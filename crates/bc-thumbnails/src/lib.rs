@@ -72,21 +72,15 @@ pub fn load_or_generate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
+    /// Write a small PNG test image to `path` using the `image` encoder.
     fn write_test_png(path: &Path, w: u32, h: u32) {
         let img = image::DynamicImage::ImageRgba8(image::RgbaImage::from_fn(w, h, |x, y| {
             image::Rgba([(x * 4 % 256) as u8, (y * 4 % 256) as u8, 128, 255])
         }));
         let file = std::fs::File::create(path).unwrap();
-        img.write_to(
-            &mut std::io::BufWriter::new(std::io::BufWriter::new(
-                std::io::BufWriter::new(std::io::BufWriter::new(std::io::BufWriter::new(
-                    std::io::BufWriter::new(std::io::BufWriter::new(file),
-                ),),
-            ),),
-        ),), image::ImageFormat::Png)
-        .unwrap();
+        let mut writer = std::io::BufWriter::new(file);
+        img.write_to(&mut writer, image::ImageFormat::Png).unwrap();
     }
 
     #[test]
@@ -98,7 +92,7 @@ mod tests {
         let thumb = decoder::decode_thumbnail(&p, 100).unwrap();
         assert!(thumb.width <= 100 && thumb.height <= 100);
         assert!(thumb.is_consistent());
-        // aspect preserved
+        // Aspect preserved.
         assert_eq!(thumb.width, 100);
         assert_eq!(thumb.height, 50);
     }
@@ -111,13 +105,13 @@ mod tests {
 
         let cache = CacheStore::open_in_memory().unwrap();
         let t1 = load_or_generate(Some(&cache), &p, 111, 999, 256).unwrap();
-        // Second call must come from cache (identical result even if file changed
-        // on disk — validity is keyed on mtime/size, which we keep constant).
+        // Second call must come from cache (identical result even if file
+        // changed on disk — validity is keyed on mtime/size, kept constant).
         let t2 = load_or_generate(Some(&cache), &p, 111, 999, 256).unwrap();
         assert_eq!(t1, t2);
 
         // Changed mtime => cache miss => re-decode.
         let t3 = load_or_generate(Some(&cache), &p, 222, 999, 256).unwrap();
-        assert_eq!(t1, t3); // same file, freshly decoded
+        assert_eq!(t1, t3);
     }
 }

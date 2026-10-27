@@ -105,7 +105,7 @@ impl CacheStore {
     pub fn prune_missing(&self) -> Result<usize, ThumbError> {
         let mut stmt = self.conn.prepare("SELECT DISTINCT path FROM thumbnails")?;
         let paths: Vec<String> = stmt
-            .query_map([], |row| row.get(0))?+
+            .query_map([], |row| row.get(0))?
             .filter_map(|r| r.ok())
             .collect();
         drop(stmt);
