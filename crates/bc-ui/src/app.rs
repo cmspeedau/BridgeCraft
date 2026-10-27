@@ -87,7 +87,11 @@ pub struct BridgeApp {
 }
 
 impl BridgeApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, root: Option<String>, cache_path: Option<PathBuf>) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        root: Option<String>,
+        cache_path: Option<PathBuf>,
+    ) -> Self {
         let (job_tx, job_rx) = channel::<ThumbJob>();
         let (res_tx, res_rx) = channel::<ThumbResult>();
         spawn_thumb_worker(cache_path, job_rx, res_tx);
@@ -118,10 +122,8 @@ impl BridgeApp {
                 self.path_input = root.display().to_string();
                 self.status = format!("Opened {} ({} items)", root.display(), self.browser.len());
                 self.pending.clear();
-                // Keep textures for paths that may reappear, but drop ones
-                // unrelated to the new folder to bound memory use.
-                self.textures
-                    .retain(|p, _| p.starts_with(root));
+                // Drop thumbnails unrelated to the new folder to bound memory use.
+                self.textures.retain(|p, _| p.starts_with(root));
             }
             Err(e) => {
                 self.status = format!("Error: {e}");
@@ -129,40 +131,34 @@ impl BridgeApp {
         }
     }
 
-    fn poll_thumbnails(&mut self) {
+    /// Collect finished thumbnail results and upload them as GPU textures.
+    fn poll_thumbnails(&mut self, ctx: &egui::Context) {
         for result in self.thumb_rx.try_iter() {
             self.pending.remove(&result.path);
-            if let (Some(thumb), Some(entry)) = (
-                result.thumb,
-                self.browser
-                    .entries
-                    .iter()
-                    .find(|e| e.path == result.path),
-            ) {
-                let _ = entry; // existence check only
+            if let Some(thumb) = result.thumb {
+                if !thumb.is_consistent() {
+                    continue;
+                }
                 let image = egui::ColorImage::from_rgba_unmultiplied(
                     [thumb.width as usize, thumb.height as usize],
                     &thumb.pixels,
                 );
-                let handle = self.thumb_ctx().create_texture(
+                let handle = ctx.load_texture(
                     result.path.display().to_string(),
                     image,
+                    egui::TextureOptions::LINEAR,
                 );
                 self.textures.insert(result.path, handle);
             }
         }
     }
 
-    fn thumb_ctx(&self) -> egui::Context {
-        // Helper kept separate so `poll_thumbnails` stays borrow-friendly.
-        egui::Context::default()
-    }
-
     fn request_thumbnail(&mut self, path: &Path, mtime: i64, size: u64) {
         if self.textures.contains_key(path) || self.pending.contains(path) {
             return;
         }
-        if self.thumb_tx
+        if self
+            .thumb_tx
             .send(ThumbJob {
                 path: path.to_path_buf(),
                 mtime_ns: mtime,
@@ -177,23 +173,14 @@ impl BridgeApp {
 
     fn content_grid(&mut self, ui: &mut egui::Ui) {
         let cols = ((ui.available_width() / CELL_SIZE).floor() as usize).max(1);
-        let count = self.browser.len();
 
-        // Clone the entries we need to render to end the borrow of self
-        // before mutating selection.
-        let entries: Vec<(PathBuf, bool, u64, Option<std::time::SystemTime>, String)> = self
+        // Snapshot the data needed for rendering so we can mutably borrow
+        // self (selection, thumbnails) inside the cell loop.
+        let entries: Vec<(PathBuf, bool, u64, Option<std::time::SystemTime>)> = self
             .browser
             .entries
             .iter()
-            .map(|e| {
-                (
-                    e.path.clone(),
-                    e.is_dir,
-                    e.size,
-                    e.modified,
-                    e.name().to_string_lossy().into_owned(),
-                )
-            })
+            .map(|e| (e.path.clone(), e.is_dir, e.size, e.modified))
             .collect();
 
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -201,10 +188,9 @@ impl BridgeApp {
                 .num_columns(cols)
                 .spacing(8.0)
                 .show(ui, |ui| {
-                    for (idx, (path, is_dir, size, modified, name)) in
-                        entries.iter().enumerate()
-                    {
+                    for (idx, (path, is_dir, size, modified)) in entries.iter().enumerate() {
                         let selected = self.browser.selection.contains(idx);
+                        let path = path.clone();
                         let response = self.cell(ui, idx, &path, *is_dir, *size, selected);
 
                         if response.clicked() {
@@ -218,18 +204,13 @@ impl BridgeApp {
                             }
                         }
                         if response.double_clicked() && *is_dir {
-                            self.open_root(&path.clone());
+                            self.open_root(&path);
                         }
 
                         if !*is_dir {
-                            self.request_thumbnail(
-                                &path.clone(),
-                                mtime_ns(*modified),
-                                *size,
-                            );
+                            self.request_thumbnail(&path, mtime_ns(*modified), *size);
                         }
                     }
-                    let _ = (count, &name_unused);
                 });
         });
     }
@@ -243,6 +224,7 @@ impl BridgeApp {
         size: u64,
         selected: bool,
     ) -> egui::Response {
+        let _ = idx;
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -253,14 +235,10 @@ impl BridgeApp {
                 egui::vec2(CELL_SIZE - 12.0, CELL_SIZE - 12.0),
                 egui::Sense::click(),
             );
-            let _ = idx;
 
             if is_dir {
-                ui.painter().rect_filled(
-                    rect,
-                    6.0,
-                    egui::Color32::from_rgb(60, 60, 40),
-                );
+                ui.painter()
+                    .rect_filled(rect, 6.0, egui::Color32::from_rgb(60, 60, 40));
                 ui.painter().text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
@@ -270,12 +248,13 @@ impl BridgeApp {
                 );
             } else if let Some(tex) = self.textures.get(path) {
                 let tex_size = tex.size_vec2();
-                let scale = (rect.size() / tex_size)
-                    .min_elem()
-                    .min(1.0);
-                let draw = tex_size * scale;
-                let center = rect.center();
-                let draw_rect = egui::Rect::from_center_size(center, draw);
+                let scale = ((rect.size().x / tex_size.x)
+                    .min(rect.size().y / tex_size.y))
+                .min(1.0);
+                let draw_rect = egui::Rect::from_center_size(
+                    rect.center(),
+                    tex_size * scale,
+                );
                 ui.painter().image(
                     tex.id(),
                     draw_rect,
@@ -283,11 +262,8 @@ impl BridgeApp {
                     egui::Color32::WHITE,
                 );
             } else {
-                ui.painter().rect_filled(
-                    rect,
-                    6.0,
-                    egui::Color32::from_rgb(45, 45, 45),
-                );
+                ui.painter()
+                    .rect_filled(rect, 6.0, egui::Color32::from_rgb(45, 45, 45));
                 ui.painter().text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
@@ -336,7 +312,7 @@ fn human_size(size: u64) -> String {
 
 impl eframe::App for BridgeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_thumbnails();
+        self.poll_thumbnails(ctx);
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -345,9 +321,7 @@ impl eframe::App for BridgeApp {
                     [ui.available_width() - 260.0, 20.0],
                     egui::TextEdit::singleline(&mut self.path_input),
                 );
-                if resp.lost_focus()
-                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                {
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     self.open_root(Path::new(&self.path_input));
                 }
                 if ui.button("Open").clicked() {
@@ -377,15 +351,11 @@ impl eframe::App for BridgeApp {
                         key_names
                             .iter()
                             .find(|(k, _)| *k == self.browser.sort_key)
-                            .map_or("?", |(_, n)| n),
+                            .map_or("?", |(_, n)| *n),
                     )
                     .show_ui(ui, |ui| {
                         for (k, n) in key_names {
-                            ui.selectable_value(
-                                &mut self.browser.sort_key,
-                                k,
-                                n,
-                            );
+                            ui.selectable_value(&mut self.browser.sort_key, k, n);
                         }
                     });
                 let dir_label = match self.browser.sort_dir {
@@ -412,13 +382,13 @@ impl eframe::App for BridgeApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            if self.browser.is_empty() && self.browser.root.is_some() {
-                ui.centered_and_justified(|ui| {
-                    ui.weak("This folder is empty.");
-                });
-            } else if self.browser.root.is_none() {
+            if self.browser.root.is_none() {
                 ui.centered_and_justified(|ui| {
                     ui.weak("Type a folder path above and press Open.");
+                });
+            } else if self.browser.is_empty() {
+                ui.centered_and_justified(|ui| {
+                    ui.weak("This folder is empty.");
                 });
             } else {
                 self.content_grid(ui);
@@ -429,17 +399,12 @@ impl eframe::App for BridgeApp {
             ui.horizontal(|ui| {
                 ui.label(&self.status);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.weak(format!("{} items", self.browser.len()));
                     if let Some(root) = &self.browser.root {
-                        ui.weak(format!("{} items", self.browser.len()));
                         ui.weak(root.display().to_string());
                     }
                 });
             });
         });
-    }
-
-    fn on_exit(&mut self) {
-        // Ask the worker to wind down by dropping our sender happens on drop;
-        // nothing else to clean up.
     }
 }
