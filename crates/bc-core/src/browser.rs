@@ -13,10 +13,14 @@ pub struct BrowserState {
     pub sort_key: SortKey,
     pub sort_dir: SortDir,
     pub selection: Selection,
+    /// Case-insensitive substring filter on file names; empty means no filter.
+    /// Directories are always shown so navigation keeps working while filtered.
+    pub filter: String,
 }
 
 impl BrowserState {
     /// Open a new root: scan its direct children and apply the current sort.
+    /// The filter is kept (matching Bridge's persistent filter behavior).
     pub fn open(&mut self, root: &std::path::Path) -> Result<()> {
         if !root.exists() {
             return Err(CoreError::PathNotFound(root.display().to_string()));
@@ -25,7 +29,8 @@ impl BrowserState {
         self.refresh()
     }
 
-    /// Re-list the current root, preserving sort settings and clearing selection.
+    /// Re-list the current root, preserving sort and filter settings.
+    /// Selection is preserved by path for entries that still exist.
     pub fn refresh(&mut self) -> Result<()> {
         let root = self
             .root
@@ -33,8 +38,65 @@ impl BrowserState {
             .ok_or_else(|| CoreError::PathNotFound("<no root open>".to_string()))?;
         self.entries = crate::fs::list_dir(root)?;
         sort_entries(&mut self.entries, self.sort_key, self.sort_dir);
-        self.selection.clear();
         Ok(())
+    }
+
+    /// Re-list the current root, restoring selection for paths that remain.
+    pub fn refresh_preserving_selection(&mut self) -> Result<()> {
+        let selected: Vec<std::path::PathBuf> = self
+            .selection
+            .indices()
+            .filter_map(|i| self.entries.get(i).map(|e| e.path.clone()))
+            .collect();
+        self.refresh()?;
+        self.selection.clear();
+        for (idx, entry) in self.entries.iter().enumerate() {
+            if selected.contains(&entry.path) {
+                self.selection.toggle(idx);
+            }
+        }
+        Ok(())
+    }
+
+    /// Set the filter and return the new visible count.
+    /// Selection is preserved by path for still-visible entries.
+    pub fn set_filter(&mut self, filter: impl Into<String>) -> usize {
+        self.filter = filter.into();
+        let visible = self.visible_indices();
+        let still_selected: Vec<std::path::PathBuf> = self
+            .selection
+            .indices()
+            .filter(|i| visible.contains(i))
+            .filter_map(|i| self.entries.get(i).map(|e| e.path.clone()))
+            .collect();
+        self.selection.clear();
+        for (idx, entry) in self.entries.iter().enumerate() {
+            if still_selected.contains(&entry.path) {
+                self.selection.toggle(idx);
+            }
+        }
+        visible.len()
+    }
+
+    /// Indices into `entries` that pass the current filter.
+    /// Matching is a case-insensitive substring test on the file name;
+    /// directories are always included so navigation keeps working.
+    pub fn visible_indices(&self) -> Vec<usize> {
+        let needle = self.filter.trim().to_lowercase();
+        if needle.is_empty() {
+            return (0..self.entries.len()).collect();
+        }
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                e.is_dir
+                    || e.path
+                        .file_name()
+                        .map_or(false, |n| n.to_string_lossy().to_lowercase().contains(&needle))
+            })
+            .map(|(i, _)| i)
+            .collect()
     }
 
     /// Change the sort order and re-sort without re-reading the directory.
@@ -48,6 +110,11 @@ impl BrowserState {
 
     pub fn entry(&self, idx: usize) -> Option<&Entry> {
         self.entries.get(idx)
+    }
+
+    /// Number of entries passing the current filter.
+    pub fn visible_len(&self) -> usize {
+        self.visible_indices().len()
     }
 
     pub fn len(&self) -> usize {
@@ -91,5 +158,62 @@ mod tests {
     fn open_missing_root_errors() {
         let mut st = BrowserState::default();
         assert!(st.open(std::path::Path::new("/does/not/exist")).is_err());
+    }
+
+    #[test]
+    fn filter_is_case_insensitive_substring_and_keeps_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Report.PNG"), b"x").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), b"x").unwrap();
+        std::fs::create_dir(dir.path().join("Archive")).unwrap();
+
+        let mut st = BrowserState::default();
+        st.open(dir.path()).unwrap();
+
+        // "arp" matches Report.PNG case-insensitively; Archive (dir) always shown.
+        assert_eq!(st.set_filter("arp"), 2);
+        let vis = st.visible_indices();
+        let names: Vec<&str> = vis
+            .iter()
+            .map(|&i| st.entry(i).unwrap().name())
+            .collect();
+        assert!(names.contains(&"Report.PNG"));
+        assert!(names.contains(&"Archive"));
+        assert!(!names.contains(&"notes.txt"));
+
+        // Empty/whitespace filter shows everything again.
+        assert_eq!(st.set_filter("   "), 3);
+    }
+
+    #[test]
+    fn filter_preserves_selection_of_still_visible_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("keep.txt"), b"x").unwrap();
+        std::fs::write(dir.path().join("drop.txt"), b"x").unwrap();
+
+        let mut st = BrowserState::default();
+        st.open(dir.path()).unwrap();
+        // entries sorted: keep.txt=0, drop.txt=1
+        st.selection.select_only(0);
+        st.set_filter("keep");
+        assert_eq!(st.selection.indices().count(), 1);
+        st.set_filter("");
+        assert_eq!(st.selection.indices().count(), 1);
+    }
+
+    #[test]
+    fn refresh_preserving_selection_restores_by_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+
+        let mut st = BrowserState::default();
+        st.open(dir.path()).unwrap();
+        st.selection.select_only(0);
+
+        // A new file appears; a plain refresh would clear selection.
+        std::fs::write(dir.path().join("b.txt"), b"x").unwrap();
+        st.refresh_preserving_selection().unwrap();
+        assert_eq!(st.len(), 2);
+        assert_eq!(st.selection.indices().collect::<Vec<_>>(), vec![0]);
     }
 }

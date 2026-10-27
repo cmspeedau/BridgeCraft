@@ -1,16 +1,21 @@
-//! Main application: content grid, folder navigation, selection, thumbnails.
+//! Main application: content grid, folder navigation, selection, thumbnails,
+//! live directory watching, and name filtering.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::time::{Duration, Instant};
 
 use bc_core::browser::BrowserState;
 use bc_core::fs::{SortDir, SortKey};
+use bc_core::watcher::Watcher;
 use bc_thumbnails::{CacheStore, Thumbnail};
 use eframe::egui;
 
 const CELL_SIZE: f32 = 132.0;
 const THUMB_MAX_EDGE: u32 = 256;
+/// Coalesce watcher event bursts into a single refresh.
+const WATCHER_DEBOUNCE: Duration = Duration::from_millis(300);
 
 struct ThumbJob {
     path: PathBuf,
@@ -84,6 +89,11 @@ pub struct BridgeApp {
     pending: HashSet<PathBuf>,
     /// Decoded thumbnails uploaded to the GPU, keyed by path.
     textures: HashMap<PathBuf, egui::TextureHandle>,
+
+    /// Watcher for the open root; recreated on navigation.
+    watcher: Option<Watcher>,
+    /// When a watcher event was seen; refresh fires after the debounce elapses.
+    refresh_due: Option<Instant>,
 }
 
 impl BridgeApp {
@@ -104,6 +114,8 @@ impl BridgeApp {
             thumb_rx: res_rx,
             pending: HashSet::new(),
             textures: HashMap::new(),
+            watcher: None,
+            refresh_due: None,
         };
 
         if let Some(root) = root {
@@ -124,9 +136,51 @@ impl BridgeApp {
                 self.pending.clear();
                 // Drop thumbnails unrelated to the new folder to bound memory use.
                 self.textures.retain(|p, _| p.starts_with(root));
+                self.attach_watcher(root);
             }
             Err(e) => {
                 self.status = format!("Error: {e}");
+            }
+        }
+    }
+
+    /// (Re)create the directory watcher for the current root.
+    fn attach_watcher(&mut self, root: &Path) {
+        self.watcher = match Watcher::new(root) {
+            Ok(w) => {
+                tracing::debug!("watching {}", root.display());
+                Some(w)
+            }
+            Err(e) => {
+                tracing::warn!("could not watch {}: {e}", root.display());
+                self.refresh_due = None;
+                None
+            }
+        };
+    }
+
+    /// Drain watcher events; schedule a debounced refresh when any arrive.
+    fn poll_watcher(&mut self) {
+        if self.refresh_due.is_none() {
+            if let Some(w) = &self.watcher {
+                if !w.drain().is_empty() {
+                    self.refresh_due = Some(Instant::now() + WATCHER_DEBOUNCE);
+                }
+            }
+        } else {
+            // Keep draining while a refresh is pending so the queue never backs up.
+            if let Some(w) = &self.watcher {
+                let _ = w.drain();
+            }
+            if Instant::now() >= self.refresh_due.unwrap() {
+                self.refresh_due = None;
+                match self.browser.refresh_preserving_selection() {
+                    Ok(()) => {
+                        self.status =
+                            format!("Refreshed ({} items)", self.browser.len());
+                    }
+                    Err(e) => tracing::warn!("live refresh failed: {e}"),
+                }
             }
         }
     }
@@ -171,16 +225,41 @@ impl BridgeApp {
         }
     }
 
+    fn filter_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Filter:");
+            let before = self.browser.filter.clone();
+            let resp = ui.add_sized(
+                [220.0, 20.0],
+                egui::TextEdit::singleline(&mut self.browser.filter)
+                    .hint_text("name contains…"),
+            );
+            // Re-apply immediately on any edit (also handles clearing).
+            if resp.changed() || self.browser.filter != before {
+                let shown = self.browser.set_filter(self.browser.filter.clone());
+                self.status = format!("Filter “{}”: {} of {} items",
+                    self.browser.filter, shown, self.browser.len());
+            }
+            if ui.button("✕").clicked() && !self.browser.filter.is_empty() {
+                self.browser.set_filter("");
+            }
+        });
+    }
+
     fn content_grid(&mut self, ui: &mut egui::Ui) {
         let cols = ((ui.available_width() / CELL_SIZE).floor() as usize).max(1);
 
-        // Snapshot the data needed for rendering so we can mutably borrow
-        // self (selection, thumbnails) inside the cell loop.
-        let entries: Vec<(PathBuf, bool, u64, Option<std::time::SystemTime>)> = self
+        // Snapshot the filtered, sorted data needed for rendering so we can
+        // mutably borrow self (selection, thumbnails) inside the cell loop.
+        let visible: Vec<(usize, PathBuf, bool, u64, Option<std::time::SystemTime>)> = self
             .browser
-            .entries
-            .iter()
-            .map(|e| (e.path.clone(), e.is_dir, e.size, e.modified))
+            .visible_indices()
+            .into_iter()
+            .filter_map(|idx| {
+                self.browser.entries.get(idx).map(|e| {
+                    (idx, e.path.clone(), e.is_dir, e.size, e.modified)
+                })
+            })
             .collect();
 
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -188,19 +267,19 @@ impl BridgeApp {
                 .num_columns(cols)
                 .spacing(8.0)
                 .show(ui, |ui| {
-                    for (idx, (path, is_dir, size, modified)) in entries.iter().enumerate() {
-                        let selected = self.browser.selection.contains(idx);
+                    for (idx, path, is_dir, size, modified) in visible.iter() {
+                        let selected = self.browser.selection.contains(*idx);
                         let path = path.clone();
-                        let response = self.cell(ui, idx, &path, *is_dir, *size, selected);
+                        let response = self.cell(ui, *idx, &path, *is_dir, *size, selected);
 
                         if response.clicked() {
                             let mods = ui.input(|i| i.modifiers);
                             if mods.shift {
-                                self.browser.selection.select_range(idx);
+                                self.browser.selection.select_range(*idx);
                             } else if mods.ctrl || mods.command {
-                                self.browser.selection.toggle(idx);
+                                self.browser.selection.toggle(*idx);
                             } else {
-                                self.browser.selection.select_only(idx);
+                                self.browser.selection.select_only(*idx);
                             }
                         }
                         if response.double_clicked() && *is_dir {
@@ -313,6 +392,7 @@ fn human_size(size: u64) -> String {
 impl eframe::App for BridgeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_thumbnails(ctx);
+        self.poll_watcher();
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -351,7 +431,7 @@ impl eframe::App for BridgeApp {
                         key_names
                             .iter()
                             .find(|(k, _)| *k == self.browser.sort_key)
-                            .map_or("?", |(_, n)| *n),
+                            .map_or("?", |(_, n)| n),
                     )
                     .show_ui(ui, |ui| {
                         for (k, n) in key_names {
@@ -370,8 +450,17 @@ impl eframe::App for BridgeApp {
                     self.browser.set_sort(self.browser.sort_key, self.browser.sort_dir);
                 }
                 ui.separator();
+                self.filter_bar(ui);
+            });
+            ui.horizontal(|ui| {
                 if ui.button("Select All").clicked() {
-                    self.browser.selection.select_all(self.browser.len());
+                    // Select only currently visible entries so Select All
+                    // respects the active filter.
+                    let visible = self.browser.visible_indices();
+                    self.browser.selection.clear();
+                    for idx in visible {
+                        self.browser.selection.toggle(idx);
+                    }
                 }
                 if ui.button("Clear").clicked() {
                     self.browser.selection.clear();
@@ -386,9 +475,16 @@ impl eframe::App for BridgeApp {
                 ui.centered_and_justified(|ui| {
                     ui.weak("Type a folder path above and press Open.");
                 });
-            } else if self.browser.is_empty() {
+            } else if self.browser.visible_len() == 0 {
                 ui.centered_and_justified(|ui| {
-                    ui.weak("This folder is empty.");
+                    if self.browser.is_empty() {
+                        ui.weak("This folder is empty.");
+                    } else {
+                        ui.weak(format!(
+                            "No items match filter “{}”.",
+                            self.browser.filter
+                        ));
+                    }
                 });
             } else {
                 self.content_grid(ui);
@@ -399,7 +495,11 @@ impl eframe::App for BridgeApp {
             ui.horizontal(|ui| {
                 ui.label(&self.status);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.weak(format!("{} items", self.browser.len()));
+                    ui.weak(format!(
+                        "{} of {} items",
+                        self.browser.visible_len(),
+                        self.browser.len()
+                    ));
                     if let Some(root) = &self.browser.root {
                         ui.weak(root.display().to_string());
                     }
