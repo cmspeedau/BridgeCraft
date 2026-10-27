@@ -1,0 +1,13 @@
+[package]
+name = "bc-metadata"
+description = "EXIF / IPTC / XMP metadata read and write for BridgeCraft"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

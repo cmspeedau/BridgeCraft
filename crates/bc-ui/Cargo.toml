@@ -1,0 +1,16 @@
+[package]
+name = "bc-ui"
+description = "Frontend shell for BridgeCraft"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "bridgecraft"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+bc-core = { path = "../bc-core" }
+tracing.workspace = true
+tracing-subscriber.workspace = true

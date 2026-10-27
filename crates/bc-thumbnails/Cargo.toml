@@ -1,0 +1,13 @@
+[package]
+name = "bc-thumbnails"
+description = "Thumbnail cache and image decoders for BridgeCraft"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

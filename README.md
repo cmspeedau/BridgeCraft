@@ -1,18 +1,31 @@
 # BridgeCraft
 
-A 1:1 clean-room reimplementation of **Adobe Bridge** in **Rust**.
+A clean-room, cross-platform digital asset browser and file manager written in Rust.
 
-BridgeCraft aims to replicate Adobe Bridge's digital asset management experience: asset browsing, previews, metadata, batch operations, and deep integration points — built natively in Rust with no Adobe code or proprietary assets.
+**Clean-room policy:** This project contains no Adobe code. See [CLEANROOM.md](CLEANROOM.md). All contributors must sign the attestation in [CONTRIBUTING.md](CONTRIBUTING.md) before their first contribution.
 
-## Goals
-- Cross-platform (Windows, macOS, Linux)
-- Fast, GPU-accelerated asset grid and preview rendering
-- Full-featured metadata handling (XMP, EXIF, IPTC) for raw formats
-- Extensible plugin architecture
-- Licensing-safe: no decompilation of Adobe Bridge; features are reimplemented from public documentation and observed behavior
+## Workspace layout
 
-## Status
-🚧 Early planning — see [ROADMAP.md](ROADMAP.md)
+| Crate | Purpose |
+|---|---|
+| `bc-core` | Filesystem scanning, watchers, selection model, app state |
+| `bc-metadata` | EXIF / IPTC / XMP / sidecar read & write |
+| `bc-thumbnails` | Thumbnail cache (SQLite), decoders (JPEG/PNG/RAW/PSD/PDF/video) |
+| `bc-ui` | Frontend shell (GUI framework TBD — see Phase 0 spike in ROADMAP) |
+
+## Roadmap
+
+See [ROADMAP.md](ROADMAP.md). Current phase: **Phase 0 — Foundations**.
+
+## Building
+
+```sh
+cargo build --workspace
+cargo test --workspace
+cargo clippy --workspace -- -D warnings
+cargo fmt --all -- --check
+```
 
 ## License
-TBD
+
+Apache-2.0. Third-party notices will be tracked in `THIRD_PARTY_LICENSES.md`.
