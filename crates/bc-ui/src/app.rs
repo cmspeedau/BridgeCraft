@@ -13,6 +13,8 @@ use bc_thumbnails::{CacheStore, Thumbnail};
 use eframe::egui;
 
 const CELL_SIZE: f32 = 132.0;
+const CELL_HEIGHT: f32 = CELL_SIZE + 44.0;
+const GRID_SPACING: f32 = 8.0;
 const THUMB_MAX_EDGE: u32 = 256;
 /// Coalesce watcher event bursts into a single refresh.
 const WATCHER_DEBOUNCE: Duration = Duration::from_millis(300);
@@ -247,50 +249,89 @@ impl BridgeApp {
     }
 
     fn content_grid(&mut self, ui: &mut egui::Ui) {
-        let cols = ((ui.available_width() / CELL_SIZE).floor() as usize).max(1);
+        // Keep all layout dimensions positive: a collapsed/zero-width UI should
+        // still show one column rather than divide by zero or skip the grid.
+        let cell_width = if CELL_SIZE.is_finite() && CELL_SIZE > 0.0 {
+            CELL_SIZE
+        } else {
+            132.0
+        };
+        let row_height = if CELL_HEIGHT.is_finite() && CELL_HEIGHT >= cell_width {
+            CELL_HEIGHT
+        } else {
+            cell_width + 32.0
+        };
+        let spacing = if GRID_SPACING.is_finite() && GRID_SPACING > 0.0 {
+            GRID_SPACING
+        } else {
+            0.0
+        };
+        let available_width = ui.available_width().max(0.0);
+        let cols = (((available_width + spacing) / (cell_width + spacing)).floor() as usize)
+            .max(1);
+        let indices = self.browser.visible_indices();
+        let row_step = row_height + spacing;
+        let row_count = (indices.len() + cols - 1) / cols;
 
-        // Snapshot the filtered, sorted data needed for rendering so we can
-        // mutably borrow self (selection, thumbnails) inside the cell loop.
-        let visible: Vec<(usize, PathBuf, bool, u64, Option<std::time::SystemTime>)> = self
-            .browser
-            .visible_indices()
-            .into_iter()
-            .filter_map(|idx| {
-                self.browser.entries.get(idx).map(|e| {
-                    (idx, e.path.clone(), e.is_dir, e.size, e.modified)
-                })
-            })
-            .collect();
+        egui::ScrollArea::vertical().show_viewport(ui, |ui, viewport| {
+            // ScrollArea reports the viewport in content coordinates. Use its
+            // vertical bounds to lay out only rows that can be seen; spacers
+            // retain the full scroll range without creating off-screen cells.
+            let first_row = ((viewport.min.y.max(0.0) / row_step).floor() as usize)
+                .min(row_count);
+            let end_row = ((viewport.max.y.max(0.0) / row_step).ceil() as usize)
+                .min(row_count);
+            let end_row = end_row.max(first_row);
+            ui.add_space(first_row as f32 * row_step);
 
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::Grid::new("content_grid")
-                .num_columns(cols)
-                .spacing(8.0)
-                .show(ui, |ui| {
-                    for (idx, path, is_dir, size, modified) in visible.iter() {
-                        let selected = self.browser.selection.contains(*idx);
-                        let path = path.clone();
-                        let response = self.cell(ui, *idx, &path, *is_dir, *size, selected);
+            for row in first_row..end_row {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = spacing;
+                    let row_start = row * cols;
+                    let row_end = (row_start + cols).min(indices.len());
+                    for &idx in &indices[row_start..row_end] {
+                        let Some(entry) = self.browser.entries.get(idx) else {
+                            continue;
+                        };
+                        let path = entry.path.clone();
+                        let is_dir = entry.is_dir;
+                        let size = entry.size;
+                        let modified = entry.modified;
+                        let selected = self.browser.selection.contains(idx);
+                        let response = ui
+                            .allocate_ui_with_layout(
+                                egui::vec2(cell_width, row_height),
+                                egui::Layout::top_down(egui::Align::Center),
+                                |cell_ui| {
+                                    self.cell(cell_ui, idx, &path, is_dir, size, selected, cell_width)
+                                },
+                            )
+                            .inner;
 
                         if response.clicked() {
                             let mods = ui.input(|i| i.modifiers);
                             if mods.shift {
-                                self.browser.selection.select_range(*idx);
+                                self.browser.selection.select_range(idx);
                             } else if mods.ctrl || mods.command {
-                                self.browser.selection.toggle(*idx);
+                                self.browser.selection.toggle(idx);
                             } else {
-                                self.browser.selection.select_only(*idx);
+                                self.browser.selection.select_only(idx);
                             }
                         }
-                        if response.double_clicked() && *is_dir {
+                        if response.double_clicked() && is_dir {
                             self.open_root(&path);
                         }
-
-                        if !*is_dir {
-                            self.request_thumbnail(&path, mtime_ns(*modified), *size);
+                        if !is_dir {
+                            self.request_thumbnail(&path, mtime_ns(modified), size);
                         }
                     }
                 });
+                // Include row spacing in the virtual extent so the next row's
+                // origin matches the row-index calculation above.
+                ui.add_space(spacing);
+            }
+
+            ui.add_space((row_count - end_row) as f32 * row_step);
         });
     }
 
@@ -302,6 +343,7 @@ impl BridgeApp {
         is_dir: bool,
         size: u64,
         selected: bool,
+        cell_size: f32,
     ) -> egui::Response {
         let _ = idx;
         let name = path
@@ -311,7 +353,7 @@ impl BridgeApp {
 
         ui.vertical_centered(|ui| {
             let (rect, response) = ui.allocate_exact_size(
-                egui::vec2(CELL_SIZE - 12.0, CELL_SIZE - 12.0),
+                egui::vec2((cell_size - 12.0).max(1.0), (cell_size - 12.0).max(1.0)),
                 egui::Sense::click(),
             );
 
@@ -360,9 +402,9 @@ impl BridgeApp {
                 );
             }
 
-            ui.set_min_width(CELL_SIZE - 16.0);
+            ui.set_min_width((cell_size - 16.0).max(1.0));
             ui.add_sized(
-                [CELL_SIZE - 16.0, 16.0],
+                [(cell_size - 16.0).max(1.0), 16.0],
                 egui::Label::new(egui::RichText::new(&name).small()).truncate(),
             );
             if !is_dir {
