@@ -101,13 +101,13 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [ ] Localization framework (i18n)
 - [ ] High-DPI + accessibility (screen reader, keyboard nav)
 - [ ] Performance profiling: cold start < 2s, folder open < 500ms for 10k items
-- [ ] **Packaging & distribution** (final release targets)
-  - [ ] **macOS**: universal 2 binary (arm64 + x86_64 via `lipo`), signed + notarized `.app` bundle in a `.dmg`
-  - [ ] **Windows**: portable ZIP build + signed MSI installer (WiX); per-machine and per-user install options
+- [ ] **Packaging & distribution** (final release targets; unsigned)
+  - [ ] **macOS**: universal 2 binary (arm64 + x86_64 via `lipo`), unsigned `.app` bundle in a `.dmg`
+  - [ ] **Windows**: portable ZIP build + MSI installer (WiX); per-machine and per-user install options
   - [ ] **Linux**: AppImage bundling all shared libs, with `.zsync` metadata for delta updates (AppImageUpdater / `appimageupdatetool`-compatible)
-  - [ ] CI release pipeline: per-platform build matrix, artifact signing, checksums, and GitHub release publishing
+  - [ ] CI release pipeline: per-platform build matrix, checksums, and GitHub release publishing
   - [ ] In-app or on-launch update check feeding the AppImage delta channel (opt-in, respects privacy)
-  - *Note: the AppImage `.zsync` delta channel only applies to Linux; macOS/Windows updates flow through the notarized/installer artifacts.*
+  - *Note: the AppImage `.zsync` delta channel only applies to Linux; no signing/notarization anywhere — users may see OS warnings (Gatekeeper "unidentified developer", SmartScreen) on macOS/Windows.*
 
 ## Milestones
 | Milestone | Target | Definition of Done | Status |
@@ -117,7 +117,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 | M3 — Metadata Complete | Q3 2027 | XMP/EXIF/IPTC read-write, smart collections | not started |
 | M4 — Automation | Q4 2027 | Batch ops, scripting API | not started |
 | M5 — Integrations | 2028 | Apple Photos, plugin system, ArtCraft bridge plugin, LightCraft bridge plugin | not started |
-| M6 — 1:1 Parity Audit & Release | 2028 | Feature checklist parity vs. Bridge 2026 user guide; signed universal macOS build, Windows portable+MSI, AppImage+.zsync published | not started |
+| M6 — 1:1 Parity Audit & Release | 2028 | Feature checklist parity vs. Bridge 2026 user guide; universal macOS build, Windows portable+MSI, AppImage+.zsync published (unsigned) | not started |
 
 ## Critical Path
 With ADR-0001 resolved (egui/eframe), filter + live refresh shipped, and virtualized grid rendering complete, the remaining critical path is: **list/details views → file operations → drag & drop**. Metadata engine (Phase 3) can proceed in parallel.
@@ -131,4 +131,4 @@ With ADR-0001 resolved (egui/eframe), filter + live refresh shipped, and virtual
 - Plugin sandboxing mistakes could expose user files (mitigate: WASM-only v1, deny-by-default capabilities, permission prompts in the plugin manager)
 - ArtCraft integration depends on an external project's evolving APIs (mitigate: version the bridge plugin against specific ArtCraft releases; its MIT/Apache licensing keeps the dependency clean)
 - LightCraft integration depends on an external project's evolving APIs (mitigate: version the bridge plugin against specific LightCraft releases; its MIT/Apache licensing keeps the dependency clean, and it is young/moving fast so pin early)
-- Code-signing/notarization requires platform certificates (Apple Developer ID, Windows code-signing cert); universal/macMSI builds add CI matrix complexity (mitigate: dedicated release workflow, artifact staging before publish)
+- Unsigned distribution artifacts will trigger OS trust warnings (macOS Gatekeeper, Windows SmartScreen) that users must dismiss manually (accepted trade-off: no signing certificates are purchased or managed)
