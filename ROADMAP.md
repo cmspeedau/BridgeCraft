@@ -14,7 +14,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [x] GUI framework selection & spike — **DONE: egui/eframe 0.27 chosen, ADR-0001 accepted**. Working GUI shell shipped: thumbnail grid, selection (click/ctrl/shift), navigation, sorting, worker-thread thumbnail pipeline with mpsc channel draining. See `docs/adr/0001-gui-framework.md`.
 - [x] Phase 0 checklist: `docs/PHASE0_CHECKLIST.md`
 
-*Note: tokio/event-bus remains intentionally deferred — the immediate-mode UI + mpsc worker pattern covers current needs. Trigger to revisit: a second concurrent background service (watcher/indexer) landing, expected Phase 3.*
+*Note: tokio/event-bus remains intentionally deferred — the immediate-mode UI + mpsc worker pattern covers current needs (watcher is drained per-frame on the UI thread with debounced refresh). Trigger to revisit: a second concurrent background service (indexer) landing, expected Phase 3.*
 
 ## Phase 1 — File Browsing Core (Weeks 5–12) — ◐ core logic + basic UI DONE; hardening below
 - [x] Non-recursive directory listing + recursive `scan()` for future flat-view modes (`bc-core::fs`)
@@ -23,14 +23,14 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [x] Multi-select model: click / ctrl-toggle / shift-range / select-all (`bc-core::selection`)
 - [x] Browser state: open root, refresh, change sort (`bc-core::browser::BrowserState`)
 - [x] Content panel: thumbnail grid in egui (list/details views pending — see hardening)
+- [x] **Filter box**: case-insensitive name-substring filter, dirs always visible, selection preserved by path, filter-aware Select All (`bc-core::browser::set_filter` + UI bar)
+- [x] **Watcher-driven live refresh**: watcher attached on folder open, events drained per frame, bursts coalesced via 300 ms debounce into `refresh_preserving_selection()`
 - [~] Thumbnail grid rendering (egui `Grid`, not virtualized yet — 100k+ item virtualization is the main remaining perf item)
 - [~] Virtual folder tree with favorites, recent folders, shared collections (data model pending)
-- [~] Filtering, search (sort done; filter/search pending)
 - [ ] List & details view modes (Bridge parity: Thumbnails / Filmstrip / List / Details)
-- [ ] Wire directory watcher into the GUI for live refresh
 - [ ] Copy / move / rename / delete (with recents/bin)
 - [ ] Drag & drop (internal reordering + OS interop)
-- [ ] **Phase 1 fix-up (current focus):** virtualized grid painting for large folders, list/details views, watcher-driven live refresh, filter box
+- [ ] **Phase 1 fix-up (remaining):** virtualized grid painting for large folders, list/details views
 
 ## Phase 2 — Thumbnails & Previews (Weeks 9–20) — ◐ cache + core decoders DONE
 - [x] Thumbnail cache database: SQLite (`rusqlite` bundled, WAL) keyed by `(path, max_edge)`, invalidation on `(mtime_ns, size)`, `prune_missing()` cleanup (`bc-thumbnails::cache`)
@@ -78,16 +78,17 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 ## Milestones
 | Milestone | Target | Definition of Done | Status |
 |---|---|---|---|
-| M1 — Browser MVP | Q1 2027 | Browse, sort, thumbnails, basic file ops | ◐ GUI + core done; remaining: virtualized grid, list/details views, file ops, drag & drop |
+| M1 — Browser MVP | Q1 2027 | Browse, sort, filter, live refresh, thumbnails, basic file ops | ◐ GUI + core done; remaining: virtualized grid, list/details views, file ops, drag & drop |
 | M2 — Preview Engine | Q2 2027 | RAW/PSD/PDF/video previews with caching | ◐ PNG/JPEG/GIF/WebP/TIFF/BMP + SQLite cache done |
 | M3 — Metadata Complete | Q3 2027 | XMP/EXIF/IPTC read-write, smart collections | not started |
 | M4 — Automation | Q4 2027 | Batch ops, scripting API | not started |
 | M5 — 1:1 Parity Audit | 2028 | Feature checklist parity vs. Bridge 2026 user guide | not started |
 
 ## Critical Path
-With ADR-0001 resolved (egui/eframe), the critical path is now **Phase 1 fix-up**: virtualized grid rendering for large folders → list/details views → file operations → drag & drop. Metadata engine (Phase 3) can proceed in parallel.
+With ADR-0001 resolved (egui/eframe) and filter + live refresh shipped, the critical path is now: **virtualized grid rendering for large folders → list/details views → file operations → drag & drop**. Metadata engine (Phase 3) can proceed in parallel.
 
 ## Risks
 - RAW format coverage breadth (mitigate: LibRaw bindings)
 - GUI performance on huge folders (mitigate: virtualization — egui `Grid` is not virtualized; custom painter-based grid is the fallback per ADR-0001)
+- Watcher platform quirks (inotify/FSEvents/ReadDirectoryChangesW edge cases, e.g. network drives) — debounced refresh + manual navigation already degrade gracefully
 - Parity scope creep (mitigate: milestone audits, feature freeze discipline)
