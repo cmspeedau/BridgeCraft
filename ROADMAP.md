@@ -62,10 +62,30 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [ ] Watched-folder auto-processing
 - [ ] Scripting/automation API (Lua or WASM plugins)
 
-## Phase 5 — Creative Cloud-Style Integrations (clean-room equivalents) (Weeks 30–40)
+## Phase 5 — Integrations & Plugin Ecosystem (clean-room equivalents) (Weeks 30–40)
 - [ ] Export/publish pipelines (replaces CC Libraries)
 - [ ] Version control / version stacks for assets
 - [ ] Migration importer (reads existing Bridge caches read-only where formats are documented)
+- [ ] **Apple Photos support**: read-only integration with the macOS Photos library
+  - [ ] Locate and open the user's `Photos.sqlite` library (read-only; never write to it) via `photoslibrary`-style access on macOS
+  - [ ] Enumerate moments/albums as virtual folders in the browser tree; surface originals + edits as entries
+  - [ ] Extract assets (originals and current renditions) into the thumbnail pipeline and preview viewer; iCloud-shared (`cloudPlaceholder`) items show a downloaded-on-demand state
+  - [ ] Metadata mapping: Photos keywords/albums/favorites → bc-metadata tags (Phase 3 alignment)
+  - [ ] Platform gate: macOS-only feature, compiled out elsewhere; user must grant disk access
+  - *Clean-room note: spec from public Photos library schema documentation and observed behavior only; no Apple code.*
+- [ ] **Plugin system for BridgeCraft** (successor to the Phase 4 scripting API; Bridges-style extension model)
+  - [ ] Plugin manifest + loader: local plugins discovered from a plugins directory; manifest declares name, version, entry points, and capabilities (menu items, panel, context-menu hooks)
+  - [ ] Plugin API surface (Rust trait + WASM host boundary): access to browser selection, current folder, thumbnails, metadata read, and file operations through a permissioned host API
+  - [ ] Sandboxing: WASM plugins run isolated with explicit capabilities (fs paths, network off by default); native plugins out of scope for v1
+  - [ ] UI extension points: plugin-registered panels, toolbar/menu actions, and batch-processing hooks
+  - [ ] Plugin manager dialog: list, enable/disable, permissions review
+  - *Relationship to Phase 4: the Phase 4 Lua/WASM scripting API is the automation surface; this is the packaged, distributable plugin layer built on top of it.*
+- [ ] **ArtCraft bridge plugin** (first-party plugin targeting [storytold/artcraft](https://github.com/storytold/artcraft))
+  - [ ] ArtCraft is a Rust, MIT/Apache-2.0 dual-licensed "IDE for artists" (AI image/video generation with Photoshop-style 2D/3D canvas compositing, layers, masking, inpainting) — a natural round-trip target for asset workflows, and its permissive license allows direct API integration (no clean-room constraints needed for this partner)
+  - [ ] Round-trip workflow: "Edit in ArtCraft" context-menu action on selected images → open in ArtCraft canvas → on save/export, updated file lands back in the browsed folder and the watcher refresh picks it up automatically (Phase 1 live refresh makes this near-free)
+  - [ ] Asset hand-off: send BridgeCraft selections (with XMP sidecar metadata, once Phase 3 lands) into ArtCraft projects as layers/ingredients; receive exports back as versioned assets (version stacks integration)
+  - [ ] Discovery: locate the ArtCraft executable/library on Win/macOS/Linux (it ships for all three), or let the user point at an install
+  - [ ] Implement as the first consumer of the plugin system above to prove the API surface
 
 ## Phase 6 — Polish & 1:1 Parity (Weeks 36–52)
 - [ ] Keyboard shortcut parity + custom shortcut editor
@@ -82,7 +102,8 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 | M2 — Preview Engine | Q2 2027 | RAW/PSD/PDF/video previews with caching | ◐ PNG/JPEG/GIF/WebP/TIFF/BMP + SQLite cache done |
 | M3 — Metadata Complete | Q3 2027 | XMP/EXIF/IPTC read-write, smart collections | not started |
 | M4 — Automation | Q4 2027 | Batch ops, scripting API | not started |
-| M5 — 1:1 Parity Audit | 2028 | Feature checklist parity vs. Bridge 2026 user guide | not started |
+| M5 — Integrations | 2028 | Apple Photos, plugin system, ArtCraft bridge plugin | not started |
+| M6 — 1:1 Parity Audit | 2028 | Feature checklist parity vs. Bridge 2026 user guide | not started |
 
 ## Critical Path
 With ADR-0001 resolved (egui/eframe), filter + live refresh shipped, and virtualized grid rendering complete, the remaining critical path is: **list/details views → file operations → drag & drop**. Metadata engine (Phase 3) can proceed in parallel.
@@ -92,3 +113,6 @@ With ADR-0001 resolved (egui/eframe), filter + live refresh shipped, and virtual
 - GUI performance on huge folders (mitigate: virtualized grid paints only visible rows and requests thumbnails only for visible cells)
 - Watcher platform quirks (inotify/FSEvents/ReadDirectoryChangesW edge cases, e.g. network drives) — debounced refresh + manual navigation already degrade gracefully
 - Parity scope creep (mitigate: milestone audits, feature freeze discipline)
+- Apple Photos integration is macOS-only and schema-dependent (mitigate: read-only access, graceful "library unavailable" degradation, feature-gated build)
+- Plugin sandboxing mistakes could expose user files (mitigate: WASM-only v1, deny-by-default capabilities, permission prompts in the plugin manager)
+- ArtCraft integration depends on an external project's evolving APIs (mitigate: version the bridge plugin against specific ArtCraft releases; its MIT/Apache licensing keeps the dependency clean)
