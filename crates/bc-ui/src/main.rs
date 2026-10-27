@@ -1,10 +1,6 @@
 //! BridgeCraft — clean-room asset browser in Rust.
-//! Phase 1: file browsing core running as a textual shell (GUI lands after
-//! the framework spike decision record).
+//! GUI shell is a placeholder until the Phase 0 framework spike concludes.
 
-use bc_core::browser::BrowserState;
-use bc_core::fs::{SortDir, SortKey};
-use bc_core::watcher::Watcher;
 use std::path::Path;
 
 fn main() -> anyhow::Result<()> {
@@ -15,31 +11,80 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    tracing::info!("BridgeCraft starting — textual shell (Phase 1)");
+    tracing::info!("BridgeCraft starting — GUI placeholder (thumbnail engine wired)");
 
     let root = std::env::args()
         .nth(1)
         .unwrap_or_else(|| ".".to_string());
+    let root = Path::new(&root);
 
-    let mut state = BrowserState::default();
-    state.open(Path::new(&root))?;
-    state.set_sort(SortKey::Name, SortDir::Asc);
-    tracing::info!("opened {}: {} entries", root, state.len());
-    for (i, e) in state.entries.iter().take(20).enumerate() {
-        let marker = if state.selection.contains(i) { "[*]" } else { "[ ]" };
-        let kind = if e.is_dir { "DIR " } else { "FILE" };
-        tracing::info!("{} {} {}", marker, kind, e.name().to_string_lossy());
-    }
-    if state.len() > 20 {
-        tracing::info!("... and {} more", state.len() - 20);
+    // Phase 2: thumbnail cache lives next to the binary's CWD.
+    let cache_path = std::env::current_dir()?.join(".bridgecraft-thumbs.db");
+    let cache = match bc_thumbnails::CacheStore::open(&cache_path) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::warn!("thumbnail cache unavailable, decoding without cache: {e}");
+            None
+        }
+    };
+
+    let entries = bc_core::fs::list_dir(root)?;
+    const MAX_EDGE: u32 = 256;
+
+    let mut hits = 0usize;
+    let mut misses = 0usize;
+    let mut errors = 0usize;
+
+    for entry in &entries {
+        if entry.is_dir {
+            continue;
+        }
+        let mtime_ns = entry
+            .modified
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+
+        match bc_thumbnails::load_or_generate(
+            cache.as_ref(),
+            &entry.path,
+            mtime_ns,
+            entry.size,
+            MAX_EDGE,
+        ) {
+            // First pass in a fresh directory: everything decodes; a second
+            // identical run should report hits. We probe the cache once more
+            // afterwards to classify hits/misses for the demo log.
+            Ok(_) => {
+                if cache
+                    .as_ref()
+                    .map(|c| c.get(&entry.path, mtime_ns, entry.size, MAX_EDGE).is_ok_and(|r| r.is_some()))
+                    .unwrap_or(false)
+                {
+                    hits += 1;
+                } else {
+                    misses += 1;
+                }
+            }
+            Err(e) => {
+                errors += 1;
+                tracing::debug!("skip {}: {e}", entry.path.display());
+            }
+        }
     }
 
-    // Demonstrate the live watcher briefly.
-    let watcher = Watcher::new(Path::new(&root))?;
-    tracing::info!("watching {} for changes (2s demo)...", root);
-    std::thread::sleep(std::time::Duration::from_secs(2));
-    let events = watcher.drain();
-    tracing::info!("{} filesystem events observed", events.len());
+    if let Some(cache) = &cache {
+        let pruned = cache.prune_missing().unwrap_or(0);
+        if pruned > 0 {
+            tracing::info!("pruned {pruned} stale cache entries");
+        }
+    }
+
+    tracing::info!(
+        "scanned {}: {} entries, thumbs: {hits} cached, {misses} decoded, {errors} failed",
+        root.display(),
+        entries.len(),
+    );
 
     Ok(())
 }

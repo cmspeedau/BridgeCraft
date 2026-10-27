@@ -12,5 +12,9 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 bc-core = { path = "../bc-core" }
+bc-thumbnails = { path = "../bc-thumbnails" }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
