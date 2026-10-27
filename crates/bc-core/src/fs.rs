@@ -21,13 +21,21 @@ pub enum SortDir {
 
 /// List the direct children of `root` (non-recursive).
 pub fn list_dir(root: &std::path::Path) -> Result<Vec<Entry>> {
-    let mut entries = Vec::new();
     let mut it = std::fs::read_dir(root).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => CoreError::PathNotFound(root.display().to_string()),
         _ => CoreError::Io(e),
     })?;
-    for e in it.next_back_ontop() {}
-    let _ = &mut it;
+    let mut entries = Vec::new();
+    for e in it.next() {
+        let e = e.map_err(CoreError::Io)?;
+        let meta = e.metadata().map_err(CoreError::Io)?;
+        entries.push(Entry {
+            path: e.path(),
+            is_dir: meta.is_dir(),
+            size: meta.len(),
+            modified: meta.modified().ok(),
+        });
+    }
     Ok(entries)
 }
 
