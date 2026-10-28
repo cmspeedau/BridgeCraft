@@ -7,8 +7,11 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use bc_core::browser::BrowserState;
+use bc_core::file_ops::{copy_path, delete_path, move_path, rename_path};
 use bc_core::fs::{SortDir, SortKey};
+use bc_core::recents::Recents;
 use bc_core::selection::Selection;
+use bc_core::trash::TrashBin;
 use bc_core::watcher::Watcher;
 use bc_thumbnails::{CacheStore, Thumbnail};
 use eframe::egui;
@@ -94,6 +97,10 @@ pub struct BridgeApp {
     browser: BrowserState,
     path_input: String,
     status: String,
+    copy_destination: String,
+    move_destination: String,
+    rename_name: String,
+    pending_delete: Option<Vec<PathBuf>>,
     view_mode: ViewMode,
     list_focused: bool,
 
@@ -124,6 +131,10 @@ impl BridgeApp {
             browser: BrowserState::default(),
             path_input: String::new(),
             status: "Ready.".into(),
+            copy_destination: String::new(),
+            move_destination: String::new(),
+            rename_name: String::new(),
+            pending_delete: None,
             view_mode: ViewMode::Thumbnails,
             list_focused: false,
             thumb_tx: job_tx,
@@ -149,6 +160,10 @@ impl BridgeApp {
             Ok(()) => {
                 self.path_input = root.display().to_string();
                 self.status = format!("Opened {} ({} items)", root.display(), self.browser.len());
+                match Recents::open_default().and_then(|mut recent| recent.record_access(root)) {
+                    Ok(()) => {}
+                    Err(e) => self.status = format!("Opened {}; recents unavailable: {e}", root.display()),
+                }
                 self.pending.clear();
                 // Drop thumbnails unrelated to the new folder to bound memory use.
                 self.textures.retain(|p, _| p.starts_with(root));
@@ -323,6 +338,10 @@ impl BridgeApp {
                             )
                             .inner;
 
+                        if response.secondary_clicked() && !self.browser.selection.contains(idx) {
+                            self.browser.selection.select_only(idx);
+                        }
+                        response.context_menu(|ui| self.selection_context_menu(ui, &path));
                         if response.clicked() {
                             let mods = ui.input(|i| i.modifiers);
                             if mods.shift {
@@ -465,6 +484,11 @@ impl BridgeApp {
                         color,
                     );
                 }
+                if response.secondary_clicked() && !self.browser.selection.contains(idx) {
+                    self.browser.selection.select_only(idx);
+                }
+                let context_path = self.browser.entries[idx].path.clone();
+                response.context_menu(|ui| self.selection_context_menu(ui, &context_path));
                 if response.clicked() {
                     self.list_focused = true;
                     let mods = ui.input(|input| input.modifiers);
@@ -482,6 +506,175 @@ impl BridgeApp {
                 }
             }
         });
+    }
+
+    fn selected_paths(&self, clicked_path: &Path) -> Vec<PathBuf> {
+        let paths: Vec<_> = self.browser.entries.iter().enumerate()
+            .filter(|(idx, _)| self.browser.selection.contains(*idx))
+            .map(|(_, entry)| entry.path.clone())
+            .collect();
+        if paths.is_empty() { vec![clicked_path.to_path_buf()] } else { paths }
+    }
+
+    fn confirm_delete_window(&mut self, ctx: &egui::Context) {
+        let Some(paths) = self.pending_delete.clone() else { return; };
+        let mut confirm = false;
+        let mut cancel = false;
+        egui::Window::new("Confirm permanent deletion")
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(format!("Permanently delete {} item(s)? This cannot be undone.", paths.len()));
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() { cancel = true; }
+                    if ui.button("Delete permanently").clicked() { confirm = true; }
+                });
+            });
+        if confirm {
+            let mut done = 0;
+            for path in &paths {
+                match delete_path(path) {
+                    Ok(()) => done += 1,
+                    Err(e) => self.status = format!("Could not delete {}: {e}", path.display()),
+                }
+            }
+            if done > 0 { self.status = format!("Permanently deleted {done} item(s)"); }
+            self.pending_delete = None;
+        } else if cancel {
+            self.pending_delete = None;
+        }
+    }
+
+    fn selection_context_menu(&mut self, ui: &mut egui::Ui, clicked_path: &Path) {
+        let paths = self.selected_paths(clicked_path);
+        ui.label(format!("{} selected", paths.len()));
+        ui.separator();
+        ui.menu_button("Copy to folder…", |ui| {
+            ui.text_edit_singleline(&mut self.copy_destination);
+            if ui.button("Copy").clicked() {
+                let folder = PathBuf::from(self.copy_destination.trim());
+                if self.copy_destination.trim().is_empty() {
+                    self.status = "Enter a destination folder for copy.".into();
+                } else {
+                    let mut done = 0;
+                    for source in &paths {
+                        let Some(name) = source.file_name() else {
+                            self.status = format!("Cannot copy path without a file name: {}", source.display());
+                            continue;
+                        };
+                        let destination = folder.join(name);
+                        match copy_path(source, &destination) {
+                            Ok(()) => done += 1,
+                            Err(e) => self.status = format!("Copy failed for {}: {e}", source.display()),
+                        }
+                    }
+                    if done > 0 { self.status = format!("Copied {done} item(s) to {}", folder.display()); }
+                }
+                ui.close_menu();
+            }
+        });
+        ui.menu_button("Move to folder…", |ui| {
+            ui.text_edit_singleline(&mut self.move_destination);
+            if ui.button("Move").clicked() {
+                let folder = PathBuf::from(self.move_destination.trim());
+                if self.move_destination.trim().is_empty() {
+                    self.status = "Enter a destination folder for move.".into();
+                } else {
+                    let mut done = 0;
+                    for source in &paths {
+                        let Some(name) = source.file_name() else {
+                            self.status = format!("Cannot move path without a file name: {}", source.display());
+                            continue;
+                        };
+                        let destination = folder.join(name);
+                        match move_path(source, &destination) {
+                            Ok(()) => done += 1,
+                            Err(e) => self.status = format!("Move failed for {}: {e}", source.display()),
+                        }
+                    }
+                    if done > 0 { self.status = format!("Moved {done} item(s) to {}", folder.display()); }
+                }
+                ui.close_menu();
+            }
+        });
+        if paths.len() == 1 {
+            ui.horizontal(|ui| {
+                ui.label("Rename:");
+                ui.text_edit_singleline(&mut self.rename_name);
+                if ui.button("Apply").clicked() {
+                    let name = self.rename_name.trim();
+                    if name.is_empty() {
+                        self.status = "Enter a new name.".into();
+                    } else {
+                        match rename_path(&paths[0], name) {
+                            Ok(path) => self.status = format!("Renamed to {}", path.display()),
+                            Err(e) => self.status = format!("Rename failed: {e}"),
+                        }
+                    }
+                    ui.close_menu();
+                }
+            });
+        }
+        if ui.button("Move to BridgeCraft Trash").clicked() {
+            match TrashBin::open_default() {
+                Ok(mut bin) => {
+                    let mut done = 0;
+                    for path in &paths {
+                        match bin.trash(path) {
+                            Ok(_) => done += 1,
+                            Err(e) => self.status = format!("Could not trash {}: {e}", path.display()),
+                        }
+                    }
+                    if done > 0 { self.status = format!("Moved {done} item(s) to BridgeCraft Trash"); }
+                }
+                Err(e) => self.status = format!("Could not open BridgeCraft Trash: {e}"),
+            }
+            ui.close_menu();
+        }
+        if ui.button("Delete permanently…").clicked() {
+            self.pending_delete = Some(paths.clone());
+            ui.close_menu();
+        }
+    }
+
+    fn recents_menu(&mut self, ui: &mut egui::Ui) {
+        match Recents::open_default() {
+            Ok(recents) if !recents.paths().is_empty() => {
+                for path in recents.paths().to_vec() {
+                    if ui.button(path.display().to_string()).clicked() {
+                        self.open_root(&path);
+                        ui.close_menu();
+                    }
+                }
+            }
+            Ok(_) => { ui.weak("No recent locations."); }
+            Err(e) => { ui.label(format!("Recents unavailable: {e}")); }
+        }
+    }
+
+    fn trash_menu(&mut self, ui: &mut egui::Ui) {
+        match TrashBin::open_default() {
+            Ok(mut bin) => {
+                let entries = bin.list();
+                if entries.is_empty() {
+                    ui.weak("Trash is empty.");
+                } else {
+                    for entry in entries {
+                        ui.horizontal(|ui| {
+                            ui.label(entry.original_path.display().to_string());
+                            if ui.button("Restore").clicked() {
+                                match bin.restore(&entry.id) {
+                                    Ok(path) => self.status = format!("Restored {}", path.display()),
+                                    Err(e) => self.status = format!("Could not restore item: {e}"),
+                                }
+                                ui.close_menu();
+                            }
+                        });
+                    }
+                }
+            }
+            Err(e) => { ui.label(format!("Trash unavailable: {e}")); }
+        }
     }
 
     fn cell(
@@ -642,6 +835,10 @@ impl eframe::App for BridgeApp {
                 self.filter_bar(ui);
             });
             ui.horizontal(|ui| {
+                ui.menu_button("Recents", |ui| self.recents_menu(ui));
+                ui.menu_button("Trash", |ui| self.trash_menu(ui));
+            });
+            ui.horizontal(|ui| {
                 ui.label("View:");
                 ui.selectable_value(&mut self.view_mode, ViewMode::Thumbnails, "Thumbnails");
                 ui.selectable_value(&mut self.view_mode, ViewMode::List, "List");
@@ -702,6 +899,7 @@ impl eframe::App for BridgeApp {
                 });
             });
         });
+        self.confirm_delete_window(ctx);
     }
 }
 
@@ -709,41 +907,39 @@ fn navigation_target(visible: &[usize], selection: &Selection, delta: i32) -> Op
     if visible.is_empty() {
         return None;
     }
-    let current = selection
-        .anchor()
-        .and_then(|anchor| visible.iter().position(|&idx| idx == anchor))
-        .or_else(|| {
-            selection
-                .indices()
-                .find_map(|idx| visible.iter().position(|&visible_idx| visible_idx == idx))
-        });
-    let next = match current {
-        Some(position) => (position as i32 + delta).clamp(0, visible.len() as i32 - 1) as usize,
-        None if delta < 0 => visible.len() - 1,
-        None => 0,
+    let current = visible
+        .iter()
+        .position(|idx| selection.contains(*idx))
+        .unwrap_or(0);
+    let next = if delta < 0 {
+        current.saturating_sub(delta.unsigned_abs() as usize)
+    } else {
+        current.saturating_add(delta as usize).min(visible.len() - 1)
     };
     Some(visible[next])
 }
 
 fn format_modified(modified: Option<std::time::SystemTime>) -> String {
-    use std::time::UNIX_EPOCH;
-    let Some(seconds) = modified
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs() as i64)
-    else {
+    let Some(modified) = modified else {
         return "—".to_owned();
     };
+    let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) else {
+        return "—".to_owned();
+    };
+    let seconds = duration.as_secs() as i64;
     let days = seconds.div_euclid(86_400);
     let day_seconds = seconds.rem_euclid(86_400);
+
+    // Civil date from Unix days (Howard Hinnant's algorithm).
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let day_of_era = z - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let mut year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month_prime = mp + if mp < 10 { 3 } else { -9 };
     let month = month_prime + if month_prime < 10 { 3 } else { -9 };
     year += i64::from(month <= 2);
     format!(
