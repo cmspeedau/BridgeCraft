@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use bc_core::browser::BrowserState;
 use bc_core::fs::{SortDir, SortKey};
+use bc_core::selection::Selection;
 use bc_core::watcher::Watcher;
 use bc_thumbnails::{CacheStore, Thumbnail};
 use eframe::egui;
@@ -18,6 +19,15 @@ const GRID_SPACING: f32 = 8.0;
 const THUMB_MAX_EDGE: u32 = 256;
 /// Coalesce watcher event bursts into a single refresh.
 const WATCHER_DEBOUNCE: Duration = Duration::from_millis(300);
+const LIST_ROW_HEIGHT: f32 = 28.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ViewMode {
+    #[default]
+    Thumbnails,
+    List,
+    Details,
+}
 
 struct ThumbJob {
     path: PathBuf,
@@ -84,6 +94,8 @@ pub struct BridgeApp {
     browser: BrowserState,
     path_input: String,
     status: String,
+    view_mode: ViewMode,
+    list_focused: bool,
 
     thumb_tx: Sender<ThumbJob>,
     thumb_rx: Receiver<ThumbResult>,
@@ -112,6 +124,8 @@ impl BridgeApp {
             browser: BrowserState::default(),
             path_input: String::new(),
             status: "Ready.".into(),
+            view_mode: ViewMode::Thumbnails,
+            list_focused: false,
             thumb_tx: job_tx,
             thumb_rx: res_rx,
             pending: HashSet::new(),
@@ -178,8 +192,7 @@ impl BridgeApp {
                 self.refresh_due = None;
                 match self.browser.refresh_preserving_selection() {
                     Ok(()) => {
-                        self.status =
-                            format!("Refreshed ({} items)", self.browser.len());
+                        self.status = format!("Refreshed ({} items)", self.browser.len());
                     }
                     Err(e) => tracing::warn!("live refresh failed: {e}"),
                 }
@@ -233,14 +246,17 @@ impl BridgeApp {
             let before = self.browser.filter.clone();
             let resp = ui.add_sized(
                 [220.0, 20.0],
-                egui::TextEdit::singleline(&mut self.browser.filter)
-                    .hint_text("name contains…"),
+                egui::TextEdit::singleline(&mut self.browser.filter).hint_text("name contains…"),
             );
             // Re-apply immediately on any edit (also handles clearing).
             if resp.changed() || self.browser.filter != before {
                 let shown = self.browser.set_filter(self.browser.filter.clone());
-                self.status = format!("Filter “{}”: {} of {} items",
-                    self.browser.filter, shown, self.browser.len());
+                self.status = format!(
+                    "Filter “{}”: {} of {} items",
+                    self.browser.filter,
+                    shown,
+                    self.browser.len()
+                );
             }
             if ui.button("✕").clicked() && !self.browser.filter.is_empty() {
                 self.browser.set_filter("");
@@ -267,8 +283,7 @@ impl BridgeApp {
             0.0
         };
         let available_width = ui.available_width().max(0.0);
-        let cols = (((available_width + spacing) / (cell_width + spacing)).floor() as usize)
-            .max(1);
+        let cols = (((available_width + spacing) / (cell_width + spacing)).floor() as usize).max(1);
         let indices = self.browser.visible_indices();
         let row_step = row_height + spacing;
         let row_count = (indices.len() + cols - 1) / cols;
@@ -277,10 +292,8 @@ impl BridgeApp {
             // ScrollArea reports the viewport in content coordinates. Use its
             // vertical bounds to lay out only rows that can be seen; spacers
             // retain the full scroll range without creating off-screen cells.
-            let first_row = ((viewport.min.y.max(0.0) / row_step).floor() as usize)
-                .min(row_count);
-            let end_row = ((viewport.max.y.max(0.0) / row_step).ceil() as usize)
-                .min(row_count);
+            let first_row = ((viewport.min.y.max(0.0) / row_step).floor() as usize).min(row_count);
+            let end_row = ((viewport.max.y.max(0.0) / row_step).ceil() as usize).min(row_count);
             let end_row = end_row.max(first_row);
             ui.add_space(first_row as f32 * row_step);
 
@@ -303,7 +316,9 @@ impl BridgeApp {
                                 egui::vec2(cell_width, row_height),
                                 egui::Layout::top_down(egui::Align::Center),
                                 |cell_ui| {
-                                    self.cell(cell_ui, idx, &path, is_dir, size, selected, cell_width)
+                                    self.cell(
+                                        cell_ui, idx, &path, is_dir, size, selected, cell_width,
+                                    )
                                 },
                             )
                             .inner;
@@ -332,6 +347,140 @@ impl BridgeApp {
             }
 
             ui.add_space((row_count - end_row) as f32 * row_step);
+        });
+    }
+
+    fn content_list(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, details: bool) {
+        let visible = self.browser.visible_indices();
+        if details {
+            ui.horizontal(|ui| {
+                ui.strong("Name");
+                ui.add_space(ui.available_width() * 0.48);
+                ui.strong("Type");
+                ui.add_space(48.0);
+                ui.strong("Size");
+                ui.add_space(42.0);
+                ui.strong("Modified");
+            });
+            ui.separator();
+        }
+
+        if self.list_focused && !ctx.wants_keyboard_input() {
+            let (up, down, shift) = ui.input(|input| {
+                (
+                    input.key_pressed(egui::Key::ArrowUp),
+                    input.key_pressed(egui::Key::ArrowDown),
+                    input.modifiers.shift,
+                )
+            });
+            let delta = if up {
+                Some(-1)
+            } else if down {
+                Some(1)
+            } else {
+                None
+            };
+            if let Some(delta) = delta {
+                if let Some(target) = navigation_target(&visible, &self.browser.selection, delta) {
+                    if shift {
+                        self.browser.selection.select_range(target);
+                    } else {
+                        self.browser.selection.select_only(target);
+                    }
+                }
+            }
+        }
+
+        egui::ScrollArea::vertical().show_rows(ui, LIST_ROW_HEIGHT, visible.len(), |ui, rows| {
+            for row in rows {
+                let idx = visible[row];
+                let Some(entry) = self.browser.entries.get(idx) else {
+                    continue;
+                };
+                let name = entry.name().to_string_lossy().into_owned();
+                let is_dir = entry.is_dir;
+                let size = entry.size;
+                let modified = format_modified(entry.modified);
+                let file_type = if is_dir {
+                    "Folder".to_owned()
+                } else {
+                    entry
+                        .path
+                        .extension()
+                        .map(|ext| ext.to_string_lossy().to_uppercase())
+                        .filter(|ext| !ext.is_empty())
+                        .unwrap_or_else(|| "File".to_owned())
+                };
+                let selected = self.browser.selection.contains(idx);
+                let (rect, response) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), LIST_ROW_HEIGHT),
+                    egui::Sense::click(),
+                );
+                if selected {
+                    ui.painter()
+                        .rect_filled(rect, 2.0, ui.visuals().selection.bg_fill);
+                } else if row % 2 == 1 {
+                    ui.painter()
+                        .rect_filled(rect, 0.0, ui.visuals().faint_bg_color);
+                }
+                let color = if selected {
+                    ui.visuals().selection.stroke.color
+                } else {
+                    ui.visuals().text_color()
+                };
+                if details {
+                    let widths = [
+                        rect.width() * 0.52,
+                        rect.width() * 0.18,
+                        rect.width() * 0.14,
+                        rect.width() * 0.16,
+                    ];
+                    let values = [
+                        format!("{}  {name}", if is_dir { "▸" } else { "·" }),
+                        file_type,
+                        if is_dir {
+                            String::new()
+                        } else {
+                            human_size(size)
+                        },
+                        modified,
+                    ];
+                    let mut x = rect.left() + 8.0;
+                    for (value, width) in values.iter().zip(widths) {
+                        ui.painter().text(
+                            egui::pos2(x, rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            value,
+                            egui::FontId::proportional(13.0),
+                            color,
+                        );
+                        x += width;
+                    }
+                } else {
+                    ui.painter().text(
+                        egui::pos2(rect.left() + 8.0, rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        format!("{}  {name}", if is_dir { "▸" } else { "·" }),
+                        egui::FontId::proportional(14.0),
+                        color,
+                    );
+                }
+                if response.clicked() {
+                    self.list_focused = true;
+                    let mods = ui.input(|input| input.modifiers);
+                    if mods.shift {
+                        self.browser.selection.select_range(idx);
+                    } else if mods.ctrl || mods.command {
+                        self.browser.selection.toggle(idx);
+                    } else {
+                        self.browser.selection.select_only(idx);
+                    }
+                }
+                if response.double_clicked() && is_dir {
+                    let path = self.browser.entries[idx].path.clone();
+                    self.open_root(&path);
+                }
+            }
         });
     }
 
@@ -369,13 +518,8 @@ impl BridgeApp {
                 );
             } else if let Some(tex) = self.textures.get(path) {
                 let tex_size = tex.size_vec2();
-                let scale = ((rect.size().x / tex_size.x)
-                    .min(rect.size().y / tex_size.y))
-                .min(1.0);
-                let draw_rect = egui::Rect::from_center_size(
-                    rect.center(),
-                    tex_size * scale,
-                );
+                let scale = ((rect.size().x / tex_size.x).min(rect.size().y / tex_size.y)).min(1.0);
+                let draw_rect = egui::Rect::from_center_size(rect.center(), tex_size * scale);
                 ui.painter().image(
                     tex.id(),
                     draw_rect,
@@ -489,10 +633,17 @@ impl eframe::App for BridgeApp {
                         SortDir::Asc => SortDir::Desc,
                         SortDir::Desc => SortDir::Asc,
                     };
-                    self.browser.set_sort(self.browser.sort_key, self.browser.sort_dir);
+                    self.browser
+                        .set_sort(self.browser.sort_key, self.browser.sort_dir);
                 }
                 ui.separator();
                 self.filter_bar(ui);
+            });
+            ui.horizontal(|ui| {
+                ui.label("View:");
+                ui.selectable_value(&mut self.view_mode, ViewMode::Thumbnails, "Thumbnails");
+                ui.selectable_value(&mut self.view_mode, ViewMode::List, "List");
+                ui.selectable_value(&mut self.view_mode, ViewMode::Details, "Details");
             });
             ui.horizontal(|ui| {
                 if ui.button("Select All").clicked() {
@@ -522,14 +673,15 @@ impl eframe::App for BridgeApp {
                     if self.browser.is_empty() {
                         ui.weak("This folder is empty.");
                     } else {
-                        ui.weak(format!(
-                            "No items match filter “{}”.",
-                            self.browser.filter
-                        ));
+                        ui.weak(format!("No items match filter “{}”.", self.browser.filter));
                     }
                 });
             } else {
-                self.content_grid(ui);
+                match self.view_mode {
+                    ViewMode::Thumbnails => self.content_grid(ui),
+                    ViewMode::List => self.content_list(ui, ctx, false),
+                    ViewMode::Details => self.content_list(ui, ctx, true),
+                }
             }
         });
 
@@ -548,5 +700,80 @@ impl eframe::App for BridgeApp {
                 });
             });
         });
+    }
+}
+
+fn navigation_target(visible: &[usize], selection: &Selection, delta: i32) -> Option<usize> {
+    if visible.is_empty() {
+        return None;
+    }
+    let current = selection
+        .anchor()
+        .and_then(|anchor| visible.iter().position(|&idx| idx == anchor))
+        .or_else(|| {
+            selection
+                .indices()
+                .find_map(|idx| visible.iter().position(|&visible_idx| visible_idx == idx))
+        });
+    let next = match current {
+        Some(position) => (position as i32 + delta).clamp(0, visible.len() as i32 - 1) as usize,
+        None if delta < 0 => visible.len() - 1,
+        None => 0,
+    };
+    Some(visible[next])
+}
+
+fn format_modified(modified: Option<std::time::SystemTime>) -> String {
+    use std::time::UNIX_EPOCH;
+    let Some(seconds) = modified
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs() as i64)
+    else {
+        return "—".to_owned();
+    };
+    let days = seconds.div_euclid(86_400);
+    let day_seconds = seconds.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}",
+        day_seconds / 3600,
+        day_seconds % 3600 / 60
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_navigation_follows_filtered_order_and_clamps() {
+        let mut selection = Selection::new();
+        assert_eq!(navigation_target(&[1, 4, 7], &selection, 1), Some(1));
+        selection.select_only(4);
+        assert_eq!(navigation_target(&[1, 4, 7], &selection, 1), Some(7));
+        assert_eq!(navigation_target(&[1, 4, 7], &selection, -1), Some(1));
+        assert_eq!(navigation_target(&[1, 4, 7], &selection, -1), Some(1));
+        assert_eq!(navigation_target(&[], &selection, 1), None);
+    }
+
+    #[test]
+    fn modified_time_is_displayed_as_utc() {
+        use std::time::{Duration, UNIX_EPOCH};
+        assert_eq!(format_modified(Some(UNIX_EPOCH)), "1970-01-01 00:00");
+        assert_eq!(
+            format_modified(Some(UNIX_EPOCH + Duration::from_secs(1_704_067_200))),
+            "2024-01-01 00:00"
+        );
+        assert_eq!(format_modified(None), "—");
     }
 }

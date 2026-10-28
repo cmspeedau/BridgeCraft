@@ -27,10 +27,10 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [x] **Watcher-driven live refresh**: watcher attached on folder open, events drained per frame, bursts coalesced via 300 ms debounce into `refresh_preserving_selection()`
 - [x] Virtualized thumbnail grid rendering (visible rows only; egui `ScrollArea` + manual row math; thumbnail requests limited to visible cells)
 - [~] Virtual folder tree with favorites, recent folders, shared collections (data model pending)
-- [ ] List & details view modes (Bridge parity: Thumbnails / Filmstrip / List / Details)
+- [x] List & details view modes (Bridge parity: Thumbnails / List / Details; Filmstrip remains future work)
 - [ ] Copy / move / rename / delete (with recents/bin)
 - [ ] Drag & drop (internal reordering + OS interop)
-- [ ] **Phase 1 fix-up (remaining):** list/details views
+- [x] **Phase 1 fix-up:** list/details views
 
 ## Phase 2 — Thumbnails & Previews (Weeks 9–20) — ◐ cache + core decoders DONE
 - [x] Thumbnail cache database: SQLite (`rusqlite` bundled, WAL) keyed by `(path, max_edge)`, invalidation on `(mtime_ns, size)`, `prune_missing()` cleanup (`bc-thumbnails::cache`)
