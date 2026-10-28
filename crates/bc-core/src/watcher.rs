@@ -16,8 +16,7 @@ impl Watcher {
         }
         let (tx, rx) = std::sync::mpsc::channel();
         let mut watcher = notify::recommended_watcher(tx)
-            .map_err(|e| CoreError::Io(std::io::Error::other(e)));
-        let mut watcher = watcher?;
+            .map_err(|e| CoreError::Io(std::io::Error::other(e)))?;
         notify::Watcher::watch(&mut watcher, root, notify::RecursiveMode::Recursive)
             .map_err(|e| CoreError::Io(std::io::Error::other(e)))?;
         Ok(Self { _watcher: watcher, rx })

@@ -2,8 +2,6 @@
 
 mod app;
 
-use anyhow::Context;
-
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -29,9 +27,7 @@ fn main() -> anyhow::Result<()> {
     eframe::run_native(
         "BridgeCraft",
         options,
-        Box::new(|cc| {
-            Box::new(app::BridgeApp::new(cc, root, cache_path))
-        }),
+        Box::new(|cc| Box::new(app::BridgeApp::new(cc, root, cache_path))),
     )
     .map_err(|e| anyhow::anyhow!("eframe exited with an error: {e}"))?;
     Ok(())

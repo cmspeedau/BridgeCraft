@@ -173,13 +173,13 @@ mod tests {
         // "arp" matches Report.PNG case-insensitively; Archive (dir) always shown.
         assert_eq!(st.set_filter("arp"), 2);
         let vis = st.visible_indices();
-        let names: Vec<&str> = vis
+        let names: Vec<String> = vis
             .iter()
-            .map(|&i| st.entry(i).unwrap().name())
+            .map(|&i| st.entry(i).unwrap().name().to_string_lossy().into_owned())
             .collect();
-        assert!(names.contains(&"Report.PNG"));
-        assert!(names.contains(&"Archive"));
-        assert!(!names.contains(&"notes.txt"));
+        assert!(names.iter().any(|n| n == "Report.PNG"));
+        assert!(names.iter().any(|n| n == "Archive"));
+        assert!(names.iter().all(|n| n != "notes.txt"));
 
         // Empty/whitespace filter shows everything again.
         assert_eq!(st.set_filter("   "), 3);
