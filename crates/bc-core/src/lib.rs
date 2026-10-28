@@ -4,7 +4,9 @@ pub mod browser;
 pub mod entry;
 pub mod file_ops;
 pub mod fs;
+pub mod recents;
 pub mod selection;
+pub mod trash;
 pub mod watcher;
 
 pub use entry::Entry;
