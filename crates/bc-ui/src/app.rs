@@ -301,7 +301,7 @@ impl BridgeApp {
         let cols = (((available_width + spacing) / (cell_width + spacing)).floor() as usize).max(1);
         let indices = self.browser.visible_indices();
         let row_step = row_height + spacing;
-        let row_count = (indices.len() + cols - 1) / cols;
+        let row_count = indices.len().div_ceil(cols);
 
         egui::ScrollArea::vertical().show_viewport(ui, |ui, viewport| {
             // ScrollArea reports the viewport in content coordinates. Use its
@@ -677,6 +677,7 @@ impl BridgeApp {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn cell(
         &self,
         ui: &mut egui::Ui,
@@ -975,3 +976,4 @@ mod tests {
         assert_eq!(format_modified(None), "—");
     }
 }
+
