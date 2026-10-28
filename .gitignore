@@ -1,0 +1,13 @@
+/target
+Cargo.lock.orig
+
+# Backup / temp files
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Editor / IDE
+.idea/
+.vscode/
+*.iml
