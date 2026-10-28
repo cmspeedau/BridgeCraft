@@ -93,7 +93,7 @@ impl BrowserState {
                 e.is_dir
                     || e.path
                         .file_name()
-                        .map_or(false, |n| n.to_string_lossy().to_lowercase().contains(&needle))
+                        .is_some_and(|n| n.to_string_lossy().to_lowercase().contains(&needle))
             })
             .map(|(i, _)| i)
             .collect()
