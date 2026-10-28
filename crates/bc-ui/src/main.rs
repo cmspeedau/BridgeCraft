@@ -33,5 +33,6 @@ fn main() -> anyhow::Result<()> {
             Box::new(app::BridgeApp::new(cc, root, cache_path))
         }),
     )
-    .context("eframe exited with an error")
+    .map_err(|e| anyhow::anyhow!("eframe exited with an error: {e}"))?;
+    Ok(())
 }
