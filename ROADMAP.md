@@ -28,7 +28,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [x] Virtualized thumbnail grid rendering (visible rows only; egui `ScrollArea` + manual row math; thumbnail requests limited to visible cells)
 - [~] Virtual folder tree with favorites, recent folders, shared collections (data model pending)
 - [x] List & details view modes (Bridge parity: Thumbnails / List / Details; Filmstrip remains future work)
-- [ ] Copy / move / rename / delete (with recents/bin)
+- [~] Copy / move / rename / delete (with recents/bin) — safe filesystem primitives for copy, move, rename, and delete implemented in `bc-core::file_ops`; browser integration and recents/bin remain
 - [ ] Drag & drop (internal reordering + OS interop)
 - [x] **Phase 1 fix-up:** list/details views
 
@@ -112,7 +112,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 ## Milestones
 | Milestone | Target | Definition of Done | Status |
 |---|---|---|---|
-| M1 — Browser MVP | Q1 2027 | Browse, sort, filter, live refresh, thumbnails, basic file ops | ◐ GUI + core done; remaining: list/details views, file ops, drag & drop |
+| M1 — Browser MVP | Q1 2027 | Browse, sort, filter, live refresh, thumbnails, basic file ops | ◐ GUI + core done; remaining: file-operation UI, recents/bin, drag & drop |
 | M2 — Preview Engine | Q2 2027 | RAW/PSD/PDF/video previews with caching | ◐ PNG/JPEG/GIF/WebP/TIFF/BMP + SQLite cache done |
 | M3 — Metadata Complete | Q3 2027 | XMP/EXIF/IPTC read-write, smart collections | not started |
 | M4 — Automation | Q4 2027 | Batch ops, scripting API | not started |
@@ -120,7 +120,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 | M6 — 1:1 Parity Audit & Release | 2028 | Feature checklist parity vs. Bridge 2026 user guide; universal macOS build, Windows portable+MSI, AppImage+.zsync published (unsigned) | not started |
 
 ## Critical Path
-With ADR-0001 resolved (egui/eframe), filter + live refresh shipped, and virtualized grid rendering complete, the remaining critical path is: **list/details views → file operations → drag & drop**. Metadata engine (Phase 3) can proceed in parallel.
+With ADR-0001 resolved (egui/eframe), filter + live refresh shipped, and virtualized grid rendering complete, the remaining critical path is: **file-operation UI + recents/bin → drag & drop**. Metadata engine (Phase 3) can proceed in parallel.
 
 ## Risks
 - RAW format coverage breadth (mitigate: LibRaw bindings)
@@ -132,3 +132,5 @@ With ADR-0001 resolved (egui/eframe), filter + live refresh shipped, and virtual
 - ArtCraft integration depends on an external project's evolving APIs (mitigate: version the bridge plugin against specific ArtCraft releases; its MIT/Apache licensing keeps the dependency clean)
 - LightCraft integration depends on an external project's evolving APIs (mitigate: version the bridge plugin against specific LightCraft releases; its MIT/Apache licensing keeps the dependency clean, and it is young/moving fast so pin early)
 - Unsigned distribution artifacts will trigger OS trust warnings (macOS Gatekeeper, Windows SmartScreen) that users must dismiss manually (accepted trade-off: no signing certificates are purchased or managed)
+
+---
