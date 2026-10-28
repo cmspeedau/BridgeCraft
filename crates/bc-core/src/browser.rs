@@ -170,16 +170,17 @@ mod tests {
         let mut st = BrowserState::default();
         st.open(dir.path()).unwrap();
 
-        // "arp" matches Report.PNG case-insensitively; Archive (dir) always shown.
-        assert_eq!(st.set_filter("arp"), 2);
+        // Uppercase "NOT" matches notes.txt case-insensitively;
+        // Archive (dir) is always shown regardless of the filter.
+        assert_eq!(st.set_filter("NOT"), 2);
         let vis = st.visible_indices();
         let names: Vec<String> = vis
             .iter()
             .map(|&i| st.entry(i).unwrap().name().to_string_lossy().into_owned())
             .collect();
-        assert!(names.iter().any(|n| n == "Report.PNG"));
+        assert!(names.iter().any(|n| n == "notes.txt"));
         assert!(names.iter().any(|n| n == "Archive"));
-        assert!(names.iter().all(|n| n != "notes.txt"));
+        assert!(names.iter().all(|n| n != "Report.PNG"));
 
         // Empty/whitespace filter shows everything again.
         assert_eq!(st.set_filter("   "), 3);
@@ -193,8 +194,12 @@ mod tests {
 
         let mut st = BrowserState::default();
         st.open(dir.path()).unwrap();
-        // entries sorted: keep.txt=0, drop.txt=1
-        st.selection.select_only(0);
+        // Look up keep.txt's index instead of hardcoding it, so the test
+        // doesn't depend on sort order.
+        let keep_idx = (0..st.len())
+            .find(|&i| st.entry(i).unwrap().name() == "keep.txt")
+            .unwrap();
+        st.selection.select_only(keep_idx);
         st.set_filter("keep");
         assert_eq!(st.selection.indices().count(), 1);
         st.set_filter("");
