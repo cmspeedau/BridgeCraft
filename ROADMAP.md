@@ -28,7 +28,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [x] Virtualized thumbnail grid rendering (visible rows only; egui `ScrollArea` + manual row math; thumbnail requests limited to visible cells)
 - [~] Virtual folder tree with favorites, recent folders, shared collections (data model pending)
 - [x] List & details view modes (Bridge parity: Thumbnails / List / Details; Filmstrip remains future work)
-- [~] Copy / move / rename / delete (with recents/bin) — safe filesystem primitives plus per-user persistent recents and a managed trash bin (list/restore) implemented in `bc-core`; browser integration and file-operation UI remain
+- [~] Copy / move / rename / delete (with recents/bin) — core operations implemented; persistent recents are bounded, managed trash supports move/list/restore, and permanent delete is separate; browser/UI integration remains
 - [ ] Drag & drop (internal reordering + OS interop)
 - [x] **Phase 1 fix-up:** list/details views
 
@@ -62,10 +62,37 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [ ] Watched-folder auto-processing
 - [ ] Scripting/automation API (Lua or WASM plugins)
 
-## Phase 5 — Creative Cloud-Style Integrations (clean-room equivalents) (Weeks 30–40)
+## Phase 5 — Integrations & Plugin Ecosystem (clean-room equivalents) (Weeks 30–40)
 - [ ] Export/publish pipelines (replaces CC Libraries)
 - [ ] Version control / version stacks for assets
 - [ ] Migration importer (reads existing Bridge caches read-only where formats are documented)
+- [ ] **Apple Photos support**: read-only integration with the macOS Photos library
+  - [ ] Locate and open the user's `Photos.sqlite` library (read-only; never write to it) via `photoslibrary`-style access on macOS
+  - [ ] Enumerate moments/albums as virtual folders in the browser tree; surface originals + edits as entries
+  - [ ] Extract assets (originals and current renditions) into the thumbnail pipeline and preview viewer; iCloud-shared (`cloudPlaceholder`) items show a downloaded-on-demand state
+  - [ ] Metadata mapping: Photos keywords/albums/favorites → bc-metadata tags (Phase 3 alignment)
+  - [ ] Platform gate: macOS-only feature, compiled out elsewhere; user must grant disk access
+  - *Clean-room note: spec from public Photos library schema documentation and observed behavior only; no Apple code.*
+- [ ] **Plugin system for BridgeCraft** (successor to the Phase 4 scripting API; Bridges-style extension model)
+  - [ ] Plugin manifest + loader: local plugins discovered from a plugins directory; manifest declares name, version, entry points, and capabilities (menu items, panel, context-menu hooks)
+  - [ ] Plugin API surface (Rust trait + WASM host boundary): access to browser selection, current folder, thumbnails, metadata read, and file operations through a permissioned host API
+  - [ ] Sandboxing: WASM plugins run isolated with explicit capabilities (fs paths, network off by default); native plugins out of scope for v1
+  - [ ] UI extension points: plugin-registered panels, toolbar/menu actions, and batch-processing hooks
+  - [ ] Plugin manager dialog: list, enable/disable, permissions review
+  - *Relationship to Phase 4: the Phase 4 Lua/WASM scripting API is the automation surface; this is the packaged, distributable plugin layer built on top of it.*
+- [ ] **ArtCraft bridge plugin** (first-party plugin targeting [storytold/artcraft](https://github.com/storytold/artcraft))
+  - [ ] ArtCraft is a Rust, MIT/Apache-2.0 dual-licensed "IDE for artists" (AI image/video generation with Photoshop-style 2D/3D canvas compositing, layers, masking, inpainting) — a natural round-trip target for asset workflows, and its permissive license allows direct API integration (no clean-room constraints needed for this partner)
+  - [ ] Round-trip workflow: "Edit in ArtCraft" context-menu action on selected images → open in ArtCraft canvas → on save/export, updated file lands back in the browsed folder and the watcher refresh picks it up automatically (Phase 1 live refresh makes this near-free)
+  - [ ] Asset hand-off: send BridgeCraft selections (with XMP sidecar metadata, once Phase 3 lands) into ArtCraft projects as layers/ingredients; receive exports back as versioned assets (version stacks integration)
+  - [ ] Discovery: locate the ArtCraft executable/library on Win/macOS/Linux (it ships for all three), or let the user point at an install
+  - [ ] Implement as the first consumer of the plugin system above to prove the API surface
+- [ ] **LightCraft bridge plugin** (first-party plugin targeting [storytold/lightcraft](https://github.com/storytold/lightcraft))
+  - [ ] LightCraft is a Rust, MIT/Apache-2.0 dual-licensed, non-destructive photo library and raw developer written in pure Rust (the Lightroom analogue to ArtCraft's Photoshop analogue), cross-platform on macOS/Windows/Linux plus WASM — a natural round-trip target for photo culling and RAW workflows, and its permissive license allows direct API integration (no clean-room constraints needed for this partner)
+  - [ ] Round-trip workflow: "Edit in LightCraft" context-menu action on selected images/RAWs → develop non-destructively in LightCraft → on export, rendered files land back in the browsed folder and the watcher refresh picks them up automatically (Phase 1 live refresh makes this near-free)
+  - [ ] Library-aware hand-off: send BridgeCraft selections (with XMP sidecar metadata and ratings/labels, once Phase 3 lands) into LightCraft's library; receive develop settings and exports back as versioned assets (version stacks integration)
+  - [ ] RAW synergy: LightCraft's Rust RAW decoding can complement Phase 2's camera-RAW plans (evaluate reusing its decoders via the plugin boundary rather than duplicating LibRaw bindings)
+  - [ ] Discovery: locate the LightCraft executable/library on Win/macOS/Linux (it ships for all three), or let the user point at an install
+  - [ ] Implement alongside ArtCraft as a second consumer of the plugin system to prove the API surface generalizes beyond a single partner
 
 ## Phase 6 — Polish, Packaging & 1:1 Parity (Weeks 36–52)
 - [ ] Keyboard shortcut parity + custom shortcut editor
@@ -85,7 +112,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 ## Milestones
 | Milestone | Target | Definition of Done | Status |
 |---|---|---|---|
-| M1 — Browser MVP | Q1 2027 | Browse, sort, filter, live refresh, thumbnails, basic file ops | ◐ GUI + core done; remaining: file-operation UI, recents/bin, drag & drop |
+| M1 — Browser MVP | Q1 2027 | Browse, sort, filter, live refresh, thumbnails, basic file ops | ◐ GUI + core done; recents/trash primitives done; remaining: file-operation UI, drag & drop |
 | M2 — Preview Engine | Q2 2027 | RAW/PSD/PDF/video previews with caching | ◐ PNG/JPEG/GIF/WebP/TIFF/BMP + SQLite cache done |
 | M3 — Metadata Complete | Q3 2027 | XMP/EXIF/IPTC read-write, smart collections | not started |
 | M4 — Automation | Q4 2027 | Batch ops, scripting API | not started |
@@ -93,11 +120,11 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 | M6 — 1:1 Parity Audit & Release | 2028 | Feature checklist parity vs. Bridge 2026 user guide; universal macOS build, Windows portable+MSI, AppImage+.zsync published (unsigned) | not started |
 
 ## Critical Path
-With ADR-0001 resolved (egui/eframe), filter + live refresh shipped, and virtualized grid rendering complete, the remaining critical path is: **file-operation UI + recents/bin → drag & drop**. Metadata engine (Phase 3) can proceed in parallel.
+With ADR-0001 resolved (egui/eframe), filter + live refresh shipped, and virtualized grid rendering complete, the remaining critical path is: **file-operation UI → drag & drop**. Recents and managed-trash primitives are implemented in `bc-core`; the browser/UI integration remains. Metadata engine (Phase 3) can proceed in parallel.
 
 ## Risks
 - RAW format coverage breadth (mitigate: LibRaw bindings)
-- GUI performance on huge folders (mitigate: virtualization — egui `Grid` is not virtualized; custom painter-based grid is the fallback per ADR-0001)
+- GUI performance on huge folders (mitigate: virtualized grid paints only visible rows and requests thumbnails only for visible cells)
 - Watcher platform quirks (inotify/FSEvents/ReadDirectoryChangesW edge cases, e.g. network drives) — debounced refresh + manual navigation already degrade gracefully
 - Parity scope creep (mitigate: milestone audits, feature freeze discipline)
 - Apple Photos integration is macOS-only and schema-dependent (mitigate: read-only access, graceful "library unavailable" degradation, feature-gated build)
@@ -107,3 +134,4 @@ With ADR-0001 resolved (egui/eframe), filter + live refresh shipped, and virtual
 - Unsigned distribution artifacts will trigger OS trust warnings (macOS Gatekeeper, Windows SmartScreen) that users must dismiss manually (accepted trade-off: no signing certificates are purchased or managed)
 
 ---
+
