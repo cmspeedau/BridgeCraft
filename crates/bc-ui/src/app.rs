@@ -743,7 +743,7 @@ fn format_modified(modified: Option<std::time::SystemTime>) -> String {
     let mut year = year_of_era + era * 400;
     let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
     let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_era - (153 * month_prime + 2) / 5 + 1;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
     let month = month_prime + if month_prime < 10 { 3 } else { -9 };
     year += i64::from(month <= 2);
     format!(
