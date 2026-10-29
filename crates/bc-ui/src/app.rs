@@ -301,7 +301,7 @@ impl BridgeApp {
         let cols = (((available_width + spacing) / (cell_width + spacing)).floor() as usize).max(1);
         let indices = self.browser.visible_indices();
         let row_step = row_height + spacing;
-        let row_count = indices.len().div_ceil(cols);
+        let row_count = (indices.len() + cols - 1) / cols;
 
         egui::ScrollArea::vertical().show_viewport(ui, |ui, viewport| {
             // ScrollArea reports the viewport in content coordinates. Use its
@@ -677,7 +677,6 @@ impl BridgeApp {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn cell(
         &self,
         ui: &mut egui::Ui,
@@ -908,39 +907,41 @@ fn navigation_target(visible: &[usize], selection: &Selection, delta: i32) -> Op
     if visible.is_empty() {
         return None;
     }
-    let current = visible
-        .iter()
-        .position(|idx| selection.contains(*idx))
-        .unwrap_or(0);
-    let next = if delta < 0 {
-        current.saturating_sub(delta.unsigned_abs() as usize)
-    } else {
-        current.saturating_add(delta as usize).min(visible.len() - 1)
+    let current = selection
+        .anchor()
+        .and_then(|anchor| visible.iter().position(|&idx| idx == anchor))
+        .or_else(|| {
+            selection
+                .indices()
+                .find_map(|idx| visible.iter().position(|&visible_idx| visible_idx == idx))
+        });
+    let next = match current {
+        Some(position) => (position as i32 + delta).clamp(0, visible.len() as i32 - 1) as usize,
+        None if delta < 0 => visible.len() - 1,
+        None => 0,
     };
     Some(visible[next])
 }
 
 fn format_modified(modified: Option<std::time::SystemTime>) -> String {
-    let Some(modified) = modified else {
+    use std::time::UNIX_EPOCH;
+    let Some(seconds) = modified
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs() as i64)
+    else {
         return "—".to_owned();
     };
-    let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) else {
-        return "—".to_owned();
-    };
-    let seconds = duration.as_secs() as i64;
     let days = seconds.div_euclid(86_400);
     let day_seconds = seconds.rem_euclid(86_400);
-
-    // Civil date from Unix days (Howard Hinnant's algorithm).
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let mut year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month_prime = mp + if mp < 10 { 3 } else { -9 };
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
     let month = month_prime + if month_prime < 10 { 3 } else { -9 };
     year += i64::from(month <= 2);
     format!(
@@ -976,4 +977,3 @@ mod tests {
         assert_eq!(format_modified(None), "—");
     }
 }
-
