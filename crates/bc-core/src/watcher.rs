@@ -55,7 +55,7 @@ mod tests {
                 let e = result.as_ref().expect("watcher reported an event error");
                 e.paths
                     .iter()
-                    .any(|p| p.file_name().map_or(false, |n| n == "new.txt"))
+                    .any(|p| p.file_name().is_some_and(|n| n == "new.txt"))
             }) {
                 seen = true;
                 break;
