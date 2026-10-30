@@ -76,6 +76,57 @@ pub fn move_path(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+/// How selected items are transferred into a destination folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferMode {
+    Move,
+    Copy,
+}
+
+/// Move or copy selected paths into an existing folder, preserving each name.
+/// Items already in that folder are skipped for moves; copies still report the
+/// existing-name collision. Directory transfers into themselves/descendants are rejected.
+pub fn transfer_into_folder(
+    sources: &[PathBuf],
+    destination_folder: &Path,
+    mode: TransferMode,
+) -> Result<usize> {
+    let destination_meta = ensure_source(destination_folder)?;
+    if !destination_meta.is_dir() {
+        return Err(CoreError::InvalidOperation(format!(
+            "destination is not a folder: {}", destination_folder.display()
+        )));
+    }
+    let destination_real = std::fs::canonicalize(destination_folder)?;
+    let mut transferred = 0;
+    for source in sources {
+        let source_meta = ensure_source(source)?;
+        let name = source.file_name().ok_or_else(|| {
+            CoreError::InvalidOperation(format!("path has no file name: {}", source.display()))
+        })?;
+        let source_real = std::fs::canonicalize(source)?;
+        if source_meta.is_dir() && destination_real.starts_with(&source_real) {
+            return Err(CoreError::InvalidOperation(format!(
+                "cannot transfer a folder into itself or its descendant: {}", source.display()
+            )));
+        }
+        if mode == TransferMode::Move {
+            if let Some(parent) = source_real.parent() {
+                if parent == destination_real {
+                    continue;
+                }
+            }
+        }
+        let destination = destination_folder.join(name);
+        match mode {
+            TransferMode::Move => move_path(source, &destination)?,
+            TransferMode::Copy => copy_path(source, &destination)?,
+        }
+        transferred += 1;
+    }
+    Ok(transferred)
+}
+
 /// Rename an item in place. `new_name` must be a single, non-empty path component.
 pub fn rename_path(source: &Path, new_name: &str) -> Result<PathBuf> {
     ensure_source(source)?;
@@ -155,6 +206,32 @@ mod tests {
         delete_path(&folder).unwrap();
         assert!(!folder.exists());
         assert!(matches!(delete_path(&file), Err(CoreError::PathNotFound(_))));
+    }
+
+    #[test]
+    fn folder_transfer_skips_same_folder_and_rejects_descendants_and_collisions() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_folder = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        std::fs::create_dir_all(&source_folder).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        let source = source_folder.join("asset.txt");
+        std::fs::write(&source, b"asset").unwrap();
+
+        assert_eq!(transfer_into_folder(&[source.clone()], &source_folder, TransferMode::Move).unwrap(), 0);
+        assert_eq!(transfer_into_folder(&[source.clone()], &destination, TransferMode::Copy).unwrap(), 1);
+        assert!(matches!(transfer_into_folder(&[source.clone()], &destination, TransferMode::Copy), Err(CoreError::PathAlreadyExists(_))));
+        assert_eq!(std::fs::read(destination.join("asset.txt")).unwrap(), b"asset");
+        assert!(matches!(transfer_into_folder(&[source_folder.clone()], &source_folder.join("nested"), TransferMode::Move), Err(CoreError::PathNotFound(_))));
+    }
+
+    #[test]
+    fn rejects_transfer_into_existing_descendant() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("folder");
+        let child = source.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        assert!(matches!(transfer_into_folder(&[source], &child, TransferMode::Copy), Err(CoreError::InvalidOperation(_))));
     }
 
     #[test]
