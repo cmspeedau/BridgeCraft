@@ -22,17 +22,17 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [x] Directory watcher (notify) with buffered events the UI can drain (`bc-core::watcher`)
 - [x] Multi-select model: click / ctrl-toggle / shift-range / select-all (`bc-core::selection`)
 - [x] Browser state: open root, refresh, change sort (`bc-core::browser::BrowserState`)
-- [x] Content panel: thumbnail grid in egui (list/details views pending — see hardening)
+- [x] Content panel: thumbnail grid in egui (list/details views added — see below)
 - [x] **Filter box**: case-insensitive name-substring filter, dirs always visible, selection preserved by path, filter-aware Select All (`bc-core::browser::set_filter` + UI bar)
 - [x] **Watcher-driven live refresh**: watcher attached on folder open, events drained per frame, bursts coalesced via 300 ms debounce into `refresh_preserving_selection()`
 - [x] Virtualized thumbnail grid rendering (visible rows only; egui `ScrollArea` + manual row math; thumbnail requests limited to visible cells)
 - [~] Virtual folder tree with favorites, recent folders, shared collections (data model pending)
 - [x] List & details view modes (Bridge parity: Thumbnails / List / Details; Filmstrip remains future work)
 - [x] Copy / move / rename / delete (with recents/bin) — core operations implemented; persistent recents are bounded, managed trash supports move/list/restore, and permanent delete is separate; browser/UI integration complete (file operations, recents, and trash/restore)
-- [ ] Drag & drop (internal reordering + OS interop)
+- [~] Drag & drop (internal reordering + OS interop) — batch transfer primitive done (`bc-core::file_ops::transfer_into_folder`: copy/move with up-front batch validation, self/descendant rejection, collision skip, per-item error reporting); grid reordering and OS-level drag-drop interop pending
 - [x] **Phase 1 fix-up:** list/details views
 
-## Phase 2 — Thumbnails & Previews (Weeks 9–20) — ◐ cache + core decoders DONE
+## Phase 2 — Thumbnails & Previews (Weeks 9–20) — ◐ cache + core decoders + batch rebuild DONE
 - [x] Thumbnail cache database: SQLite (`rusqlite` bundled, WAL) keyed by `(path, max_edge)`, invalidation on `(mtime_ns, size)`, `prune_missing()` cleanup (`bc-thumbnails::cache`)
 - [x] Cache-first orchestrator with graceful fallback (`bc-thumbnails::load_or_generate`)
 - [x] Format decoders via Rust crates: PNG/JPEG/TIFF/GIF/WebP/BMP (via `image`), RGBA8 + aspect-preserving downscale (`bc-thumbnails::decoder`)
@@ -114,7 +114,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 ## Milestones
 | Milestone | Target | Definition of Done | Status |
 |---|---|---|---|
-| M1 — Browser MVP | Q1 2027 | Browse, sort, filter, live refresh, thumbnails, basic file ops | ◐ GUI + core done; recents/trash primitives done; remaining: file-operation UI, drag & drop |
+| M1 — Browser MVP | Q1 2027 | Browse, sort, filter, live refresh, thumbnails, basic file ops | ◐ GUI + core done; file ops, recents & trash integrated in UI; remaining: drag & drop (internal reordering + OS interop) |
 | M2 — Preview Engine | Q2 2027 | RAW/PSD/PDF/video previews with caching | ◐ PNG/JPEG/GIF/WebP/TIFF/BMP + SQLite cache done |
 | M3 — Metadata Complete | Q3 2027 | XMP/EXIF/IPTC read-write, smart collections | not started |
 | M4 — Automation | Q4 2027 | Batch ops, scripting API | not started |
@@ -122,7 +122,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 | M6 — 1:1 Parity Audit & Release | 2028 | Feature checklist parity vs. Bridge 2026 user guide; universal macOS build, Windows portable+MSI, AppImage+.zsync published (unsigned) | not started |
 
 ## Critical Path
-With ADR-0001 resolved (egui/eframe), filter + live refresh shipped, and virtualized grid rendering complete, the remaining critical path is: **file-operation UI → drag & drop**. Recents and managed-trash primitives are implemented in `bc-core`; the browser/UI integration remains. Metadata engine (Phase 3) can proceed in parallel.
+With ADR-0001 resolved (egui/eframe), filter + live refresh shipped, virtualized grid rendering complete, and file-operation UI integrated (copy/move/rename/delete with recents and trash/restore), the remaining critical path is: **drag & drop** (internal reordering + OS interop; the batch transfer primitive is already done in `bc-core::file_ops`). Metadata engine (Phase 3) can proceed in parallel.
 
 ## Risks
 - RAW format coverage breadth (mitigate: LibRaw bindings)
