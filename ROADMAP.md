@@ -42,7 +42,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [ ] Camera RAW support (LibRaw bindings or DNG parsing)
 - [ ] PSD/AI/Illustrator preview extraction
 - [ ] Preview quality levels: thumbnail / preview / 1:1 zoom viewer
-- [ ] Batch (re)build cache command
+- [x] Batch (re)build cache command
 - [~] Reuse embedded XMP/EXIF previews as fast-path thumbnails — deferred to Phase 3 (needs metadata reader)
 
 **Implementation constraint note (2026-10-30):** The PDF, video, camera-RAW, PSD/AI, and multi-quality preview items remain unimplemented. This scoped attempt did not add native bindings, subprocess fallbacks, parser stubs, or UI controls: the available repository context and verification environment were insufficient to safely implement and test these untrusted-file decoders or claim support. The items remain unchecked pending an environment with the required C toolchain/runtime libraries or independently verified pure-Rust implementations and representative fixtures. No new third-party dependency was introduced.
