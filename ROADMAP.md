@@ -42,7 +42,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [ ] Camera RAW support (LibRaw bindings or DNG parsing)
 - [ ] PSD/AI/Illustrator preview extraction
 - [ ] Preview quality levels: thumbnail / preview / 1:1 zoom viewer
-- [ ] Batch (re)build cache command
+- [x] Batch (re)build cache command
 - [~] Reuse embedded XMP/EXIF previews as fast-path thumbnails — deferred to Phase 3 (needs metadata reader)
 
 ## Phase 3 — Metadata Engine (Weeks 15–26) — NOT STARTED (skeleton only)
@@ -88,7 +88,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
   - [ ] Implement as the first consumer of the plugin system above to prove the API surface
 - [ ] **LightCraft bridge plugin** (first-party plugin targeting [storytold/lightcraft](https://github.com/storytold/lightcraft))
   - [ ] LightCraft is a Rust, MIT/Apache-2.0 dual-licensed, non-destructive photo library and raw developer written in pure Rust (the Lightroom analogue to ArtCraft's Photoshop analogue), cross-platform on macOS/Windows/Linux plus WASM — a natural round-trip target for photo culling and RAW workflows, and its permissive license allows direct API integration (no clean-room constraints needed for this partner)
-  - [ ] Round-trip workflow: "Edit in LightCraft" context-menu action on selected images/RAWs → develop non-destructively in LightCraft → on export, rendered files land back in the browsed folder and the watcher refresh picks them up automatically (Phase 1 live refresh makes this near-free)
+  - [ ] Round-trip workflow: "Edit in LightCraft" context-menu action on selected images/RAWs → develop non-destructively in LightCraft → on export, rendered files land back in the browsed folder and the watcher refresh picks it up automatically (Phase 1 live refresh makes this near-free)
   - [ ] Library-aware hand-off: send BridgeCraft selections (with XMP sidecar metadata and ratings/labels, once Phase 3 lands) into LightCraft's library; receive develop settings and exports back as versioned assets (version stacks integration)
   - [ ] RAW synergy: LightCraft's Rust RAW decoding can complement Phase 2's camera-RAW plans (evaluate reusing its decoders via the plugin boundary rather than duplicating LibRaw bindings)
   - [ ] Discovery: locate the LightCraft executable/library on Win/macOS/Linux (it ships for all three), or let the user point at an install
