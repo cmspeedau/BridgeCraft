@@ -85,14 +85,30 @@ pub enum TransferMode {
     Copy,
 }
 
+/// Summary returned by [`transfer_into_folder`].
+#[derive(Debug, Default)]
+pub struct TransferReport {
+    /// Items successfully moved or copied.
+    pub transferred: usize,
+    /// Items skipped because they already reside in the destination folder (moves only).
+    pub skipped: usize,
+    /// Per-item failures in input order; empty when every item succeeded.
+    pub errors: Vec<(PathBuf, CoreError)>,
+}
+
 /// Move or copy selected paths into an existing folder, preserving each name.
-/// Items already in that folder are skipped for moves; copies still report the
-/// existing-name collision. Directory transfers into themselves/descendants are rejected.
+///
+/// Batch-level rejections — a missing or non-folder destination, or a folder
+/// transferred into itself or its own descendant — are returned as `Err`
+/// before any item is touched, so a rejected batch leaves the filesystem
+/// unchanged. Per-item failures (name collisions, symlinked sources on copy,
+/// I/O errors) do not stop the batch: the transfer continues and each failure
+/// is collected into [`TransferReport::errors`].
 pub fn transfer_into_folder(
     sources: &[PathBuf],
     destination_folder: &Path,
     mode: TransferMode,
-) -> Result<usize> {
+) -> Result<TransferReport> {
     let destination_meta = ensure_source(destination_folder)?;
     if !destination_meta.is_dir() {
         return Err(CoreError::InvalidOperation(format!(
@@ -101,34 +117,53 @@ pub fn transfer_into_folder(
         )));
     }
     let destination_real = std::fs::canonicalize(destination_folder)?;
-    let mut transferred = 0;
+
+    // Validate every source before touching the filesystem so a rejected
+    // batch transfers nothing, not even the items before the offending one.
+    let mut plan = Vec::with_capacity(sources.len());
     for source in sources {
         let source_meta = ensure_source(source)?;
         let name = source.file_name().ok_or_else(|| {
             CoreError::InvalidOperation(format!("path has no file name: {}", source.display()))
         })?;
-        let source_real = std::fs::canonicalize(source)?;
-        if source_meta.is_dir() && destination_real.starts_with(&source_real) {
-            return Err(CoreError::InvalidOperation(format!(
-                "cannot transfer a folder into itself or its descendant: {}",
-                source.display()
-            )));
-        }
-        if mode == TransferMode::Move {
-            if let Some(parent) = source_real.parent() {
-                if parent == destination_real {
-                    continue;
-                }
+        if source_meta.is_dir() {
+            let source_real = std::fs::canonicalize(source)?;
+            if destination_real.starts_with(&source_real) {
+                return Err(CoreError::InvalidOperation(format!(
+                    "cannot transfer a folder into itself or its descendant: {}",
+                    source.display()
+                )));
             }
         }
-        let destination = destination_folder.join(name);
-        match mode {
-            TransferMode::Move => move_path(source, &destination)?,
-            TransferMode::Copy => copy_path(source, &destination)?,
-        }
-        transferred += 1;
+        // Compare the canonicalised parent rather than the canonicalised
+        // source: canonicalising the source itself resolves symlinks to their
+        // target's folder, so a symlink already sitting in the destination
+        // would not be recognised there and would collide with itself.
+        let already_in_place = mode == TransferMode::Move
+            && source
+                .parent()
+                .and_then(|parent| std::fs::canonicalize(parent).ok())
+                .is_some_and(|parent_real| parent_real == destination_real);
+        plan.push((name, already_in_place));
     }
-    Ok(transferred)
+
+    let mut report = TransferReport::default();
+    for (source, (name, already_in_place)) in sources.iter().zip(plan) {
+        if already_in_place {
+            report.skipped += 1;
+            continue;
+        }
+        let destination = destination_folder.join(name);
+        let outcome = match mode {
+            TransferMode::Move => move_path(source, &destination),
+            TransferMode::Copy => copy_path(source, &destination),
+        };
+        match outcome {
+            Ok(()) => report.transferred += 1,
+            Err(error) => report.errors.push((source.clone(), error)),
+        }
+    }
+    Ok(report)
 }
 
 /// Rename an item in place. `new_name` must be a single, non-empty path component.
@@ -223,7 +258,7 @@ mod tests {
     }
 
     #[test]
-    fn folder_transfer_skips_same_folder_and_rejects_descendants_and_collisions() {
+    fn folder_transfer_skips_same_folder_and_reports_collisions() {
         let temp = tempfile::tempdir().unwrap();
         let source_folder = temp.path().join("source");
         let destination = temp.path().join("destination");
@@ -232,26 +267,122 @@ mod tests {
         let source = source_folder.join("asset.txt");
         std::fs::write(&source, b"asset").unwrap();
 
+        let moved_in_place = transfer_into_folder(
+            std::slice::from_ref(&source),
+            &source_folder,
+            TransferMode::Move,
+        )
+        .unwrap();
         assert_eq!(
-            transfer_into_folder(&[source.clone()], &source_folder, TransferMode::Move).unwrap(),
-            0
+            (
+                moved_in_place.transferred,
+                moved_in_place.skipped,
+                moved_in_place.errors.len()
+            ),
+            (0, 1, 0)
         );
+
+        let copied = transfer_into_folder(
+            std::slice::from_ref(&source),
+            &destination,
+            TransferMode::Copy,
+        )
+        .unwrap();
         assert_eq!(
-            transfer_into_folder(&[source.clone()], &destination, TransferMode::Copy).unwrap(),
-            1
+            (copied.transferred, copied.skipped, copied.errors.len()),
+            (1, 0, 0)
         );
-        assert!(matches!(
-            transfer_into_folder(&[source.clone()], &destination, TransferMode::Copy),
-            Err(CoreError::PathAlreadyExists(_))
-        ));
         assert_eq!(
             std::fs::read(destination.join("asset.txt")).unwrap(),
             b"asset"
         );
+
+        let collided = transfer_into_folder(
+            std::slice::from_ref(&source),
+            &destination,
+            TransferMode::Copy,
+        )
+        .unwrap();
+        assert_eq!((collided.transferred, collided.skipped), (0, 0));
+        assert_eq!(collided.errors.len(), 1);
+        assert_eq!(collided.errors[0].0, source);
+        assert!(matches!(
+            collided.errors[0].1,
+            CoreError::PathAlreadyExists(_)
+        ));
+    }
+
+    #[test]
+    fn continues_batch_after_per_item_failures() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("destination");
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(destination.join("b.txt"), b"existing").unwrap();
+        let a = temp.path().join("a.txt");
+        let b = temp.path().join("b.txt");
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+
+        let report =
+            transfer_into_folder(&[a.clone(), b.clone()], &destination, TransferMode::Move)
+                .unwrap();
+        assert_eq!(
+            (report.transferred, report.skipped, report.errors.len()),
+            (1, 0, 1)
+        );
+        assert_eq!(report.errors[0].0, b);
+        assert!(matches!(
+            report.errors[0].1,
+            CoreError::PathAlreadyExists(_)
+        ));
+        assert!(!a.exists());
+        assert!(b.exists());
+    }
+
+    #[test]
+    fn rejects_transfer_into_self_or_descendant_without_moving_anything() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("folder");
+        let child = folder.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(child.join("keep.txt"), b"keep").unwrap();
+        let healthy = temp.path().join("healthy.txt");
+        std::fs::write(&healthy, b"healthy").unwrap();
+
+        // A folder transferred into itself or an existing child is rejected
+        // in both modes.
+        for mode in [TransferMode::Move, TransferMode::Copy] {
+            assert!(matches!(
+                transfer_into_folder(std::slice::from_ref(&folder), &folder, mode),
+                Err(CoreError::InvalidOperation(_))
+            ));
+            assert!(matches!(
+                transfer_into_folder(std::slice::from_ref(&folder), &child, mode),
+                Err(CoreError::InvalidOperation(_))
+            ));
+        }
+
+        // A rejected batch validates up front: nothing in it is transferred.
         assert!(matches!(
             transfer_into_folder(
-                &[source_folder.clone()],
-                &source_folder.join("nested"),
+                &[healthy.clone(), folder.clone()],
+                &child,
+                TransferMode::Move
+            ),
+            Err(CoreError::InvalidOperation(_))
+        ));
+        assert!(healthy.exists());
+        assert_eq!(std::fs::read(child.join("keep.txt")).unwrap(), b"keep");
+
+        // Destination must be a folder, and a missing destination stays missing.
+        assert!(matches!(
+            transfer_into_folder(std::slice::from_ref(&healthy), &healthy, TransferMode::Move),
+            Err(CoreError::InvalidOperation(_))
+        ));
+        assert!(matches!(
+            transfer_into_folder(
+                std::slice::from_ref(&folder),
+                &folder.join("nope"),
                 TransferMode::Move
             ),
             Err(CoreError::PathNotFound(_))
@@ -259,15 +390,29 @@ mod tests {
     }
 
     #[test]
-    fn rejects_transfer_into_existing_descendant() {
+    #[cfg(unix)]
+    fn move_skips_symlink_already_in_destination() {
         let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().join("folder");
-        let child = source.join("child");
-        std::fs::create_dir_all(&child).unwrap();
-        assert!(matches!(
-            transfer_into_folder(&[source], &child, TransferMode::Copy),
-            Err(CoreError::InvalidOperation(_))
-        ));
+        let destination = temp.path().join("destination");
+        let elsewhere = temp.path().join("elsewhere");
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::create_dir(&elsewhere).unwrap();
+        let target = elsewhere.join("target.txt");
+        std::fs::write(&target, b"x").unwrap();
+        let link = destination.join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let report = transfer_into_folder(
+            std::slice::from_ref(&link),
+            &destination,
+            TransferMode::Move,
+        )
+        .unwrap();
+        assert_eq!(
+            (report.transferred, report.skipped, report.errors.len()),
+            (0, 1, 0)
+        );
+        assert!(std::fs::symlink_metadata(&link).is_ok());
     }
 
     #[test]
