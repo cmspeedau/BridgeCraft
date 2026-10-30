@@ -29,7 +29,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [~] Virtual folder tree with favorites, recent folders, shared collections (data model pending)
 - [x] List & details view modes (Bridge parity: Thumbnails / List / Details; Filmstrip remains future work)
 - [x] Copy / move / rename / delete (with recents/bin) — core operations implemented; persistent recents are bounded, managed trash supports move/list/restore, and permanent delete is separate; browser/UI integration complete (file operations, recents, and trash/restore)
-- [ ] Drag & drop (internal reordering + OS interop)
+- [~] Drag & drop (internal reordering + OS interop) — in-app drag shipped: drag the selection (or an unselected item) onto a folder — list row or grid cell, highlighted on hover — or onto the content background to move it into that folder via `bc-core::file_ops::transfer_into_folder`, Alt held copies; OS interop shipped inbound: files dropped from Finder/Explorer are copied into the hovered or open folder. Outbound drag-to-OS stays future work (egui/eframe 0.27 exposes no API to start an OS drag); internal visual reordering is moot while views are sort-driven
 - [x] **Phase 1 fix-up:** list/details views
 
 ## Phase 2 — Thumbnails & Previews (Weeks 9–20) — ◐ cache + core decoders DONE
