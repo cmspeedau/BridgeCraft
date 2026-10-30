@@ -4,6 +4,16 @@ use std::path::Path;
 
 use crate::{ThumbError, Thumbnail};
 
+/// True when `path` has the extension of an image format this crate can
+/// decode. Keep in sync with the `image` features in the workspace
+/// `Cargo.toml` (png, jpeg, gif, webp, tiff, bmp).
+pub fn is_supported(path: &Path) -> bool {
+    const SUPPORTED: [&str; 8] = ["png", "jpg", "jpeg", "gif", "webp", "tif", "tiff", "bmp"];
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| SUPPORTED.contains(&ext.to_ascii_lowercase().as_str()))
+}
+
 /// Decode an image file and produce an RGBA thumbnail whose longest
 /// edge fits within `max_edge`, preserving aspect ratio.
 pub fn decode_thumbnail(path: &Path, max_edge: u32) -> Result<Thumbnail, ThumbError> {
@@ -32,4 +42,24 @@ pub fn decode_thumbnail(path: &Path, max_edge: u32) -> Result<Thumbnail, ThumbEr
         height: th,
         pixels: scaled.into_raw(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_supported_matches_enabled_formats() {
+        assert!(is_supported(Path::new("a.png")));
+        assert!(is_supported(Path::new("a.PNG")));
+        assert!(is_supported(Path::new("dir/b.jpeg")));
+        assert!(is_supported(Path::new("dir/b.JPG")));
+        assert!(is_supported(Path::new("c.tiff")));
+        assert!(is_supported(Path::new("d.TIF")));
+        assert!(is_supported(Path::new("e.webp")));
+        assert!(!is_supported(Path::new("notes.txt")));
+        assert!(!is_supported(Path::new("film.mp4")));
+        assert!(!is_supported(Path::new("noext")));
+        assert!(!is_supported(Path::new(".hidden.png.bak")));
+    }
 }

@@ -487,6 +487,7 @@ dependencies = [
  "bc-thumbnails",
  "eframe",
  "egui",
+ "image",
  "tempfile",
  "tracing",
  "tracing-subscriber",

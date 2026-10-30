@@ -42,7 +42,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [ ] Camera RAW support (LibRaw bindings or DNG parsing)
 - [ ] PSD/AI/Illustrator preview extraction
 - [ ] Preview quality levels: thumbnail / preview / 1:1 zoom viewer
-- [ ] Batch (re)build cache command
+- [x] Batch (re)build cache command
 - [~] Reuse embedded XMP/EXIF previews as fast-path thumbnails — deferred to Phase 3 (needs metadata reader)
 
 ## Phase 3 — Metadata Engine (Weeks 15–26) — NOT STARTED (skeleton only)
