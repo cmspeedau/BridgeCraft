@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use crate::{Thumbnail, ThumbError};
+use crate::{ThumbError, Thumbnail};
 
 /// Decode an image file and produce an RGBA thumbnail whose longest
 /// edge fits within `max_edge`, preserving aspect ratio.

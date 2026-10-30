@@ -162,7 +162,9 @@ impl BridgeApp {
                 self.status = format!("Opened {} ({} items)", root.display(), self.browser.len());
                 match Recents::open_default().and_then(|mut recent| recent.record_access(root)) {
                     Ok(()) => {}
-                    Err(e) => self.status = format!("Opened {}; recents unavailable: {e}", root.display()),
+                    Err(e) => {
+                        self.status = format!("Opened {}; recents unavailable: {e}", root.display())
+                    }
                 }
                 self.pending.clear();
                 // Drop thumbnails unrelated to the new folder to bound memory use.
@@ -509,25 +511,42 @@ impl BridgeApp {
     }
 
     fn selected_paths(&self, clicked_path: &Path) -> Vec<PathBuf> {
-        let paths: Vec<_> = self.browser.entries.iter().enumerate()
+        let paths: Vec<_> = self
+            .browser
+            .entries
+            .iter()
+            .enumerate()
             .filter(|(idx, _)| self.browser.selection.contains(*idx))
             .map(|(_, entry)| entry.path.clone())
             .collect();
-        if paths.is_empty() { vec![clicked_path.to_path_buf()] } else { paths }
+        if paths.is_empty() {
+            vec![clicked_path.to_path_buf()]
+        } else {
+            paths
+        }
     }
 
     fn confirm_delete_window(&mut self, ctx: &egui::Context) {
-        let Some(paths) = self.pending_delete.clone() else { return; };
+        let Some(paths) = self.pending_delete.clone() else {
+            return;
+        };
         let mut confirm = false;
         let mut cancel = false;
         egui::Window::new("Confirm permanent deletion")
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
-                ui.label(format!("Permanently delete {} item(s)? This cannot be undone.", paths.len()));
+                ui.label(format!(
+                    "Permanently delete {} item(s)? This cannot be undone.",
+                    paths.len()
+                ));
                 ui.horizontal(|ui| {
-                    if ui.button("Cancel").clicked() { cancel = true; }
-                    if ui.button("Delete permanently").clicked() { confirm = true; }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                    if ui.button("Delete permanently").clicked() {
+                        confirm = true;
+                    }
                 });
             });
         if confirm {
@@ -538,7 +557,9 @@ impl BridgeApp {
                     Err(e) => self.status = format!("Could not delete {}: {e}", path.display()),
                 }
             }
-            if done > 0 { self.status = format!("Permanently deleted {done} item(s)"); }
+            if done > 0 {
+                self.status = format!("Permanently deleted {done} item(s)");
+            }
             self.pending_delete = None;
         } else if cancel {
             self.pending_delete = None;
@@ -559,16 +580,23 @@ impl BridgeApp {
                     let mut done = 0;
                     for source in &paths {
                         let Some(name) = source.file_name() else {
-                            self.status = format!("Cannot copy path without a file name: {}", source.display());
+                            self.status = format!(
+                                "Cannot copy path without a file name: {}",
+                                source.display()
+                            );
                             continue;
                         };
                         let destination = folder.join(name);
                         match copy_path(source, &destination) {
                             Ok(()) => done += 1,
-                            Err(e) => self.status = format!("Copy failed for {}: {e}", source.display()),
+                            Err(e) => {
+                                self.status = format!("Copy failed for {}: {e}", source.display())
+                            }
                         }
                     }
-                    if done > 0 { self.status = format!("Copied {done} item(s) to {}", folder.display()); }
+                    if done > 0 {
+                        self.status = format!("Copied {done} item(s) to {}", folder.display());
+                    }
                 }
                 ui.close_menu();
             }
@@ -583,16 +611,23 @@ impl BridgeApp {
                     let mut done = 0;
                     for source in &paths {
                         let Some(name) = source.file_name() else {
-                            self.status = format!("Cannot move path without a file name: {}", source.display());
+                            self.status = format!(
+                                "Cannot move path without a file name: {}",
+                                source.display()
+                            );
                             continue;
                         };
                         let destination = folder.join(name);
                         match move_path(source, &destination) {
                             Ok(()) => done += 1,
-                            Err(e) => self.status = format!("Move failed for {}: {e}", source.display()),
+                            Err(e) => {
+                                self.status = format!("Move failed for {}: {e}", source.display())
+                            }
                         }
                     }
-                    if done > 0 { self.status = format!("Moved {done} item(s) to {}", folder.display()); }
+                    if done > 0 {
+                        self.status = format!("Moved {done} item(s) to {}", folder.display());
+                    }
                 }
                 ui.close_menu();
             }
@@ -622,10 +657,14 @@ impl BridgeApp {
                     for path in &paths {
                         match bin.trash(path) {
                             Ok(_) => done += 1,
-                            Err(e) => self.status = format!("Could not trash {}: {e}", path.display()),
+                            Err(e) => {
+                                self.status = format!("Could not trash {}: {e}", path.display())
+                            }
                         }
                     }
-                    if done > 0 { self.status = format!("Moved {done} item(s) to BridgeCraft Trash"); }
+                    if done > 0 {
+                        self.status = format!("Moved {done} item(s) to BridgeCraft Trash");
+                    }
                 }
                 Err(e) => self.status = format!("Could not open BridgeCraft Trash: {e}"),
             }
@@ -647,8 +686,12 @@ impl BridgeApp {
                     }
                 }
             }
-            Ok(_) => { ui.weak("No recent locations."); }
-            Err(e) => { ui.label(format!("Recents unavailable: {e}")); }
+            Ok(_) => {
+                ui.weak("No recent locations.");
+            }
+            Err(e) => {
+                ui.label(format!("Recents unavailable: {e}"));
+            }
         }
     }
 
@@ -664,7 +707,9 @@ impl BridgeApp {
                             ui.label(entry.original_path.display().to_string());
                             if ui.button("Restore").clicked() {
                                 match bin.restore(&entry.id) {
-                                    Ok(path) => self.status = format!("Restored {}", path.display()),
+                                    Ok(path) => {
+                                        self.status = format!("Restored {}", path.display())
+                                    }
                                     Err(e) => self.status = format!("Could not restore item: {e}"),
                                 }
                                 ui.close_menu();
@@ -673,7 +718,9 @@ impl BridgeApp {
                     }
                 }
             }
-            Err(e) => { ui.label(format!("Trash unavailable: {e}")); }
+            Err(e) => {
+                ui.label(format!("Trash unavailable: {e}"));
+            }
         }
     }
 

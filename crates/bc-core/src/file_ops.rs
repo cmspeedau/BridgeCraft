@@ -34,7 +34,8 @@ pub fn copy_path(source: &Path, destination: &Path) -> Result<()> {
     ensure_new_destination(destination)?;
     if metadata.file_type().is_symlink() {
         return Err(CoreError::InvalidOperation(format!(
-            "refusing to copy symlink {}", source.display()
+            "refusing to copy symlink {}",
+            source.display()
         )));
     }
     if metadata.is_dir() {
@@ -49,7 +50,8 @@ pub fn copy_path(source: &Path, destination: &Path) -> Result<()> {
         Ok(())
     } else {
         Err(CoreError::InvalidOperation(format!(
-            "unsupported filesystem object: {}", source.display()
+            "unsupported filesystem object: {}",
+            source.display()
         )))
     }
 }
@@ -94,7 +96,8 @@ pub fn transfer_into_folder(
     let destination_meta = ensure_source(destination_folder)?;
     if !destination_meta.is_dir() {
         return Err(CoreError::InvalidOperation(format!(
-            "destination is not a folder: {}", destination_folder.display()
+            "destination is not a folder: {}",
+            destination_folder.display()
         )));
     }
     let destination_real = std::fs::canonicalize(destination_folder)?;
@@ -107,7 +110,8 @@ pub fn transfer_into_folder(
         let source_real = std::fs::canonicalize(source)?;
         if source_meta.is_dir() && destination_real.starts_with(&source_real) {
             return Err(CoreError::InvalidOperation(format!(
-                "cannot transfer a folder into itself or its descendant: {}", source.display()
+                "cannot transfer a folder into itself or its descendant: {}",
+                source.display()
             )));
         }
         if mode == TransferMode::Move {
@@ -155,7 +159,8 @@ pub fn delete_path(path: &Path) -> Result<()> {
         std::fs::remove_dir_all(path)?;
     } else {
         return Err(CoreError::InvalidOperation(format!(
-            "unsupported filesystem object: {}", path.display()
+            "unsupported filesystem object: {}",
+            path.display()
         )));
     }
     Ok(())
@@ -174,8 +179,14 @@ mod tests {
         std::fs::write(source.join("nested/file.txt"), b"asset").unwrap();
         let copied = temp.path().join("copied");
         copy_path(&source, &copied).unwrap();
-        assert_eq!(std::fs::read(copied.join("nested/file.txt")).unwrap(), b"asset");
-        assert!(matches!(copy_path(&source, &copied), Err(CoreError::PathAlreadyExists(_))));
+        assert_eq!(
+            std::fs::read(copied.join("nested/file.txt")).unwrap(),
+            b"asset"
+        );
+        assert!(matches!(
+            copy_path(&source, &copied),
+            Err(CoreError::PathAlreadyExists(_))
+        ));
     }
 
     #[test]
@@ -205,7 +216,10 @@ mod tests {
         std::fs::create_dir_all(folder.join("nested")).unwrap();
         delete_path(&folder).unwrap();
         assert!(!folder.exists());
-        assert!(matches!(delete_path(&file), Err(CoreError::PathNotFound(_))));
+        assert!(matches!(
+            delete_path(&file),
+            Err(CoreError::PathNotFound(_))
+        ));
     }
 
     #[test]
@@ -218,11 +232,30 @@ mod tests {
         let source = source_folder.join("asset.txt");
         std::fs::write(&source, b"asset").unwrap();
 
-        assert_eq!(transfer_into_folder(&[source.clone()], &source_folder, TransferMode::Move).unwrap(), 0);
-        assert_eq!(transfer_into_folder(&[source.clone()], &destination, TransferMode::Copy).unwrap(), 1);
-        assert!(matches!(transfer_into_folder(&[source.clone()], &destination, TransferMode::Copy), Err(CoreError::PathAlreadyExists(_))));
-        assert_eq!(std::fs::read(destination.join("asset.txt")).unwrap(), b"asset");
-        assert!(matches!(transfer_into_folder(&[source_folder.clone()], &source_folder.join("nested"), TransferMode::Move), Err(CoreError::PathNotFound(_))));
+        assert_eq!(
+            transfer_into_folder(&[source.clone()], &source_folder, TransferMode::Move).unwrap(),
+            0
+        );
+        assert_eq!(
+            transfer_into_folder(&[source.clone()], &destination, TransferMode::Copy).unwrap(),
+            1
+        );
+        assert!(matches!(
+            transfer_into_folder(&[source.clone()], &destination, TransferMode::Copy),
+            Err(CoreError::PathAlreadyExists(_))
+        ));
+        assert_eq!(
+            std::fs::read(destination.join("asset.txt")).unwrap(),
+            b"asset"
+        );
+        assert!(matches!(
+            transfer_into_folder(
+                &[source_folder.clone()],
+                &source_folder.join("nested"),
+                TransferMode::Move
+            ),
+            Err(CoreError::PathNotFound(_))
+        ));
     }
 
     #[test]
@@ -231,7 +264,10 @@ mod tests {
         let source = temp.path().join("folder");
         let child = source.join("child");
         std::fs::create_dir_all(&child).unwrap();
-        assert!(matches!(transfer_into_folder(&[source], &child, TransferMode::Copy), Err(CoreError::InvalidOperation(_))));
+        assert!(matches!(
+            transfer_into_folder(&[source], &child, TransferMode::Copy),
+            Err(CoreError::InvalidOperation(_))
+        ));
     }
 
     #[test]
@@ -239,6 +275,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source");
         std::fs::create_dir(&source).unwrap();
-        assert!(matches!(copy_path(&source, &source.join("child")), Err(CoreError::InvalidOperation(_))));
+        assert!(matches!(
+            copy_path(&source, &source.join("child")),
+            Err(CoreError::InvalidOperation(_))
+        ));
     }
 }

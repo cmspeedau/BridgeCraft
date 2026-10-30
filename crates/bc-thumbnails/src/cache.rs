@@ -4,7 +4,7 @@ use std::path::Path;
 
 use rusqlite::{params, Connection};
 
-use crate::{Thumbnail, ThumbError};
+use crate::{ThumbError, Thumbnail};
 
 /// Persistent thumbnail cache keyed by (path, mtime, size, max_edge).
 pub struct CacheStore {
@@ -59,7 +59,11 @@ impl CacheStore {
                 let width: u32 = row.get(0)?;
                 let height: u32 = row.get(1)?;
                 let pixels: Vec<u8> = row.get(2)?;
-                let thumb = Thumbnail { width, height, pixels };
+                let thumb = Thumbnail {
+                    width,
+                    height,
+                    pixels,
+                };
                 if thumb.is_consistent() {
                     Ok(Some(thumb))
                 } else {
@@ -142,7 +146,11 @@ mod tests {
     #[test]
     fn metadata_change_invalidates() {
         let cache = CacheStore::open_in_memory().unwrap();
-        let thumb = Thumbnail { width: 1, height: 1, pixels: vec![0, 0, 0, 255] };
+        let thumb = Thumbnail {
+            width: 1,
+            height: 1,
+            pixels: vec![0, 0, 0, 255],
+        };
         cache.put(Path::new("/a.png"), 1, 10, 64, &thumb).unwrap();
         assert_eq!(cache.get(Path::new("/a.png"), 2, 10, 64).unwrap(), None);
         assert_eq!(cache.get(Path::new("/a.png"), 1, 11, 64).unwrap(), None);
@@ -152,8 +160,14 @@ mod tests {
     #[test]
     fn prune_removes_missing_paths() {
         let cache = CacheStore::open_in_memory().unwrap();
-        let thumb = Thumbnail { width: 1, height: 1, pixels: vec![0, 0, 0, 255] };
-        cache.put(Path::new("/definitely/missing/x.png"), 1, 1, 64, &thumb).unwrap();
+        let thumb = Thumbnail {
+            width: 1,
+            height: 1,
+            pixels: vec![0, 0, 0, 255],
+        };
+        cache
+            .put(Path::new("/definitely/missing/x.png"), 1, 1, 64, &thumb)
+            .unwrap();
         assert_eq!(cache.prune_missing().unwrap(), 1);
     }
 }

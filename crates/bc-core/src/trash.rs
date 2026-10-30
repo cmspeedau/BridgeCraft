@@ -85,9 +85,9 @@ impl TrashBin {
                 "cannot move the managed bin into itself".into(),
             ));
         }
-        let name = source.file_name().ok_or_else(|| {
-            CoreError::InvalidOperation("source path has no file name".into())
-        })?;
+        let name = source
+            .file_name()
+            .ok_or_else(|| CoreError::InvalidOperation("source path has no file name".into()))?;
         let deleted_at_unix_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| CoreError::InvalidOperation(format!("system clock error: {error}")))?
@@ -95,7 +95,9 @@ impl TrashBin {
         let id = loop {
             let nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map_err(|error| CoreError::InvalidOperation(format!("system clock error: {error}")))?
+                .map_err(|error| {
+                    CoreError::InvalidOperation(format!("system clock error: {error}"))
+                })?
                 .as_nanos();
             let id = format!("{nanos}-{}", NEXT_ID.fetch_add(1, Ordering::Relaxed));
             if !self.entries.iter().any(|entry| entry.id == id)
@@ -119,9 +121,10 @@ impl TrashBin {
         };
         self.entries.push(record);
         if let Err(error) = self.persist() {
-            let record = self.entries.pop().ok_or_else(|| {
-                CoreError::InvalidOperation("trash index update failed".into())
-            })?;
+            let record = self
+                .entries
+                .pop()
+                .ok_or_else(|| CoreError::InvalidOperation("trash index update failed".into()))?;
             let _ = fs::rename(&record.stored_path, &original_path);
             let _ = fs::remove_dir(item_dir);
             return Err(error);
@@ -225,7 +228,10 @@ mod tests {
             bin.trash(temp.path().join("missing")),
             Err(CoreError::PathNotFound(_))
         ));
-        assert!(matches!(bin.trash(&root), Err(CoreError::InvalidOperation(_))));
+        assert!(matches!(
+            bin.trash(&root),
+            Err(CoreError::InvalidOperation(_))
+        ));
         bin.restore(&entry.id).unwrap();
         assert_eq!(fs::read(dir.join("nested/file")).unwrap(), b"data");
     }
