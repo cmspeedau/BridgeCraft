@@ -7,7 +7,9 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use bc_core::browser::BrowserState;
-use bc_core::file_ops::{copy_path, delete_path, move_path, rename_path};
+use bc_core::file_ops::{
+    copy_path, delete_path, move_path, rename_path, transfer_into_folder, TransferMode,
+};
 use bc_core::fs::{SortDir, SortKey};
 use bc_core::recents::Recents;
 use bc_core::selection::Selection;
@@ -115,6 +117,11 @@ pub struct BridgeApp {
     watcher: Option<Watcher>,
     /// When a watcher event was seen; refresh fires after the debounce elapses.
     refresh_due: Option<Instant>,
+    /// Folder under the pointer last frame; OS file drops land here when set.
+    hovered_folder: Option<PathBuf>,
+    /// Set once a folder target has taken a drag payload this frame, so the
+    /// panel-wide fallback zone does not handle the same drop twice.
+    drop_taken: bool,
 }
 
 impl BridgeApp {
@@ -143,6 +150,8 @@ impl BridgeApp {
             textures: HashMap::new(),
             watcher: None,
             refresh_due: None,
+            hovered_folder: None,
+            drop_taken: false,
         };
 
         if let Some(root) = root {
@@ -190,6 +199,12 @@ impl BridgeApp {
                 None
             }
         };
+    }
+
+    /// Reload the listing after a drop so the results are visible immediately
+    /// rather than waiting for the debounced watcher refresh.
+    fn refresh_after_drop(&mut self) {
+        let _ = self.browser.refresh_preserving_selection();
     }
 
     /// Drain watcher events; schedule a debounced refresh when any arrive.
@@ -360,6 +375,36 @@ impl BridgeApp {
                         if !is_dir {
                             self.request_thumbnail(&path, mtime_ns(modified), size);
                         }
+                        if is_dir && response.hovered() {
+                            self.hovered_folder = Some(path.clone());
+                        }
+                        if response.drag_started() {
+                            let paths = if self.browser.selection.contains(idx) {
+                                self.selected_paths(&path)
+                            } else {
+                                self.browser.selection.select_only(idx);
+                                vec![path.clone()]
+                            };
+                            response.dnd_set_drag_payload(paths);
+                        }
+                        if is_dir {
+                            if response.dnd_hover_payload::<Vec<PathBuf>>().is_some() {
+                                ui.painter().rect_stroke(
+                                    response.rect.expand(2.0),
+                                    6.0,
+                                    egui::Stroke::new(
+                                        2.0_f32,
+                                        egui::Color32::from_rgb(0, 160, 255),
+                                    ),
+                                );
+                            }
+                            if let Some(payload) = response.dnd_release_payload::<Vec<PathBuf>>() {
+                                self.drop_taken = true;
+                                let mode = drop_mode(ui.input(|i| i.modifiers.alt));
+                                self.status = apply_transfer(&payload, &path, mode);
+                                self.refresh_after_drop();
+                            }
+                        }
                     }
                 });
                 // Include row spacing in the virtual extent so the next row's
@@ -435,7 +480,7 @@ impl BridgeApp {
                 let selected = self.browser.selection.contains(idx);
                 let (rect, response) = ui.allocate_exact_size(
                     egui::vec2(ui.available_width(), LIST_ROW_HEIGHT),
-                    egui::Sense::click(),
+                    egui::Sense::click_and_drag(),
                 );
                 if selected {
                     ui.painter()
@@ -505,6 +550,36 @@ impl BridgeApp {
                 if response.double_clicked() && is_dir {
                     let path = self.browser.entries[idx].path.clone();
                     self.open_root(&path);
+                }
+                if is_dir && response.hovered() {
+                    self.hovered_folder = Some(context_path.clone());
+                }
+                if response.drag_started() {
+                    // Dragging an item inside the selection drags the whole
+                    // selection; dragging an unselected item selects and drags
+                    // just that item.
+                    let paths = if self.browser.selection.contains(idx) {
+                        self.selected_paths(&context_path)
+                    } else {
+                        self.browser.selection.select_only(idx);
+                        vec![context_path.clone()]
+                    };
+                    response.dnd_set_drag_payload(paths);
+                }
+                if is_dir {
+                    if response.dnd_hover_payload::<Vec<PathBuf>>().is_some() {
+                        ui.painter().rect_stroke(
+                            rect,
+                            2.0,
+                            egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(0, 160, 255)),
+                        );
+                    }
+                    if let Some(payload) = response.dnd_release_payload::<Vec<PathBuf>>() {
+                        self.drop_taken = true;
+                        let mode = drop_mode(ui.input(|i| i.modifiers.alt));
+                        self.status = apply_transfer(&payload, &context_path, mode);
+                        self.refresh_after_drop();
+                    }
                 }
             }
         });
@@ -744,7 +819,7 @@ impl BridgeApp {
         ui.vertical_centered(|ui| {
             let (rect, response) = ui.allocate_exact_size(
                 egui::vec2((cell_size - 12.0).max(1.0), (cell_size - 12.0).max(1.0)),
-                egui::Sense::click(),
+                egui::Sense::click_and_drag(),
             );
 
             if is_dir {
@@ -801,6 +876,46 @@ impl BridgeApp {
     }
 }
 
+/// Transfer mode for a drop: hold Alt to copy, otherwise move.
+fn drop_mode(alt_down: bool) -> TransferMode {
+    if alt_down {
+        TransferMode::Copy
+    } else {
+        TransferMode::Move
+    }
+}
+
+/// Apply a drag-and-drop transfer via `bc-core` and render the outcome as a
+/// status line. Batch rejections leave the filesystem untouched and are
+/// reported as such; per-item failures are counted and the first is shown.
+fn apply_transfer(sources: &[PathBuf], destination: &Path, mode: TransferMode) -> String {
+    let verb = match mode {
+        TransferMode::Move => "Moved",
+        TransferMode::Copy => "Copied",
+    };
+    match transfer_into_folder(sources, destination, mode) {
+        Ok(report) => {
+            let mut status = format!(
+                "{verb} {} item(s) into {}",
+                report.transferred,
+                destination.display()
+            );
+            if report.skipped > 0 {
+                status += &format!(", skipped {} already in destination", report.skipped);
+            }
+            if let Some((path, error)) = report.errors.first() {
+                status += &format!(
+                    "; {} failed, first: {}: {error}",
+                    report.errors.len(),
+                    path.display()
+                );
+            }
+            status
+        }
+        Err(error) => format!("Drop rejected: {error}"),
+    }
+}
+
 fn human_size(size: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut v = size as f64;
@@ -820,6 +935,33 @@ impl eframe::App for BridgeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_thumbnails(ctx);
         self.poll_watcher();
+
+        // Files dropped in from the OS (Finder/Explorer) are copied into the
+        // hovered folder, or into the open folder when nothing is hovered.
+        // This uses last frame's hover, which is where the pointer sits while
+        // the drop event arrives; egui reports native drops without a widget.
+        let os_drops: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|file| file.path.clone())
+                .collect()
+        });
+        if !os_drops.is_empty() {
+            let target = self
+                .hovered_folder
+                .clone()
+                .or_else(|| self.browser.root.clone());
+            match target {
+                Some(folder) => {
+                    self.status = apply_transfer(&os_drops, &folder, TransferMode::Copy);
+                    self.refresh_after_drop();
+                }
+                None => self.status = "Open a folder before dropping files.".into(),
+            }
+        }
+        self.hovered_folder = None;
+        self.drop_taken = false;
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -930,6 +1072,24 @@ impl eframe::App for BridgeApp {
                     ViewMode::Details => self.content_list(ui, ctx, true),
                 }
             }
+            // Fallback drop zone: a drag released anywhere in the content
+            // panel (not on a folder) transfers into the currently open
+            // folder. Hover sense only, so it never steals clicks from the
+            // cells painted above it.
+            let background = ui.interact(
+                ui.min_rect(),
+                ui.id().with("drop-background"),
+                egui::Sense::hover(),
+            );
+            if !self.drop_taken {
+                if let Some(payload) = background.dnd_release_payload::<Vec<PathBuf>>() {
+                    if let Some(root) = self.browser.root.clone() {
+                        let mode = drop_mode(ui.input(|i| i.modifiers.alt));
+                        self.status = apply_transfer(&payload, &root, mode);
+                        self.refresh_after_drop();
+                    }
+                }
+            }
         });
 
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
@@ -1023,5 +1183,73 @@ mod tests {
             "2024-01-01 00:00"
         );
         assert_eq!(format_modified(None), "—");
+    }
+
+    fn touch(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, b"payload").unwrap();
+        path
+    }
+
+    #[test]
+    fn drop_mode_maps_alt_to_copy() {
+        assert_eq!(drop_mode(false), TransferMode::Move);
+        assert_eq!(drop_mode(true), TransferMode::Copy);
+    }
+
+    #[test]
+    fn move_drop_relocates_and_copy_drop_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = touch(dir.path(), "a.txt");
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+
+        let status = apply_transfer(std::slice::from_ref(&source), &target, TransferMode::Move);
+        assert!(status.starts_with("Moved 1 item(s)"), "{status}");
+        assert!(!source.exists());
+        assert!(target.join("a.txt").exists());
+
+        let status = apply_transfer(&[target.join("a.txt")], dir.path(), TransferMode::Copy);
+        assert!(status.starts_with("Copied 1 item(s)"), "{status}");
+        assert!(dir.path().join("a.txt").exists());
+        assert!(target.join("a.txt").exists());
+    }
+
+    #[test]
+    fn move_drop_into_same_folder_skips() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = touch(dir.path(), "a.txt");
+
+        let status = apply_transfer(
+            std::slice::from_ref(&source),
+            dir.path(),
+            TransferMode::Move,
+        );
+        assert!(status.contains("skipped 1"), "{status}");
+        assert!(source.exists());
+    }
+
+    #[test]
+    fn copy_collision_is_reported_and_leaves_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = touch(dir.path(), "a.txt");
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        touch(&target, "a.txt");
+
+        let status = apply_transfer(std::slice::from_ref(&source), &target, TransferMode::Copy);
+        assert!(status.contains("1 failed"), "{status}");
+        assert!(source.exists());
+    }
+
+    #[test]
+    fn folder_drop_into_itself_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+
+        let status = apply_transfer(std::slice::from_ref(&sub), &sub, TransferMode::Move);
+        assert!(status.starts_with("Drop rejected"), "{status}");
+        assert!(sub.exists());
     }
 }
