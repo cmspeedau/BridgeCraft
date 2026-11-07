@@ -2,6 +2,7 @@
 
 pub mod browser;
 pub mod entry;
+pub mod favorites;
 pub mod file_ops;
 pub mod fs;
 pub mod recents;

@@ -26,7 +26,8 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [x] **Filter box**: case-insensitive name-substring filter, dirs always visible, selection preserved by path, filter-aware Select All (`bc-core::browser::set_filter` + UI bar)
 - [x] **Watcher-driven live refresh**: watcher attached on folder open, events drained per frame, bursts coalesced via 300 ms debounce into `refresh_preserving_selection()`
 - [x] Virtualized thumbnail grid rendering (visible rows only; egui `ScrollArea` + manual row math; thumbnail requests limited to visible cells)
-- [~] Virtual folder tree with favorites, recent folders, shared collections (data model pending)
+- [x] **Bridge-style workspace shell**: left sidebar (Favorites tab backed by a persistent store `bc-core::favorites`, collapsible Folders tree, Recent dock, Trash window), clickable breadcrumb path bar, right Preview/Metadata panel (live preview from the cached 2048 tier + properties incl. header-read dimensions), bottom status bar (view modes, thumbnail zoom slider, "Thumbnails only" filter, items/selected/size summary), toolbar with F5 / Ctrl+A / Ctrl+O — layout target is the public Adobe Bridge Essentials screenshot (visual target only; clean-room per CLEANROOM.md)
+- [~] Virtual folder tree with favorites, recent folders, shared collections — favorites & recents shipped with the shell above; shared collections remain pending
 - [x] List & details view modes (Bridge parity: Thumbnails / List / Details; Filmstrip remains future work)
 - [x] Copy / move / rename / delete (with recents/bin) — core operations implemented; persistent recents are bounded, managed trash supports move/list/restore, and permanent delete is separate; browser/UI integration complete (file operations, recents, and trash/restore)
 - [ ] Drag & drop (internal reordering + OS interop)

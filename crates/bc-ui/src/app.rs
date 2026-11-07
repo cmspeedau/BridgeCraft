@@ -1,5 +1,12 @@
-//! Main application: content grid, folder navigation, selection, thumbnails,
-//! live directory watching, and name filtering.
+//! Main application: favorites/folders sidebar, thumbnail grid, folder
+//! navigation, selection, thumbnails, live directory watching, name
+//! filtering, metadata panel, and the preview/zoom viewer.
+//!
+//! The layout mirrors the public Adobe Bridge "Essentials" workspace
+//! (left favorites sidebar, central content grid, right Preview/Metadata
+//! panel, breadcrumb path bar, bottom status bar with thumbnail zoom) —
+//! a visual target only: all code here is BridgeCraft's own (see
+//! CLEANROOM.md).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -7,6 +14,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use bc_core::browser::BrowserState;
+use bc_core::favorites::Favorites;
 use bc_core::file_ops::{copy_path, delete_path, move_path, rename_path};
 use bc_core::fs::{SortDir, SortKey};
 use bc_core::recents::Recents;
@@ -18,13 +26,17 @@ use eframe::egui;
 
 use crate::viewer::{self, ViewerState, ZoomMode, FULL_EDGE, PREVIEW_EDGE};
 
-const CELL_SIZE: f32 = 132.0;
-const CELL_HEIGHT: f32 = CELL_SIZE + 44.0;
+/// Default grid cell width; the status-bar zoom slider ranges from this.
+const DEFAULT_CELL: f32 = 150.0;
+const MIN_CELL: f32 = 96.0;
+const MAX_CELL: f32 = 320.0;
 const GRID_SPACING: f32 = 8.0;
 const THUMB_MAX_EDGE: u32 = 256;
 /// Coalesce watcher event bursts into a single refresh.
 const WATCHER_DEBOUNCE: Duration = Duration::from_millis(300);
 const LIST_ROW_HEIGHT: f32 = 28.0;
+/// Sidebar "Recent" section cap.
+const SIDEBAR_RECENTS: usize = 6;
 
 /// Texture cache key: a file can have several resolutions in flight (grid
 /// thumbnail, viewer preview, viewer full-resolution).
@@ -36,6 +48,20 @@ enum ViewMode {
     Thumbnails,
     List,
     Details,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SidebarTab {
+    #[default]
+    Favorites,
+    Folders,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum RightTab {
+    #[default]
+    Preview,
+    Metadata,
 }
 
 struct ThumbJob {
@@ -105,6 +131,18 @@ fn spawn_thumb_worker(
         .expect("failed to spawn thumbnail worker");
 }
 
+/// Label for a breadcrumb/tree node: file name, or an anchored icon for the
+/// filesystem root ("/" or a drive).
+fn node_label(path: &Path) -> String {
+    match path.parent() {
+        None => format!("⌂ {}", path.display()),
+        Some(_) => path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string()),
+    }
+}
+
 pub struct BridgeApp {
     browser: BrowserState,
     path_input: String,
@@ -131,6 +169,29 @@ pub struct BridgeApp {
     watcher: Option<Watcher>,
     /// When a watcher event was seen; refresh fires after the debounce elapses.
     refresh_due: Option<Instant>,
+
+    // ------------------------------------------------------------- shell --
+    /// Persistent favorite folders; `None` when the store cannot be opened.
+    favorites: Option<Favorites>,
+    /// Load failure surfaced once so the sidebar can say why it is inert.
+    favorites_error: Option<String>,
+    sidebar_tab: SidebarTab,
+    right_tab: RightTab,
+    /// Folder-tree nodes the user has expanded (persisted across navigation).
+    expanded: HashSet<PathBuf>,
+    /// Lazy directory listings for the tree; `None` value = read failed.
+    tree_children: HashMap<PathBuf, Option<Vec<PathBuf>>>,
+    /// Cached recent-folder list (reloaded on navigation).
+    recent_paths: Vec<PathBuf>,
+    /// Grid cell width, driven by the status-bar zoom slider.
+    cell_size: f32,
+    /// Hide files nothing can thumbnail from the grid/list.
+    thumbs_only: bool,
+    /// Open-folder path field (toggled by the Open button / Ctrl+O).
+    open_field: bool,
+    trash_window: bool,
+    /// Header-only dimensions, cached per path for the Metadata panel.
+    dims_cache: HashMap<PathBuf, Option<(u32, u32)>>,
 }
 
 impl BridgeApp {
@@ -142,6 +203,11 @@ impl BridgeApp {
         let (job_tx, job_rx) = channel::<ThumbJob>();
         let (res_tx, res_rx) = channel::<ThumbResult>();
         spawn_thumb_worker(cache_path, job_rx, res_tx);
+
+        let (favorites, favorites_error) = match Favorites::open_default() {
+            Ok(store) => (Some(store), None),
+            Err(e) => (None, Some(e.to_string())),
+        };
 
         let mut app = Self {
             browser: BrowserState::default(),
@@ -161,6 +227,18 @@ impl BridgeApp {
             viewer: ViewerState::default(),
             watcher: None,
             refresh_due: None,
+            favorites,
+            favorites_error,
+            sidebar_tab: SidebarTab::default(),
+            right_tab: RightTab::default(),
+            expanded: HashSet::new(),
+            tree_children: HashMap::new(),
+            recent_paths: Vec::new(),
+            cell_size: DEFAULT_CELL,
+            thumbs_only: false,
+            open_field: false,
+            trash_window: false,
+            dims_cache: HashMap::new(),
         };
 
         if let Some(root) = root {
@@ -178,8 +256,16 @@ impl BridgeApp {
             Ok(()) => {
                 self.path_input = root.display().to_string();
                 self.status = format!("Opened {} ({} items)", root.display(), self.browser.len());
-                match Recents::open_default().and_then(|mut recent| recent.record_access(root)) {
-                    Ok(()) => {}
+                match Recents::open_default() {
+                    Ok(mut recents) => match recents.record_access(root) {
+                        Ok(()) => {
+                            self.recent_paths = recents.paths().iter().take(16).cloned().collect();
+                        }
+                        Err(e) => {
+                            self.status =
+                                format!("Opened {}; recents unavailable: {e}", root.display())
+                        }
+                    },
                     Err(e) => {
                         self.status = format!("Opened {}; recents unavailable: {e}", root.display())
                     }
@@ -190,6 +276,8 @@ impl BridgeApp {
                 self.viewer.close();
                 // Drop thumbnails unrelated to the new folder to bound memory use.
                 self.textures.retain(|(path, _), _| path.starts_with(root));
+                // Keep the tree anchored on the folder the user is in.
+                self.expanded.insert(root.to_path_buf());
                 self.attach_watcher(root);
             }
             Err(e) => {
@@ -232,6 +320,7 @@ impl BridgeApp {
                     Ok(()) => {
                         // Files may have been fixed or replaced on disk.
                         self.failed.clear();
+                        self.tree_children.clear();
                         self.status = format!("Refreshed ({} items)", self.browser.len());
                     }
                     Err(e) => tracing::warn!("live refresh failed: {e}"),
@@ -291,6 +380,445 @@ impl BridgeApp {
         }
     }
 
+    // -------------------------------------------------------------- shell --
+
+    /// Entries the grid/list/status actually show: browser visibility plus
+    /// the optional "thumbnails only" filter.
+    fn display_indices(&self) -> Vec<usize> {
+        let visible = self.browser.visible_indices();
+        if !self.thumbs_only {
+            return visible;
+        }
+        visible
+            .into_iter()
+            .filter(|&idx| {
+                self.browser
+                    .entries
+                    .get(idx)
+                    .is_some_and(|e| e.is_dir || bc_thumbnails::decoder::can_thumbnail(&e.path))
+            })
+            .collect()
+    }
+
+    /// The single selected entry, when exactly one file/folder is selected.
+    fn single_selection(&self) -> Option<usize> {
+        let mut indices = self.browser.selection.indices();
+        match (indices.next(), indices.next()) {
+            (Some(idx), None) if self.browser.entries.get(idx).is_some() => Some(idx),
+            _ => None,
+        }
+    }
+
+    fn selected_total_size(&self) -> u64 {
+        self.browser
+            .selection
+            .indices()
+            .filter_map(|idx| self.browser.entries.get(idx))
+            .map(|entry| entry.size)
+            .sum()
+    }
+
+    fn refresh_now(&mut self) {
+        match self.browser.refresh_preserving_selection() {
+            Ok(()) => {
+                self.failed.clear();
+                self.tree_children.clear();
+                self.status = format!("Refreshed ({} items)", self.browser.len());
+            }
+            Err(e) => self.status = format!("Refresh failed: {e}"),
+        }
+    }
+
+    /// Subdirectories of `dir` for the tree, cached after first read.
+    fn tree_children_of(&mut self, dir: &Path) -> Vec<PathBuf> {
+        if let Some(cached) = self.tree_children.get(dir) {
+            return cached.clone().unwrap_or_default();
+        }
+        let mut children: Vec<PathBuf> = std::fs::read_dir(dir)
+            .ok()
+            .map(|read| {
+                read.filter_map(Result::ok)
+                    .filter_map(|item| {
+                        let path = item.path();
+                        let is_dir = item.file_type().ok().is_some_and(|ft| ft.is_dir());
+                        // Hidden dot-folders are noise in a favorites tree.
+                        let hidden = path
+                            .file_name()
+                            .is_some_and(|n| n.to_string_lossy().starts_with('.'));
+                        (is_dir && !hidden).then_some(path)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        children.sort();
+        self.tree_children
+            .insert(dir.to_path_buf(), Some(children.clone()));
+        children
+    }
+
+    /// One folder-tree row plus its expanded children.
+    fn tree_node(&mut self, ui: &mut egui::Ui, dir: &Path, depth: usize) {
+        let children = self.tree_children_of(dir);
+        let is_open = self.expanded.contains(dir);
+        let at = self.browser.root.as_deref() == Some(dir);
+
+        ui.push_id(dir, |ui| {
+            ui.horizontal(|ui| {
+                ui.add_space(depth as f32 * 12.0);
+                let twist = if children.is_empty() {
+                    "·"
+                } else if is_open {
+                    "-"
+                } else {
+                    "+"
+                };
+                if ui
+                    .add(egui::Label::new(twist).selectable(false))
+                    .on_hover_text("Expand/collapse")
+                    .interact(egui::Sense::click())
+                    .clicked()
+                    && !children.is_empty()
+                {
+                    if is_open {
+                        self.expanded.remove(dir);
+                    } else {
+                        self.expanded.insert(dir.to_path_buf());
+                    }
+                }
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new(format!("📁 {}", node_label(dir))).small(),
+                        )
+                        .selected(at),
+                    )
+                    .clicked()
+                {
+                    self.open_root(dir);
+                }
+            });
+        });
+
+        if is_open {
+            for child in &children {
+                self.tree_node(ui, child, depth + 1);
+            }
+        }
+    }
+
+    /// Left sidebar: Favorites/Folders tabs, Recent shortcuts, Trash entry.
+    fn sidebar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Favorites, "★ Favorites");
+            ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Folders, "📁 Folders");
+        });
+        ui.separator();
+
+        // Bottom dock inside the sidebar: recents + trash.
+        egui::TopBottomPanel::bottom("sidebar_dock").show_inside(ui, |ui| {
+            ui.separator();
+            ui.add(egui::Label::new(egui::RichText::new("Recent").weak()).selectable(false));
+            if self.recent_paths.is_empty() {
+                ui.weak("No recent folders.");
+            } else {
+                let recent = self.recent_paths.clone();
+                egui::ScrollArea::vertical()
+                    .max_height(SIDEBAR_RECENTS as f32 * 24.0)
+                    .auto_shrink([true, false])
+                    .show(ui, |ui| {
+                        for path in recent.iter().take(SIDEBAR_RECENTS) {
+                            let short = node_label(path);
+                            let width = ui.available_width().max(60.0);
+                            let clicked = ui
+                                .add_sized(
+                                    [width, 18.0],
+                                    egui::Button::new(egui::RichText::new(&short).small()),
+                                )
+                                .on_hover_text(path.display().to_string())
+                                .clicked();
+                            if clicked {
+                                self.open_root(path);
+                            }
+                        }
+                    });
+            }
+            ui.separator();
+            if ui.button("Trash…").clicked() {
+                self.trash_window = true;
+            }
+        });
+
+        match self.sidebar_tab {
+            SidebarTab::Favorites => {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    if let Some(error) = &self.favorites_error {
+                        ui.weak(format!("Favorites unavailable: {error}"));
+                        return;
+                    }
+                    let favorites = match &self.favorites {
+                        Some(store) => store.paths().to_vec(),
+                        None => Vec::new(),
+                    };
+                    if favorites.is_empty() {
+                        ui.weak(
+                            "No favorites yet.\nUse “+ Add current folder” to star this folder.",
+                        );
+                    }
+                    for fav in favorites {
+                        let mut remove = false;
+                        ui.horizontal(|ui| {
+                            let label = node_label(&fav);
+                            let at = self.browser.root.as_deref() == Some(fav.as_path());
+                            let width = (ui.available_width() - 32.0).max(60.0);
+                            let clicked = ui
+                                .add_sized(
+                                    [width, 18.0],
+                                    egui::Button::new(
+                                        egui::RichText::new(format!("⭐ {label}")).small(),
+                                    )
+                                    .selected(at),
+                                )
+                                .on_hover_text(fav.display().to_string())
+                                .clicked();
+                            if ui
+                                .small_button("×")
+                                .on_hover_text("Remove from favorites")
+                                .clicked()
+                            {
+                                remove = true;
+                            }
+                            if clicked {
+                                self.open_root(&fav);
+                            }
+                        });
+                        if remove {
+                            if let Some(store) = &mut self.favorites {
+                                match store.remove(&fav) {
+                                    Ok(_) => {
+                                        self.status =
+                                            format!("Removed {} from favorites", fav.display())
+                                    }
+                                    Err(e) => {
+                                        self.status = format!("Could not update favorites: {e}")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(root) = self.browser.root.clone() {
+                        let already = self
+                            .favorites
+                            .as_ref()
+                            .is_some_and(|store| store.contains(&root));
+                        if !already && ui.button("+ Add current folder").clicked() {
+                            if let Some(store) = &mut self.favorites {
+                                match store.add(&root) {
+                                    Ok(true) => {
+                                        self.status =
+                                            format!("Added {} to favorites", root.display())
+                                    }
+                                    Ok(false) => {}
+                                    Err(e) => {
+                                        self.status = format!("Could not favorite folder: {e}")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+            SidebarTab::Folders => {
+                let root = self.browser.root.clone();
+                egui::ScrollArea::vertical().show(ui, |ui| match root {
+                    Some(root) => {
+                        // The tree is anchored at the open folder; breadcrumb
+                        // chips and Recents handle upward navigation.
+                        self.tree_node(ui, &root, 0);
+                    }
+                    None => {
+                        ui.weak("Open a folder to browse the tree.");
+                    }
+                });
+            }
+        }
+    }
+
+    /// Cached header-only dimensions for the metadata panel.
+    fn dims_of(&mut self, path: &Path) -> Option<(u32, u32)> {
+        if !self.dims_cache.contains_key(path) {
+            let dims = bc_thumbnails::decoder::image_dimensions(path);
+            self.dims_cache.insert(path.to_path_buf(), dims);
+        }
+        self.dims_cache.get(path).copied().flatten()
+    }
+
+    fn prop_row(ui: &mut egui::Ui, label: &str, value: String) {
+        ui.horizontal(|ui| {
+            ui.add_sized(
+                [76.0, 16.0],
+                egui::Label::new(egui::RichText::new(label).weak().small()).selectable(false),
+            );
+            ui.add(
+                egui::Label::new(egui::RichText::new(value).small())
+                    .truncate(true)
+                    .selectable(true),
+            );
+        });
+    }
+
+    /// Right panel: Preview tab (image) and Metadata tab (properties).
+    fn metadata_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.right_tab, RightTab::Preview, "Preview");
+            ui.selectable_value(&mut self.right_tab, RightTab::Metadata, "Metadata");
+        });
+        ui.separator();
+
+        let count = self.browser.selection.len();
+        let single = self.single_selection();
+        let Some(idx) = single else {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                if count == 0 {
+                    ui.weak("Nothing selected.");
+                } else {
+                    ui.label(format!("{count} selected"));
+                    let total = self.selected_total_size();
+                    ui.weak(format!("{} total", human_size(total)));
+                    for path in self.selected_paths(Path::new("")).iter().take(200) {
+                        ui.weak(
+                            path.file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| path.display().to_string()),
+                        );
+                    }
+                }
+            });
+            return;
+        };
+
+        let Some(entry) = self.browser.entries.get(idx).cloned() else {
+            ui.weak("Selection is no longer visible.");
+            return;
+        };
+        let name = entry.name().to_string_lossy().into_owned();
+        ui.add(
+            egui::Label::new(egui::RichText::new(&name).strong().small())
+                .truncate(true)
+                .selectable(false),
+        )
+        .on_hover_text(entry.path.display().to_string());
+        ui.separator();
+
+        match self.right_tab {
+            RightTab::Preview => {
+                let path = entry.path.clone();
+                if entry.is_dir {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(egui::RichText::new("📁").size(48.0));
+                    });
+                    ui.centered_and_justified(|ui| ui.weak("Folder"));
+                } else if bc_thumbnails::decoder::can_thumbnail(&path) {
+                    // Ask the cache for the big tier once; the grid tier fills
+                    // in while it decodes.
+                    if let Some(meta) = self.entry_meta(&path) {
+                        self.request_image(&path, meta.0, meta.1, PREVIEW_EDGE, true);
+                    }
+                    let texture = self
+                        .textures
+                        .get(&(path.clone(), PREVIEW_EDGE))
+                        .or_else(|| self.textures.get(&(path.clone(), THUMB_MAX_EDGE)))
+                        .cloned();
+                    match texture {
+                        Some(tex) => {
+                            let (rect, _) =
+                                ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
+                            let size = tex.size_vec2();
+                            let scale = ((rect.width() / size.x.max(1.0))
+                                .min(rect.height() / size.y.max(1.0)))
+                            .clamp(0.02, 8.0);
+                            let draw_rect =
+                                egui::Rect::from_center_size(rect.center(), size * scale);
+                            ui.painter().image(
+                                tex.id(),
+                                draw_rect,
+                                egui::Rect::from_min_max(
+                                    egui::pos2(0.0, 0.0),
+                                    egui::pos2(1.0, 1.0),
+                                ),
+                                egui::Color32::WHITE,
+                            );
+                        }
+                        None => {
+                            let key = (path.clone(), PREVIEW_EDGE);
+                            let message = if self.failed.contains(&key) {
+                                "Preview failed to decode"
+                            } else {
+                                "Loading preview…"
+                            };
+                            ui.centered_and_justified(|ui| ui.weak(message));
+                        }
+                    }
+                } else {
+                    ui.weak("No preview for this file type.");
+                }
+            }
+            RightTab::Metadata => {
+                let path = entry.path.clone();
+                let dims = if entry.is_dir {
+                    None
+                } else {
+                    self.dims_of(&path)
+                };
+                let file_type = if entry.is_dir {
+                    "Folder".to_owned()
+                } else {
+                    entry
+                        .path
+                        .extension()
+                        .map(|ext| format!("{} file", ext.to_string_lossy().to_uppercase()))
+                        .unwrap_or_else(|| "File".to_owned())
+                };
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    Self::prop_row(ui, "Name", name.clone());
+                    Self::prop_row(ui, "Kind", file_type.clone());
+                    if let Some((w, h)) = dims {
+                        Self::prop_row(ui, "Dimensions", format!("{w} × {h}"));
+                    }
+                    Self::prop_row(
+                        ui,
+                        "Size",
+                        if entry.is_dir {
+                            "—".to_owned()
+                        } else {
+                            human_size(entry.size)
+                        },
+                    );
+                    Self::prop_row(ui, "Modified", format_modified(entry.modified));
+                    Self::prop_row(ui, "Path", path.display().to_string());
+                });
+            }
+        }
+    }
+
+    /// Preview-tier textures belong to the viewer and the metadata panel
+    /// only; anything else (files the user moved past) is dropped so huge
+    /// 2048 px RGBA images cannot pile up in GPU memory.
+    fn prune_preview_textures(&mut self) {
+        let viewer_path = self.viewer.path.clone();
+        let panel_path = self.single_selection().and_then(|idx| {
+            self.browser
+                .entries
+                .get(idx)
+                .filter(|e| !e.is_dir)
+                .map(|e| e.path.clone())
+        });
+        self.textures.retain(|(path, edge), _| {
+            *edge != PREVIEW_EDGE
+                || viewer_path.as_deref() == Some(path.as_path())
+                || panel_path.as_deref() == Some(path.as_path())
+        });
+    }
+
     // ------------------------------------------------------------- viewer --
 
     /// (mtime_ns, size) for a browsed entry, used to request viewer tiers.
@@ -308,8 +836,7 @@ impl BridgeApp {
             return;
         }
         let files: Vec<PathBuf> = self
-            .browser
-            .visible_indices()
+            .display_indices()
             .iter()
             .filter_map(|&idx| self.browser.entries.get(idx))
             .filter(|entry| !entry.is_dir)
@@ -319,7 +846,7 @@ impl BridgeApp {
         self.viewer.native = bc_thumbnails::decoder::image_dimensions(path);
         self.request_preview(path);
         self.status =
-            "Preview · ←/→ browse · ± or ctrl+scroll zoom · 0 fit · 1 100% · drag pan · Esc close"
+            "Preview · Left/Right browse · +/- or Ctrl+scroll zoom · 0 fit · 1 100% · drag pan · Esc close"
                 .into();
     }
 
@@ -407,17 +934,25 @@ impl BridgeApp {
             .unwrap_or_else(|| path.display().to_string());
 
         ui.horizontal(|ui| {
-            if ui.button("◀").on_hover_text("Previous file (←)").clicked() {
+            if ui
+                .button("<")
+                .on_hover_text("Previous file (Left arrow)")
+                .clicked()
+            {
                 self.viewer_step(-1);
             }
-            if ui.button("▶").on_hover_text("Next file (→)").clicked() {
+            if ui
+                .button(">")
+                .on_hover_text("Next file (Right arrow)")
+                .clicked()
+            {
                 self.viewer_step(1);
             }
             ui.separator();
-            if ui.button("−").on_hover_text("Zoom out (−)").clicked() {
+            if ui.button("-").on_hover_text("Zoom out (Minus)").clicked() {
                 self.viewer.zoom_step(0.8);
             }
-            if ui.button("+").on_hover_text("Zoom in (+)").clicked() {
+            if ui.button("+").on_hover_text("Zoom in (Plus)").clicked() {
                 self.viewer.zoom_step(1.25);
             }
             ui.label(format!("{:.0}%", self.viewer.displayed * 100.0));
@@ -434,7 +969,7 @@ impl BridgeApp {
             ui.separator();
             ui.label(egui::RichText::new(&name).strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("✕ Close").on_hover_text("Esc").clicked() {
+                if ui.button("Close").on_hover_text("Esc").clicked() {
                     self.close_viewer();
                 }
             });
@@ -523,40 +1058,18 @@ impl BridgeApp {
         }
     }
 
-    fn filter_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label("Filter:");
-            let before = self.browser.filter.clone();
-            let resp = ui.add_sized(
-                [220.0, 20.0],
-                egui::TextEdit::singleline(&mut self.browser.filter).hint_text("name contains…"),
-            );
-            // Re-apply immediately on any edit (also handles clearing).
-            if resp.changed() || self.browser.filter != before {
-                let shown = self.browser.set_filter(self.browser.filter.clone());
-                self.status = format!(
-                    "Filter “{}”: {} of {} items",
-                    self.browser.filter,
-                    shown,
-                    self.browser.len()
-                );
-            }
-            if ui.button("✕").clicked() && !self.browser.filter.is_empty() {
-                self.browser.set_filter("");
-            }
-        });
-    }
+    // ------------------------------------------------------------ content --
 
     fn content_grid(&mut self, ui: &mut egui::Ui) {
         // Keep all layout dimensions positive: a collapsed/zero-width UI should
         // still show one column rather than divide by zero or skip the grid.
-        let cell_width = if CELL_SIZE.is_finite() && CELL_SIZE > 0.0 {
-            CELL_SIZE
+        let cell_width = if self.cell_size.is_finite() && self.cell_size > 0.0 {
+            self.cell_size
         } else {
-            132.0
+            DEFAULT_CELL
         };
-        let row_height = if CELL_HEIGHT.is_finite() && CELL_HEIGHT >= cell_width {
-            CELL_HEIGHT
+        let row_height = if cell_width.is_finite() && cell_width >= MIN_CELL {
+            cell_width + 44.0
         } else {
             cell_width + 32.0
         };
@@ -567,7 +1080,7 @@ impl BridgeApp {
         };
         let available_width = ui.available_width().max(0.0);
         let cols = (((available_width + spacing) / (cell_width + spacing)).floor() as usize).max(1);
-        let indices = self.browser.visible_indices();
+        let indices = self.display_indices();
         let row_step = row_height + spacing;
         let row_count = indices.len().div_ceil(cols);
 
@@ -611,6 +1124,7 @@ impl BridgeApp {
                         }
                         response.context_menu(|ui| self.selection_context_menu(ui, &path));
                         if response.clicked() {
+                            self.list_focused = true;
                             let mods = ui.input(|i| i.modifiers);
                             if mods.shift {
                                 self.browser.selection.select_range(idx);
@@ -642,7 +1156,7 @@ impl BridgeApp {
     }
 
     fn content_list(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, details: bool) {
-        let visible = self.browser.visible_indices();
+        let visible = self.display_indices();
         if details {
             ui.horizontal(|ui| {
                 ui.strong("Name");
@@ -743,7 +1257,7 @@ impl BridgeApp {
                         rect.width() * 0.16,
                     ];
                     let values = [
-                        format!("{}  {name}", if is_dir { "▸" } else { "·" }),
+                        format!("{}  {name}", if is_dir { "📁" } else { "·" }),
                         file_type,
                         if is_dir {
                             String::new()
@@ -767,7 +1281,7 @@ impl BridgeApp {
                     ui.painter().text(
                         egui::pos2(rect.left() + 8.0, rect.center().y),
                         egui::Align2::LEFT_CENTER,
-                        format!("{}  {name}", if is_dir { "▸" } else { "·" }),
+                        format!("{}  {name}", if is_dir { "📁" } else { "·" }),
                         egui::FontId::proportional(14.0),
                         color,
                     );
@@ -813,6 +1327,16 @@ impl BridgeApp {
             vec![clicked_path.to_path_buf()]
         } else {
             paths
+        }
+    }
+
+    fn select_all_visible(&mut self) {
+        // Select only currently displayed entries so Select All respects
+        // the active filter and the thumbnails-only toggle.
+        let visible = self.display_indices();
+        self.browser.selection.clear();
+        for idx in visible {
+            self.browser.selection.toggle(idx);
         }
     }
 
@@ -973,52 +1497,47 @@ impl BridgeApp {
         }
     }
 
-    fn recents_menu(&mut self, ui: &mut egui::Ui) {
-        match Recents::open_default() {
-            Ok(recents) if !recents.paths().is_empty() => {
-                for path in recents.paths().to_vec() {
-                    if ui.button(path.display().to_string()).clicked() {
-                        self.open_root(&path);
-                        ui.close_menu();
-                    }
-                }
-            }
-            Ok(_) => {
-                ui.weak("No recent locations.");
-            }
-            Err(e) => {
-                ui.label(format!("Recents unavailable: {e}"));
-            }
+    fn trash_window(&mut self, ctx: &egui::Context) {
+        if !self.trash_window {
+            return;
         }
-    }
-
-    fn trash_menu(&mut self, ui: &mut egui::Ui) {
-        match TrashBin::open_default() {
-            Ok(mut bin) => {
-                let entries = bin.list();
-                if entries.is_empty() {
-                    ui.weak("Trash is empty.");
-                } else {
-                    for entry in entries {
-                        ui.horizontal(|ui| {
-                            ui.label(entry.original_path.display().to_string());
-                            if ui.button("Restore").clicked() {
-                                match bin.restore(&entry.id) {
-                                    Ok(path) => {
-                                        self.status = format!("Restored {}", path.display())
+        // Local flag so the window's close button can clear the shared field
+        // without borrowing `self` through the builder.
+        let mut open = true;
+        egui::Window::new("BridgeCraft Trash")
+            .resizable(true)
+            .default_size([460.0, 300.0])
+            .open(&mut open)
+            .show(ctx, |ui| match TrashBin::open_default() {
+                Ok(mut bin) => {
+                    let entries = bin.list();
+                    if entries.is_empty() {
+                        ui.weak("Trash is empty.");
+                    } else {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            for entry in entries {
+                                ui.horizontal(|ui| {
+                                    ui.label(entry.original_path.display().to_string());
+                                    if ui.button("Restore").clicked() {
+                                        match bin.restore(&entry.id) {
+                                            Ok(path) => {
+                                                self.status = format!("Restored {}", path.display())
+                                            }
+                                            Err(e) => {
+                                                self.status = format!("Could not restore item: {e}")
+                                            }
+                                        }
                                     }
-                                    Err(e) => self.status = format!("Could not restore item: {e}"),
-                                }
-                                ui.close_menu();
+                                });
                             }
                         });
                     }
                 }
-            }
-            Err(e) => {
-                ui.label(format!("Trash unavailable: {e}"));
-            }
-        }
+                Err(e) => {
+                    ui.label(format!("Trash unavailable: {e}"));
+                }
+            });
+        self.trash_window = open;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1040,7 +1559,7 @@ impl BridgeApp {
 
         ui.vertical_centered(|ui| {
             let (rect, response) = ui.allocate_exact_size(
-                egui::vec2((cell_size - 12.0).max(1.0), (cell_size - 12.0).max(1.0)),
+                egui::vec2((cell_size - 12.0).max(1.0), (cell_size - 20.0).max(1.0)),
                 egui::Sense::click(),
             );
 
@@ -1056,7 +1575,7 @@ impl BridgeApp {
                 );
             } else if let Some(tex) = self.textures.get(&(path.to_path_buf(), THUMB_MAX_EDGE)) {
                 let tex_size = tex.size_vec2();
-                let scale = ((rect.size().x / tex_size.x).min(rect.size().y / tex_size.y)).min(1.0);
+                let scale = (rect.size().x / tex_size.x).min(rect.size().y / tex_size.y);
                 let draw_rect = egui::Rect::from_center_size(rect.center(), tex_size * scale);
                 ui.painter().image(
                     tex.id(),
@@ -1070,7 +1589,7 @@ impl BridgeApp {
                 ui.painter().text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
-                    "⋯",
+                    "…",
                     egui::FontId::proportional(24.0),
                     egui::Color32::GRAY,
                 );
@@ -1096,6 +1615,186 @@ impl BridgeApp {
         })
         .inner
     }
+
+    // ------------------------------------------------------------- chrome --
+
+    /// Toolbar + breadcrumb rows above the content.
+    fn top_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if ui
+                    .button("Open…")
+                    .on_hover_text("Open a folder (Ctrl+O)")
+                    .clicked()
+                {
+                    self.open_field = !self.open_field;
+                }
+                let parent = self
+                    .browser
+                    .root
+                    .as_ref()
+                    .and_then(|r| r.parent())
+                    .map(|p| p.to_path_buf());
+                if ui
+                    .button("Up")
+                    .on_hover_text("Up to the parent folder")
+                    .clicked()
+                {
+                    if let Some(parent) = parent {
+                        self.open_root(&parent);
+                    }
+                }
+                if ui.button("Refresh").on_hover_text("Refresh (F5)").clicked() {
+                    self.refresh_now();
+                }
+                ui.separator();
+                if ui.button("Select All").clicked() {
+                    self.select_all_visible();
+                }
+                if ui.button("Clear").clicked() {
+                    self.browser.selection.clear();
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    egui::ComboBox::from_id_source("sort_key")
+                        .selected_text(match self.browser.sort_key {
+                            SortKey::Name => "Name",
+                            SortKey::Size => "Size",
+                            SortKey::Modified => "Modified",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.browser.sort_key, SortKey::Name, "Name");
+                            ui.selectable_value(&mut self.browser.sort_key, SortKey::Size, "Size");
+                            ui.selectable_value(
+                                &mut self.browser.sort_key,
+                                SortKey::Modified,
+                                "Modified",
+                            );
+                        });
+                    let dir_label = match self.browser.sort_dir {
+                        SortDir::Asc => "A-Z",
+                        SortDir::Desc => "Z-A",
+                    };
+                    if ui.button(dir_label).clicked() {
+                        self.browser.sort_dir = match self.browser.sort_dir {
+                            SortDir::Asc => SortDir::Desc,
+                            SortDir::Desc => SortDir::Asc,
+                        };
+                        self.browser
+                            .set_sort(self.browser.sort_key, self.browser.sort_dir);
+                    }
+                    ui.label("Sort:");
+                    ui.separator();
+                    let before = self.browser.filter.clone();
+                    let resp = ui.add_sized(
+                        [200.0, 20.0],
+                        egui::TextEdit::singleline(&mut self.browser.filter)
+                            .hint_text("filter by name…"),
+                    );
+                    if resp.changed() || self.browser.filter != before {
+                        let shown = self.browser.set_filter(self.browser.filter.clone());
+                        self.status = format!(
+                            "Filter “{}”: {} of {} items",
+                            self.browser.filter,
+                            shown,
+                            self.browser.len()
+                        );
+                    }
+                });
+            });
+            if self.open_field {
+                ui.horizontal(|ui| {
+                    ui.label("Folder:");
+                    let resp = ui.add_sized(
+                        [(ui.available_width() - 120.0).max(160.0), 20.0],
+                        egui::TextEdit::singleline(&mut self.path_input).hint_text("path…"),
+                    );
+                    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if (resp.lost_focus() && enter) || ui.button("Open").clicked() {
+                        let path = self.path_input.clone();
+                        self.open_root(Path::new(&path));
+                    }
+                    if ui.button("Close").clicked() {
+                        self.open_field = false;
+                    }
+                });
+            }
+        });
+
+        egui::TopBottomPanel::top("breadcrumbs").show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| match &self.browser.root {
+                None => {
+                    ui.weak("No folder open — press Open… to pick one.");
+                }
+                Some(root) => {
+                    let chain: Vec<PathBuf> = root.ancestors().map(Path::to_path_buf).collect();
+                    let last = chain.len().saturating_sub(1);
+                    for (i, ancestor) in chain.iter().rev().enumerate() {
+                        if i > 0 {
+                            ui.weak("›");
+                        }
+                        let active = i == last;
+                        let label = node_label(ancestor);
+                        if ui
+                            .add(
+                                egui::Button::new(egui::RichText::new(label).small())
+                                    .selected(active),
+                            )
+                            .on_hover_text(ancestor.display().to_string())
+                            .clicked()
+                            && !active
+                        {
+                            self.open_root(ancestor);
+                        }
+                    }
+                }
+            });
+        });
+    }
+
+    fn status_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+            let selected = self.browser.selection.len();
+            let selected_size = self.selected_total_size();
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.view_mode, ViewMode::Thumbnails, "Thumbnails")
+                    .on_hover_text("Thumbnail grid");
+                ui.selectable_value(&mut self.view_mode, ViewMode::List, "List")
+                    .on_hover_text("Compact list");
+                ui.selectable_value(&mut self.view_mode, ViewMode::Details, "Details")
+                    .on_hover_text("Details table");
+                ui.separator();
+                ui.add_sized(
+                    [140.0, 18.0],
+                    egui::Slider::new(&mut self.cell_size, MIN_CELL..=MAX_CELL)
+                        .text("Zoom")
+                        .show_value(false),
+                );
+                ui.separator();
+                ui.checkbox(&mut self.thumbs_only, "Thumbnails only")
+                    .on_hover_text("Hide files BridgeCraft cannot preview");
+                ui.separator();
+                ui.add(
+                    egui::Label::new(egui::RichText::new(&self.status).small())
+                        .truncate(true)
+                        .selectable(false),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let summary = if selected > 0 {
+                        format!(
+                            "{} of {} items · {} selected · {}",
+                            self.browser.visible_len(),
+                            self.browser.len(),
+                            selected,
+                            human_size(selected_size)
+                        )
+                    } else {
+                        format!("{} items", self.browser.len())
+                    };
+                    ui.weak(egui::RichText::new(summary).small());
+                });
+            });
+        });
+    }
 }
 
 fn human_size(size: u64) -> String {
@@ -1117,6 +1816,27 @@ impl eframe::App for BridgeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_thumbnails(ctx);
         self.poll_watcher();
+        self.prune_preview_textures();
+
+        // Global shortcuts that must not fire while a text field has focus.
+        if !ctx.wants_keyboard_input() {
+            let (ctrl, select_all, refresh) = ctx.input(|input| {
+                (
+                    input.modifiers.ctrl || input.modifiers.command,
+                    input.key_pressed(egui::Key::A),
+                    input.key_pressed(egui::Key::F5),
+                )
+            });
+            if refresh {
+                self.refresh_now();
+            }
+            if ctrl && select_all {
+                self.select_all_visible();
+            }
+            if ctrl && ctx.input(|i| i.key_pressed(egui::Key::O)) {
+                self.open_field = !self.open_field;
+            }
+        }
 
         // Viewer shortcuts, active only while the viewer owns the panel and
         // no text field has focus.
@@ -1155,101 +1875,29 @@ impl eframe::App for BridgeApp {
             }
         }
 
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Folder:");
-                let resp = ui.add_sized(
-                    [ui.available_width() - 260.0, 20.0],
-                    egui::TextEdit::singleline(&mut self.path_input),
-                );
-                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    let path = self.path_input.clone();
-                    self.open_root(Path::new(&path));
-                }
-                if ui.button("Open").clicked() {
-                    let path = self.path_input.clone();
-                    self.open_root(Path::new(&path));
-                }
-                if ui.button("⬆ Up").clicked() {
-                    if let Some(parent) = self
-                        .browser
-                        .root
-                        .as_ref()
-                        .and_then(|r| r.parent())
-                        .map(|p| p.to_path_buf())
-                    {
-                        self.open_root(&parent);
-                    }
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("Sort:");
-                let key_names = [
-                    (SortKey::Name, "Name"),
-                    (SortKey::Size, "Size"),
-                    (SortKey::Modified, "Modified"),
-                ];
-                egui::ComboBox::from_id_source("sort_key")
-                    .selected_text(
-                        key_names
-                            .iter()
-                            .find(|(k, _)| *k == self.browser.sort_key)
-                            .map_or("?", |(_, n)| n),
-                    )
-                    .show_ui(ui, |ui| {
-                        for (k, n) in key_names {
-                            ui.selectable_value(&mut self.browser.sort_key, k, n);
-                        }
-                    });
-                let dir_label = match self.browser.sort_dir {
-                    SortDir::Asc => "▲ Asc",
-                    SortDir::Desc => "▼ Desc",
-                };
-                if ui.button(dir_label).clicked() {
-                    self.browser.sort_dir = match self.browser.sort_dir {
-                        SortDir::Asc => SortDir::Desc,
-                        SortDir::Desc => SortDir::Asc,
-                    };
-                    self.browser
-                        .set_sort(self.browser.sort_key, self.browser.sort_dir);
-                }
-                ui.separator();
-                self.filter_bar(ui);
-            });
-            ui.horizontal(|ui| {
-                ui.menu_button("Recents", |ui| self.recents_menu(ui));
-                ui.menu_button("Trash", |ui| self.trash_menu(ui));
-            });
-            ui.horizontal(|ui| {
-                ui.label("View:");
-                ui.selectable_value(&mut self.view_mode, ViewMode::Thumbnails, "Thumbnails");
-                ui.selectable_value(&mut self.view_mode, ViewMode::List, "List");
-                ui.selectable_value(&mut self.view_mode, ViewMode::Details, "Details");
-            });
-            ui.horizontal(|ui| {
-                if ui.button("Select All").clicked() {
-                    // Select only currently visible entries so Select All
-                    // respects the active filter.
-                    let visible = self.browser.visible_indices();
-                    self.browser.selection.clear();
-                    for idx in visible {
-                        self.browser.selection.toggle(idx);
-                    }
-                }
-                if ui.button("Clear").clicked() {
-                    self.browser.selection.clear();
-                }
-                ui.separator();
-                ui.label(format!("{} selected", self.browser.selection.len()));
-            });
-        });
+        self.top_bar(ctx);
+        self.status_bar(ctx);
+
+        egui::SidePanel::left("sidebar")
+            .resizable(true)
+            .default_width(210.0)
+            .min_width(150.0)
+            .max_width(380.0)
+            .show(ctx, |ui| self.sidebar(ui));
+
+        egui::SidePanel::right("metadata")
+            .resizable(true)
+            .default_width(260.0)
+            .min_width(180.0)
+            .max_width(480.0)
+            .show(ctx, |ui| self.metadata_panel(ui));
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.viewer.is_open() {
                 self.viewer_view(ui, ctx);
             } else if self.browser.root.is_none() {
                 ui.centered_and_justified(|ui| {
-                    ui.weak("Type a folder path above and press Open.");
+                    ui.weak("Press Open… (Ctrl+O) and type a folder path.");
                 });
             } else if self.browser.visible_len() == 0 {
                 ui.centered_and_justified(|ui| {
@@ -1258,6 +1906,10 @@ impl eframe::App for BridgeApp {
                     } else {
                         ui.weak(format!("No items match filter “{}”.", self.browser.filter));
                     }
+                });
+            } else if self.display_indices().is_empty() {
+                ui.centered_and_justified(|ui| {
+                    ui.weak("Thumbnails-only hides every item in this folder.");
                 });
             } else {
                 match self.view_mode {
@@ -1268,21 +1920,7 @@ impl eframe::App for BridgeApp {
             }
         });
 
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(&self.status);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.weak(format!(
-                        "{} of {} items",
-                        self.browser.visible_len(),
-                        self.browser.len()
-                    ));
-                    if let Some(root) = &self.browser.root {
-                        ui.weak(root.display().to_string());
-                    }
-                });
-            });
-        });
+        self.trash_window(ctx);
         self.confirm_delete_window(ctx);
     }
 }
@@ -1359,5 +1997,18 @@ mod tests {
             "2024-01-01 00:00"
         );
         assert_eq!(format_modified(None), "—");
+    }
+
+    #[test]
+    fn node_label_anchors_roots_and_names_children() {
+        assert_eq!(node_label(Path::new("/")), "⌂ /");
+        assert_eq!(node_label(Path::new("/tmp/demo")), "demo");
+    }
+
+    #[test]
+    fn human_size_scales_units() {
+        assert_eq!(human_size(9), "9 B");
+        assert_eq!(human_size(2048), "2.0 KB");
+        assert_eq!(human_size(5 * 1024 * 1024), "5.0 MB");
     }
 }
