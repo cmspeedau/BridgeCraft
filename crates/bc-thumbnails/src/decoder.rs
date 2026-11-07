@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use crate::{video, ThumbError, Thumbnail};
+use crate::{pdf, video, ThumbError, Thumbnail};
 
 /// True when `path` has the extension of an image format this crate can
 /// decode. Keep in sync with the `image` features in the workspace
@@ -21,7 +21,9 @@ pub fn is_supported(path: &Path) -> bool {
 /// thumbnail pipeline, so a machine without FFmpeg does not retry every
 /// video file it browses.
 pub fn can_thumbnail(path: &Path) -> bool {
-    is_supported(path) || (video::is_supported(path) && video::is_available())
+    is_supported(path)
+        || (video::is_supported(path) && video::is_available())
+        || (pdf::is_supported(path) && pdf::is_available())
 }
 
 /// Decode an image or video file and produce an RGBA thumbnail whose longest
@@ -29,6 +31,9 @@ pub fn can_thumbnail(path: &Path) -> bool {
 pub fn decode_thumbnail(path: &Path, max_edge: u32) -> Result<Thumbnail, ThumbError> {
     if video::is_supported(path) {
         return video::decode_thumbnail(path, max_edge);
+    }
+    if pdf::is_supported(path) {
+        return pdf::decode_thumbnail(path, max_edge);
     }
 
     let display = path.display().to_string();
@@ -82,5 +87,6 @@ mod tests {
         assert!(can_thumbnail(Path::new("a.png")));
         assert!(!can_thumbnail(Path::new("notes.txt")));
         assert_eq!(can_thumbnail(Path::new("film.mp4")), video::is_available());
+        assert_eq!(can_thumbnail(Path::new("doc.pdf")), pdf::is_available());
     }
 }

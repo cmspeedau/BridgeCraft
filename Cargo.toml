@@ -29,6 +29,10 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # or bundled. The download feature is disabled on purpose: BridgeCraft never
 # fetches binaries at build or run time.
 ffmpeg-sidecar = { version = "2.7", default-features = false }
+# Dynamic bindings to a user-provided libpdfium; nothing is linked or bundled.
+# `image_latest` is disabled to avoid a second copy of the `image` crate: raw
+# RGBA is all the thumbnail pipeline needs.
+pdfium-render = { version = "0.9", default-features = false, features = ["pdfium_latest", "thread_safe"] }
 eframe = "0.27"
 egui = "0.27"
 

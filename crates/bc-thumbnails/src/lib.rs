@@ -2,6 +2,7 @@
 
 pub mod cache;
 pub mod decoder;
+pub mod pdf;
 pub mod video;
 
 use std::path::Path;
@@ -22,6 +23,9 @@ pub enum ThumbError {
 
     #[error("video thumbnail failed for {path}: {message}")]
     Video { path: String, message: String },
+
+    #[error("pdf thumbnail failed for {path}: {message}")]
+    Pdf { path: String, message: String },
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),

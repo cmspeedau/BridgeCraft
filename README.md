@@ -26,9 +26,14 @@ cargo clippy --workspace -- -D warnings
 cargo fmt --all -- --check
 ```
 
-### Video thumbnails (optional FFmpeg)
+### Optional runtime codecs (video & PDF)
 
-Video files get thumbnails through a locally installed [`ffmpeg`](https://ffmpeg.org/) executable. BridgeCraft does not link or bundle FFmpeg, so its licence stays outside this project, and builds work without it: when `ffmpeg` is not on `PATH` (or next to the app binary), videos are shown without a preview and everything else works normally. Video tests generate their fixtures with FFmpeg and skip when it is unavailable.
+Video and PDF thumbnails use optional, locally installed libraries. Neither is linked or bundled, and builds work without them:
+
+- **Video:** a `ffmpeg` executable on `PATH` (or next to the app binary).
+- **PDF:** a Pdfium library (`libpdfium.so`, `libpdfium.dylib`, or `pdfium.dll`) located via `PDFIUM_PATH` (file or directory), next to the app binary, common install directories, or the OS loader's search path. `PDFIUM_PATH` takes priority.
+
+Without them, those files are shown without a preview and everything else works normally. Tests that need these libraries generate their own fixtures and skip when a library is unavailable.
 
 ## Releases & packaging
 

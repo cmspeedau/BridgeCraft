@@ -41,6 +41,11 @@ fn main() -> anyhow::Result<()> {
     } else {
         tracing::info!("ffmpeg not found in PATH; video thumbnails are disabled");
     }
+    if bc_thumbnails::pdf::is_available() {
+        tracing::info!("pdf thumbnails enabled (pdfium found)");
+    } else {
+        tracing::info!("pdfium not found; pdf thumbnails are disabled (set PDFIUM_PATH)");
+    }
 
     let root = std::env::args().nth(1);
 

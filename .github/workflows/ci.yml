@@ -24,6 +24,14 @@ jobs:
       - name: Install ffmpeg (video thumbnail tests)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install Pdfium (PDF thumbnail tests)
+        if: runner.os == 'Linux'
+        run: |
+          curl -fsSL -o /tmp/pdfium.tgz "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium%2F8138/pdfium-linux-x64.tgz"
+          echo "d6b1e28950a0392590d79bbdbb7eb19686872b688f8a36f170acb19e41473113  /tmp/pdfium.tgz" | sha256sum -c -
+          sudo mkdir -p /opt/pdfium
+          sudo tar -xzf /tmp/pdfium.tgz -C /opt/pdfium
+          echo "PDFIUM_PATH=/opt/pdfium/lib" >> "$GITHUB_ENV"
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
