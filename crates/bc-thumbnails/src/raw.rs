@@ -21,7 +21,9 @@
 //! LibRaw is dual-licensed LGPL-2.1 / CDDL-1.0 and is supplied by the user; no
 //! LibRaw code is redistributed with BridgeCraft.
 
-use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString, OsStr};
+#[cfg(not(windows))]
+use std::ffi::CString;
+use std::ffi::{c_char, c_int, c_uint, c_void, CStr, OsStr};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -59,6 +61,7 @@ struct RawLib {
     /// Kept alive so the symbols below stay valid.
     _library: Library,
     init: unsafe extern "C" fn(c_uint) -> *mut c_void,
+    #[cfg(not(windows))]
     open_file: unsafe extern "C" fn(*mut c_void, *const c_char) -> c_int,
     #[cfg(windows)]
     open_wfile: unsafe extern "C" fn(*mut c_void, *const u16) -> c_int,
@@ -83,6 +86,7 @@ impl RawLib {
         // Resolve every symbol against the borrow first, then move the
         // library into the struct so the pointers stay valid.
         let init = symbol(&library, b"libraw_init\0")?;
+        #[cfg(not(windows))]
         let open_file = symbol(&library, b"libraw_open_file\0")?;
         #[cfg(windows)]
         let open_wfile = symbol(&library, b"libraw_open_wfile\0")?;
@@ -104,6 +108,7 @@ impl RawLib {
         Ok(Self {
             _library: library,
             init,
+            #[cfg(not(windows))]
             open_file,
             #[cfg(windows)]
             open_wfile,
