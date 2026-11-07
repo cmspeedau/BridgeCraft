@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 bc-core = { path = "../bc-core" }
+bc-metadata = { path = "../bc-metadata" }
 bc-thumbnails = { path = "../bc-thumbnails" }
 eframe.workspace = true
 egui.workspace = true

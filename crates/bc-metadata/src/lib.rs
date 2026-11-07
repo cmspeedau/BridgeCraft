@@ -1,7 +1,11 @@
 //! bc-metadata: EXIF / IPTC / XMP metadata read & write.
 //!
-//! Phase 0 skeleton only. Real implementation lands in Phase 3,
-//! using published open specs (ISO 16684 XMP, EXIF, IPTC) — see CLEANROOM.md.
+//! EXIF reading (JPEG `APP1` and TIFF-family containers, pure Rust, built
+//! from the published TIFF/EXIF specs) is implemented in [`exif`]. IPTC,
+//! XMP, the structured model (issue #5) and writing land later in Phase 3.
+//! Clean-room per CLEANROOM.md.
+
+pub mod exif;
 
 use thiserror::Error;
 
@@ -12,6 +16,9 @@ pub enum MetadataError {
 
     #[error("malformed metadata: {0}")]
     Malformed(String),
+
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// Placeholder trait for metadata readers (EXIF, IPTC, XMP).

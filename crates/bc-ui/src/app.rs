@@ -192,6 +192,8 @@ pub struct BridgeApp {
     trash_window: bool,
     /// Header-only dimensions, cached per path for the Metadata panel.
     dims_cache: HashMap<PathBuf, Option<(u32, u32)>>,
+    /// EXIF fields cached per path, keyed with the mtime they were read at.
+    exif_cache: HashMap<PathBuf, (i64, bc_metadata::Metadata)>,
 }
 
 impl BridgeApp {
@@ -239,6 +241,7 @@ impl BridgeApp {
             open_field: false,
             trash_window: false,
             dims_cache: HashMap::new(),
+            exif_cache: HashMap::new(),
         };
 
         if let Some(root) = root {
@@ -652,6 +655,26 @@ impl BridgeApp {
         self.dims_cache.get(path).copied().flatten()
     }
 
+    /// EXIF fields for a file, cached until the file's modified time moves.
+    /// Failed reads cache an empty map so the panel does not retry per frame.
+    fn exif_for(&mut self, path: &Path, mtime: i64) -> Option<bc_metadata::Metadata> {
+        if let Some((cached_mtime, meta)) = self.exif_cache.get(path) {
+            if *cached_mtime == mtime {
+                return Some(meta.clone());
+            }
+        }
+        let meta = match bc_metadata::exif::read_exif_file(path) {
+            Ok(meta) => meta,
+            Err(e) => {
+                tracing::debug!("exif read failed for {}: {e}", path.display());
+                bc_metadata::Metadata::new()
+            }
+        };
+        self.exif_cache
+            .insert(path.to_path_buf(), (mtime, meta.clone()));
+        Some(meta)
+    }
+
     fn prop_row(ui: &mut egui::Ui, label: &str, value: String) {
         ui.horizontal(|ui| {
             ui.add_sized(
@@ -778,7 +801,53 @@ impl BridgeApp {
                         .map(|ext| format!("{} file", ext.to_string_lossy().to_uppercase()))
                         .unwrap_or_else(|| "File".to_owned())
                 };
+                let exif = if entry.is_dir || !bc_thumbnails::decoder::can_thumbnail(&path) {
+                    None
+                } else {
+                    self.exif_for(&path, mtime_ns(entry.modified))
+                };
                 egui::ScrollArea::vertical().show(ui, |ui| {
+                    if let Some(meta) = exif.as_ref().filter(|meta| !meta.is_empty()) {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new("Camera Data (EXIF)").weak().small(),
+                            )
+                            .selectable(false),
+                        );
+                        if let Some(v) = format_camera(meta) {
+                            Self::prop_row(ui, "Camera", v);
+                        }
+                        if let Some(v) = meta
+                            .get("exif.DateTimeOriginal")
+                            .or_else(|| meta.get("exif.DateTime"))
+                        {
+                            Self::prop_row(ui, "Taken", v.clone());
+                        }
+                        for (label, key) in [
+                            ("Exposure", "exif.ExposureTime"),
+                            ("Aperture", "exif.FNumber"),
+                            ("ISO", "exif.ISOSpeedRatings"),
+                            ("Focal Length", "exif.FocalLength"),
+                            ("Orientation", "exif.Orientation"),
+                            ("Color Space", "exif.ColorSpace"),
+                            ("Software", "exif.Software"),
+                        ] {
+                            if let Some(v) = meta.get(key) {
+                                Self::prop_row(ui, label, v.clone());
+                            }
+                        }
+                        if let Some(v) = exif_image_size(meta) {
+                            Self::prop_row(ui, "EXIF Size", v);
+                        }
+                        if let Some(v) = exif_gps(meta) {
+                            Self::prop_row(ui, "GPS", v);
+                        }
+                        ui.separator();
+                    }
+                    ui.add(
+                        egui::Label::new(egui::RichText::new("File Properties").weak().small())
+                            .selectable(false),
+                    );
                     Self::prop_row(ui, "Name", name.clone());
                     Self::prop_row(ui, "Kind", file_type.clone());
                     if let Some((w, h)) = dims {
@@ -1797,6 +1866,40 @@ impl BridgeApp {
     }
 }
 
+/// Make + Model as one line; a Make duplicated as the Model's prefix is
+/// dropped so "Canon" + "Canon EOS-1D X" reads as just the model.
+fn format_camera(meta: &bc_metadata::Metadata) -> Option<String> {
+    match (meta.get("exif.Make"), meta.get("exif.Model")) {
+        (Some(make), Some(model)) => Some(if model.starts_with(make.as_str()) {
+            model.clone()
+        } else {
+            format!("{make} {model}")
+        }),
+        (Some(make), None) => Some(make.clone()),
+        (None, Some(model)) => Some(model.clone()),
+        (None, None) => None,
+    }
+}
+
+/// EXIF-reported pixel dimensions as one line.
+fn exif_image_size(meta: &bc_metadata::Metadata) -> Option<String> {
+    let width = meta.get("exif.PixelWidth")?;
+    let height = meta.get("exif.PixelHeight")?;
+    Some(format!("{width} × {height}"))
+}
+
+/// GPS position (plus altitude when present) as one line; needs both
+/// latitude and longitude to be worth showing.
+fn exif_gps(meta: &bc_metadata::Metadata) -> Option<String> {
+    let lat = meta.get("gps.Latitude")?;
+    let lon = meta.get("gps.Longitude")?;
+    let mut text = format!("{lat}, {lon}");
+    if let Some(alt) = meta.get("gps.Altitude") {
+        text.push_str(&format!(" · {alt}"));
+    }
+    Some(text)
+}
+
 fn human_size(size: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut v = size as f64;
@@ -2010,5 +2113,48 @@ mod tests {
         assert_eq!(human_size(9), "9 B");
         assert_eq!(human_size(2048), "2.0 KB");
         assert_eq!(human_size(5 * 1024 * 1024), "5.0 MB");
+    }
+
+    fn exif_fixture(pairs: &[(&str, &str)]) -> bc_metadata::Metadata {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn camera_line_deduplicates_a_make_prefix() {
+        let prefixed = exif_fixture(&[("exif.Make", "Canon"), ("exif.Model", "Canon EOS-1D X")]);
+        assert_eq!(format_camera(&prefixed).as_deref(), Some("Canon EOS-1D X"));
+        let split = exif_fixture(&[("exif.Make", "Canon"), ("exif.Model", "EOS-1D X")]);
+        assert_eq!(format_camera(&split).as_deref(), Some("Canon EOS-1D X"));
+        let model_only = exif_fixture(&[("exif.Model", "Z9")]);
+        assert_eq!(format_camera(&model_only).as_deref(), Some("Z9"));
+        assert_eq!(format_camera(&exif_fixture(&[])), None);
+    }
+
+    #[test]
+    fn exif_size_and_gps_rows_join_fields_or_stay_quiet() {
+        let meta = exif_fixture(&[
+            ("exif.PixelWidth", "5184"),
+            ("exif.PixelHeight", "3456"),
+            ("gps.Latitude", "47.60621 N"),
+            ("gps.Longitude", "122.32000 W"),
+            ("gps.Altitude", "120.0 m"),
+        ]);
+        assert_eq!(exif_image_size(&meta).as_deref(), Some("5184 × 3456"));
+        assert_eq!(
+            exif_gps(&meta).as_deref(),
+            Some("47.60621 N, 122.32000 W · 120.0 m")
+        );
+        // A half-written GPS pair or a missing dimension shows nothing.
+        assert_eq!(
+            exif_gps(&exif_fixture(&[("gps.Latitude", "47.6 N")])).as_deref(),
+            None
+        );
+        assert_eq!(
+            exif_image_size(&exif_fixture(&[("exif.PixelWidth", "5184")])).as_deref(),
+            None
+        );
     }
 }

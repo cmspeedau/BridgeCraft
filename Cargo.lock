@@ -487,6 +487,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bc-core",
+ "bc-metadata",
  "bc-thumbnails",
  "eframe",
  "egui",
