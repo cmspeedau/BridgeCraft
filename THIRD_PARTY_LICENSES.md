@@ -7,6 +7,7 @@ confirmed to be Apache-2.0 / MIT / BSD / ISC compatible (see CLEANROOM.md).
 |---|---|---|---|
 | [`ffmpeg-sidecar`](https://crates.io/crates/ffmpeg-sidecar) | MIT | Drives a user-installed `ffmpeg` binary for video thumbnails | The `download_ffmpeg` feature is disabled; no binary is fetched or bundled |
 | [`pdfium-render`](https://crates.io/crates/pdfium-render) | MIT OR Apache-2.0 | Dynamically binds to a user-provided Pdfium library for PDF thumbnails | Loaded at run time with `libloading`; no Pdfium code is linked or bundled |
+| [`image`](https://crates.io/crates/image) | MIT OR Apache-2.0 | Decodes supported raster formats and embedded PSD JPEG thumbnails; converts PSD RGB resources to thumbnail buffers | Existing workspace dependency; no new dependency added |
 | [`libloading`](https://crates.io/crates/libloading) | ISC | Loads a user-installed LibRaw at run time for camera-RAW thumbnails | Loads only; no LibRaw code is linked or bundled |
 
 ## Runtime dependencies (not distributed)

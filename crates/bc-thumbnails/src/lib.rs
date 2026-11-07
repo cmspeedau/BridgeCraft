@@ -1,8 +1,10 @@
 //! bc-thumbnails: SQLite-backed thumbnail cache and image decoders.
 
+pub mod ai;
 pub mod cache;
 pub mod decoder;
 pub mod pdf;
+pub mod psd;
 pub mod raw;
 pub mod video;
 
@@ -30,6 +32,12 @@ pub enum ThumbError {
 
     #[error("pdf thumbnail failed for {path}: {message}")]
     Pdf { path: String, message: String },
+
+    #[error("PSD thumbnail failed for {path}: {message}")]
+    Psd { path: String, message: String },
+
+    #[error("Illustrator thumbnail failed for {path}: {message}")]
+    Ai { path: String, message: String },
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),

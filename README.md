@@ -10,12 +10,12 @@ A clean-room, cross-platform digital asset browser and file manager written in R
 |---|---|
 | `bc-core` | Filesystem scanning, watchers, selection model, app state |
 | `bc-metadata` | EXIF / IPTC / XMP / sidecar read & write |
-| `bc-thumbnails` | Thumbnail cache (SQLite); image, video (ffmpeg), PDF (pdfium) & camera RAW (LibRaw) decoders — the last three via optional run-time libraries |
+| `bc-thumbnails` | Thumbnail cache (SQLite); image, PSD, PDF-compatible AI, video (ffmpeg), PDF (pdfium) & camera RAW (LibRaw) decoders — optional external runtimes for video, PDF/AI and RAW |
 | `bc-ui` | Frontend shell (GUI framework TBD — see Phase 0 spike in ROADMAP) |
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md). Current phase: **Phase 0 — Foundations**.
+See [ROADMAP.md](ROADMAP.md). Current phase: **Phase 2 — Thumbnails & Previews**.
 
 ## Building
 
@@ -26,9 +26,9 @@ cargo clippy --workspace -- -D warnings
 cargo fmt --all -- --check
 ```
 
-### Optional runtime decoders (video, PDF & camera RAW)
+### Optional runtime decoders (video, PDF/AI & camera RAW)
 
-Video, PDF and camera-RAW thumbnails use optional, locally installed decoders. None are linked or bundled, and builds work without them:
+PSD previews use embedded JPEG or 24-bit RGB image resources. PDF-compatible Illustrator (`.ai`) files use the same optional Pdfium runtime as PDFs; PostScript-only AI is reported unsupported. Video, PDF/AI and camera-RAW thumbnails use optional, locally installed decoders. None are linked or bundled, and builds work without them:
 
 - **Video:** a `ffmpeg` executable on `PATH` (or next to the app binary).
 - **PDF:** a Pdfium library (`libpdfium.so`, `libpdfium.dylib`, or `pdfium.dll`) located via `PDFIUM_PATH` (file or directory), next to the app binary, common install directories, or the OS loader's search path. `PDFIUM_PATH` takes priority.

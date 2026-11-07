@@ -40,7 +40,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [x] PDF (via pdfium bindings) — `pdfium-render` binds to a user-provided `libpdfium` at run time (not bundled; see `docs/PHASE2.md`)
 - [x] Video via ffmpeg bindings — `ffmpeg-sidecar` drives a user-installed `ffmpeg` binary (not bundled or linked; see `docs/PHASE2.md`)
 - [x] Camera RAW support — `raw.rs` binds at run time to a user-installed LibRaw via `libloading` (embedded preview fast-path, full-render fallback; not bundled; see `docs/PHASE2.md`)
-- [ ] PSD/AI/Illustrator preview extraction
+- [x] PSD embedded preview extraction (resource IDs 1033/1036; JPEG and 24-bit RGB) and PDF-compatible AI rendering via Pdfium; PostScript-only AI returns an explicit unsupported error
 - [ ] Preview quality levels: thumbnail / preview / 1:1 zoom viewer
 - [x] Batch (re)build cache command
 - [~] Reuse embedded XMP/EXIF previews as fast-path thumbnails — deferred to Phase 3 (needs metadata reader)
@@ -113,7 +113,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 | Milestone | Target | Definition of Done | Status |
 |---|---|---|---|
 | M1 — Browser MVP | Q1 2027 | Browse, sort, filter, live refresh, thumbnails, basic file ops | ◐ GUI + core done; recents/trash primitives done; remaining: file-operation UI, drag & drop |
-| M2 — Preview Engine | Q2 2027 | RAW/PSD/PDF/video previews with caching | ◐ PNG/JPEG/GIF/WebP/TIFF/BMP + video (runtime ffmpeg) + PDF (runtime pdfium) + camera RAW (runtime LibRaw) + SQLite cache done |
+| M2 — Preview Engine | Q2 2027 | RAW/PSD/PDF/video previews with caching | ◐ PNG/JPEG/GIF/WebP/TIFF/BMP + video (runtime ffmpeg) + PDF (runtime pdfium) + camera RAW (runtime LibRaw) + PSD/AI + SQLite cache done |
 | M3 — Metadata Complete | Q3 2027 | XMP/EXIF/IPTC read-write, smart collections | not started |
 | M4 — Automation | Q4 2027 | Batch ops, scripting API | not started |
 | M5 — Integrations | 2028 | Apple Photos, plugin system, ArtCraft bridge plugin, LightCraft bridge plugin | not started |

@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use crate::{pdf, raw, video, ThumbError, Thumbnail};
+use crate::{ai, pdf, psd, raw, video, ThumbError, Thumbnail};
 
 /// True when `path` has the extension of an image format this crate can
 /// decode. Keep in sync with the `image` features in the workspace
@@ -22,6 +22,8 @@ pub fn is_supported(path: &Path) -> bool {
 /// video file it browses.
 pub fn can_thumbnail(path: &Path) -> bool {
     is_supported(path)
+        || psd::is_supported(path)
+        || (ai::is_pdf_compatible(path) && pdf::is_available())
         || (video::is_supported(path) && video::is_available())
         || (pdf::is_supported(path) && pdf::is_available())
         || (raw::is_supported(path) && raw::is_available())
@@ -30,6 +32,12 @@ pub fn can_thumbnail(path: &Path) -> bool {
 /// Decode an image, video, or RAW file and produce an RGBA thumbnail whose
 /// longest edge fits within `max_edge`, preserving aspect ratio.
 pub fn decode_thumbnail(path: &Path, max_edge: u32) -> Result<Thumbnail, ThumbError> {
+    if psd::is_supported(path) {
+        return psd::decode_thumbnail(path, max_edge);
+    }
+    if ai::is_supported(path) {
+        return ai::decode_thumbnail(path, max_edge);
+    }
     if video::is_supported(path) {
         return video::decode_thumbnail(path, max_edge);
     }
@@ -129,5 +137,9 @@ mod tests {
         assert_eq!(can_thumbnail(Path::new("film.mp4")), video::is_available());
         assert_eq!(can_thumbnail(Path::new("doc.pdf")), pdf::is_available());
         assert_eq!(can_thumbnail(Path::new("shot.CR2")), raw::is_available());
+        assert!(can_thumbnail(Path::new("design.psd")));
+        assert!(!can_thumbnail(Path::new("legacy.ai")));
+        assert!(ai::is_supported(Path::new("design.AI")));
+        assert!(psd::is_supported(Path::new("design.PSD")));
     }
 }
