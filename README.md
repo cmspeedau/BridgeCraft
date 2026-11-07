@@ -11,11 +11,11 @@ A clean-room, cross-platform digital asset browser and file manager written in R
 | `bc-core` | Filesystem scanning, watchers, selection model, app state |
 | `bc-metadata` | EXIF / IPTC / XMP / sidecar read & write |
 | `bc-thumbnails` | Thumbnail cache (SQLite); image, PSD, PDF-compatible AI, video (ffmpeg), PDF (pdfium) & camera RAW (LibRaw) decoders — optional external runtimes for video, PDF/AI and RAW |
-| `bc-ui` | Frontend shell (GUI framework TBD — see Phase 0 spike in ROADMAP) |
+| `bc-ui` | egui/eframe frontend: thumbnail grid, list/details views, file operations, preview & 1:1 zoom viewer |
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md). Current phase: **Phase 2 — Thumbnails & Previews**.
+See [ROADMAP.md](ROADMAP.md). Phase 2 (Thumbnails & Previews) is **complete**: cache, all preview formats, and the preview/1:1 zoom viewer. Current focus: **Phase 3 — Metadata Engine** (contributor issues [#5–#19](https://github.com/cmspeedau/BridgeCraft/issues/19)) and the remaining Phase 1 hardening.
 
 ## Building
 
@@ -35,6 +35,20 @@ PSD previews use embedded JPEG or 24-bit RGB image resources. PDF-compatible Ill
 - **Camera RAW:** a LibRaw library (`libraw.so`/`.dylib`/`.dll`, including versioned sonames) located via `LIBRAW_PATH` (file or directory), next to the app binary, common install directories, or the OS loader's search path. `LIBRAW_PATH` takes priority. RAW decoding prefers the camera's embedded preview and falls back to a full LibRaw render.
 
 Without a decoder, the matching files are shown without a preview and everything else works normally. Tests that need these decoders generate their own fixtures and skip when a decoder is unavailable; a real camera-RAW file can be exercised locally with `RAW_SAMPLE=/path/to/file cargo test`.
+
+## Preview & zoom viewer
+
+Open a preview for any thumbnailable file by double-clicking it (or Enter in List/Details view, or **Preview** in the context menu). The viewer escalates through three quality tiers: the 256 px grid thumbnail, a cached 2048 px preview, and — when you ask for 100% — an on-demand native-resolution decode (capped at 8192 px / 64 MP so a huge file can't stall the app).
+
+| Key | Action |
+|---|---|
+| `← / →` | Previous / next file (selection stays in sync) |
+| `+ / −` or `Ctrl`+scroll | Zoom (2%–1600%) |
+| `0` | Fit to window |
+| `1` | 100% (triggers the full-resolution decode) |
+| Drag | Pan when zoomed in |
+| Double-click | Reset to fit |
+| `Esc` | Close |
 
 ## Releases & packaging
 

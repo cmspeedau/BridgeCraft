@@ -32,7 +32,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [ ] Drag & drop (internal reordering + OS interop)
 - [x] **Phase 1 fix-up:** list/details views
 
-## Phase 2 — Thumbnails & Previews (Weeks 9–20) — ◐ cache + core decoders DONE
+## Phase 2 — Thumbnails & Previews (Weeks 9–20) — ✅ COMPLETE
 - [x] Thumbnail cache database: SQLite (`rusqlite` bundled, WAL) keyed by `(path, max_edge)`, invalidation on `(mtime_ns, size)`, `prune_missing()` cleanup (`bc-thumbnails::cache`)
 - [x] Cache-first orchestrator with graceful fallback (`bc-thumbnails::load_or_generate`)
 - [x] Format decoders via Rust crates: PNG/JPEG/TIFF/GIF/WebP/BMP (via `image`), RGBA8 + aspect-preserving downscale (`bc-thumbnails::decoder`)
@@ -41,9 +41,11 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [x] Video via ffmpeg bindings — `ffmpeg-sidecar` drives a user-installed `ffmpeg` binary (not bundled or linked; see `docs/PHASE2.md`)
 - [x] Camera RAW support — `raw.rs` binds at run time to a user-installed LibRaw via `libloading` (embedded preview fast-path, full-render fallback; not bundled; see `docs/PHASE2.md`)
 - [x] PSD embedded preview extraction (resource IDs 1033/1036; JPEG and 24-bit RGB) and PDF-compatible AI rendering via Pdfium; PostScript-only AI returns an explicit unsupported error
-- [ ] Preview quality levels: thumbnail / preview / 1:1 zoom viewer
+- [x] Preview quality levels: thumbnail / preview / 1:1 zoom viewer (`bc-ui::viewer`) — 256 grid tier, cached 2048 preview tier, on-demand native 1:1 decode capped at 8192 px / 64 MP, fit/±/zoom/pan and ←/→ stepping
 - [x] Batch (re)build cache command
 - [~] Reuse embedded XMP/EXIF previews as fast-path thumbnails — deferred to Phase 3 (needs metadata reader)
+
+*Note: the phase is closed with that one item intentionally deferred — the metadata reader (Phase 3, #5/#6) is a hard dependency, and camera RAW already fast-paths the camera's embedded preview internally. It will be picked up as part of the metadata work in `#5–#19`.*
 
 ## Phase 3 — Metadata Engine (Weeks 15–26) — NOT STARTED (skeleton only)
 - [~] `bc-metadata` crate skeleton exists with a `Reader` trait; real implementation pending (from open specs: CIPA EXIF, IPTC IIM4, ISO 16684-2 XMP)
@@ -113,7 +115,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 | Milestone | Target | Definition of Done | Status |
 |---|---|---|---|
 | M1 — Browser MVP | Q1 2027 | Browse, sort, filter, live refresh, thumbnails, basic file ops | ◐ GUI + core done; recents/trash primitives done; remaining: file-operation UI, drag & drop |
-| M2 — Preview Engine | Q2 2027 | RAW/PSD/PDF/video previews with caching | ◐ PNG/JPEG/GIF/WebP/TIFF/BMP + video (runtime ffmpeg) + PDF (runtime pdfium) + camera RAW (runtime LibRaw) + PSD/AI + SQLite cache done |
+| M2 — Preview Engine | Q2 2027 | RAW/PSD/PDF/video previews with caching | ✅ PNG/JPEG/GIF/WebP/TIFF/BMP + video/PDF/camera RAW (runtime libs) + PSD/AI + SQLite cache + preview/1:1 zoom viewer |
 | M3 — Metadata Complete | Q3 2027 | XMP/EXIF/IPTC read-write, smart collections | not started |
 | M4 — Automation | Q4 2027 | Batch ops, scripting API | not started |
 | M5 — Integrations | 2028 | Apple Photos, plugin system, ArtCraft bridge plugin, LightCraft bridge plugin | not started |

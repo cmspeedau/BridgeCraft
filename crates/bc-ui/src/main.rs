@@ -1,6 +1,7 @@
 //! BridgeCraft — clean-room asset browser in Rust (egui/eframe frontend).
 
 mod app;
+mod viewer;
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;

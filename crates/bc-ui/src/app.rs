@@ -16,6 +16,8 @@ use bc_core::watcher::Watcher;
 use bc_thumbnails::{CacheStore, Thumbnail};
 use eframe::egui;
 
+use crate::viewer::{self, ViewerState, ZoomMode, FULL_EDGE, PREVIEW_EDGE};
+
 const CELL_SIZE: f32 = 132.0;
 const CELL_HEIGHT: f32 = CELL_SIZE + 44.0;
 const GRID_SPACING: f32 = 8.0;
@@ -23,6 +25,10 @@ const THUMB_MAX_EDGE: u32 = 256;
 /// Coalesce watcher event bursts into a single refresh.
 const WATCHER_DEBOUNCE: Duration = Duration::from_millis(300);
 const LIST_ROW_HEIGHT: f32 = 28.0;
+
+/// Texture cache key: a file can have several resolutions in flight (grid
+/// thumbnail, viewer preview, viewer full-resolution).
+type TexKey = (PathBuf, u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum ViewMode {
@@ -37,10 +43,14 @@ struct ThumbJob {
     mtime_ns: i64,
     size: u64,
     max_edge: u32,
+    /// Decode through the SQLite cache (grid/preview tiers) or always decode
+    /// fresh (the uncached full-resolution tier).
+    cached: bool,
 }
 
 struct ThumbResult {
     path: PathBuf,
+    max_edge: u32,
     thumb: Option<Thumbnail>,
 }
 
@@ -70,7 +80,7 @@ fn spawn_thumb_worker(
             });
             for job in rx {
                 let thumb = bc_thumbnails::load_or_generate(
-                    cache.as_ref(),
+                    if job.cached { cache.as_ref() } else { None },
                     &job.path,
                     job.mtime_ns,
                     job.size,
@@ -79,9 +89,11 @@ fn spawn_thumb_worker(
                 if let Err(e) = &thumb {
                     tracing::debug!("thumb decode failed for {}: {e}", job.path.display());
                 }
+                let max_edge = job.max_edge;
                 if tx
                     .send(ThumbResult {
                         path: job.path,
+                        max_edge,
                         thumb: thumb.ok(),
                     })
                     .is_err()
@@ -107,11 +119,13 @@ pub struct BridgeApp {
     thumb_tx: Sender<ThumbJob>,
     thumb_rx: Receiver<ThumbResult>,
     /// Requests already sent to the worker, awaiting a result.
-    pending: HashSet<PathBuf>,
-    /// Decoded thumbnails uploaded to the GPU, keyed by path.
-    textures: HashMap<PathBuf, egui::TextureHandle>,
-    /// Paths that failed to decode; not retried until the next refresh.
-    failed: HashSet<PathBuf>,
+    pending: HashSet<TexKey>,
+    /// Decoded images uploaded to the GPU, keyed by path and long edge.
+    textures: HashMap<TexKey, egui::TextureHandle>,
+    /// Paths that failed to decode at a given tier; not retried until refresh.
+    failed: HashSet<TexKey>,
+    /// Pure state of the preview/zoom viewer (drawn over the content panel).
+    viewer: ViewerState,
 
     /// Watcher for the open root; recreated on navigation.
     watcher: Option<Watcher>,
@@ -144,6 +158,7 @@ impl BridgeApp {
             pending: HashSet::new(),
             textures: HashMap::new(),
             failed: HashSet::new(),
+            viewer: ViewerState::default(),
             watcher: None,
             refresh_due: None,
         };
@@ -171,8 +186,10 @@ impl BridgeApp {
                 }
                 self.pending.clear();
                 self.failed.clear();
+                // Folder changes end the preview: the file list it navigated is gone.
+                self.viewer.close();
                 // Drop thumbnails unrelated to the new folder to bound memory use.
-                self.textures.retain(|p, _| p.starts_with(root));
+                self.textures.retain(|(path, _), _| path.starts_with(root));
                 self.attach_watcher(root);
             }
             Err(e) => {
@@ -226,7 +243,7 @@ impl BridgeApp {
     /// Collect finished thumbnail results and upload them as GPU textures.
     fn poll_thumbnails(&mut self, ctx: &egui::Context) {
         for result in self.thumb_rx.try_iter() {
-            self.pending.remove(&result.path);
+            self.pending.remove(&(result.path.clone(), result.max_edge));
             if let Some(thumb) = result.thumb {
                 if !thumb.is_consistent() {
                     continue;
@@ -236,21 +253,26 @@ impl BridgeApp {
                     &thumb.pixels,
                 );
                 let handle = ctx.load_texture(
-                    result.path.display().to_string(),
+                    format!("{}@{}", result.path.display(), result.max_edge),
                     image,
                     egui::TextureOptions::LINEAR,
                 );
-                self.textures.insert(result.path, handle);
+                self.textures.insert((result.path, result.max_edge), handle);
             } else {
-                self.failed.insert(result.path);
+                self.failed.insert((result.path, result.max_edge));
             }
         }
     }
 
     fn request_thumbnail(&mut self, path: &Path, mtime: i64, size: u64) {
-        if self.textures.contains_key(path)
-            || self.pending.contains(path)
-            || self.failed.contains(path)
+        self.request_image(path, mtime, size, THUMB_MAX_EDGE, true);
+    }
+
+    fn request_image(&mut self, path: &Path, mtime: i64, size: u64, max_edge: u32, cached: bool) {
+        let key = (path.to_path_buf(), max_edge);
+        if self.textures.contains_key(&key)
+            || self.pending.contains(&key)
+            || self.failed.contains(&key)
         {
             return;
         }
@@ -260,11 +282,244 @@ impl BridgeApp {
                 path: path.to_path_buf(),
                 mtime_ns: mtime,
                 size,
-                max_edge: THUMB_MAX_EDGE,
+                max_edge,
+                cached,
             })
             .is_ok()
         {
-            self.pending.insert(path.to_path_buf());
+            self.pending.insert(key);
+        }
+    }
+
+    // ------------------------------------------------------------- viewer --
+
+    /// (mtime_ns, size) for a browsed entry, used to request viewer tiers.
+    fn entry_meta(&self, path: &Path) -> Option<(i64, u64)> {
+        self.browser
+            .entries
+            .iter()
+            .find(|entry| entry.path == path)
+            .map(|entry| (mtime_ns(entry.modified), entry.size))
+    }
+
+    fn open_viewer(&mut self, path: &Path) {
+        if path.is_dir() || !bc_thumbnails::decoder::can_thumbnail(path) {
+            self.status = format!("No preview available for {}", path.display());
+            return;
+        }
+        let files: Vec<PathBuf> = self
+            .browser
+            .visible_indices()
+            .iter()
+            .filter_map(|&idx| self.browser.entries.get(idx))
+            .filter(|entry| !entry.is_dir)
+            .map(|entry| entry.path.clone())
+            .collect();
+        self.viewer.open(path.to_path_buf(), files);
+        self.viewer.native = bc_thumbnails::decoder::image_dimensions(path);
+        self.request_preview(path);
+        self.status =
+            "Preview · ←/→ browse · ± or ctrl+scroll zoom · 0 fit · 1 100% · drag pan · Esc close"
+                .into();
+    }
+
+    fn close_viewer(&mut self) {
+        if let Some(path) = self.viewer.path.take() {
+            self.forget_viewer_textures(&path);
+        }
+        self.viewer.close();
+    }
+
+    /// Drop the uncached/preview-tier textures of a file the viewer left, so
+    /// multi-hundred-megabyte full decodes do not pile up in GPU memory.
+    fn forget_viewer_textures(&mut self, path: &Path) {
+        let keep = |key: &(PathBuf, u32)| key.0 != path || key.1 == THUMB_MAX_EDGE;
+        self.textures.retain(|key, _| keep(key));
+        self.failed.retain(|key| keep(key));
+    }
+
+    fn viewer_step(&mut self, delta: isize) {
+        let previous = self.viewer.path.clone();
+        let Some(next) = self.viewer.step(delta) else {
+            return;
+        };
+        if let Some(previous) = &previous {
+            self.forget_viewer_textures(previous);
+        }
+        self.viewer.native = bc_thumbnails::decoder::image_dimensions(&next);
+        if let Some(idx) = self
+            .browser
+            .entries
+            .iter()
+            .position(|entry| entry.path == next)
+        {
+            self.browser.selection.select_only(idx);
+        }
+        self.request_preview(&next);
+        self.status = format!("Previewing {}", next.display());
+    }
+
+    fn request_preview(&mut self, path: &Path) {
+        if let Some((mtime, size)) = self.entry_meta(path) {
+            self.request_image(path, mtime, size, PREVIEW_EDGE, true);
+        }
+    }
+
+    /// 100% zoom: show at actual size, upgrading to the uncached full tier
+    /// when the preview is a downscale and the file is not pathologically big.
+    fn go_actual_size(&mut self) {
+        self.viewer.set_actual();
+        let Some(path) = self.viewer.path.clone() else {
+            return;
+        };
+        if self.viewer.full_requested {
+            return;
+        }
+        self.viewer.full_requested = true;
+        let native = self.viewer.native;
+        if let Some((width, height)) = native {
+            if width.max(height) <= PREVIEW_EDGE {
+                // The preview tier already holds native resolution.
+                return;
+            }
+        }
+        if !viewer::full_allowed(native) {
+            let dims = native.map_or_else(|| "dimensions".to_owned(), |(w, h)| format!("{w}×{h}"));
+            self.viewer.note = format!(
+                "Full resolution skipped for {dims}; preview shown at 100% ({:.0} MP cap)",
+                viewer::MAX_FULL_PIXELS as f64 / 1e6
+            );
+            return;
+        }
+        if let Some((mtime, size)) = self.entry_meta(&path) {
+            self.request_image(&path, mtime, size, FULL_EDGE, false);
+        }
+    }
+
+    /// Draw the preview/zoom viewer in place of the content panel.
+    fn viewer_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let Some(path) = self.viewer.path.clone() else {
+            return;
+        };
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+
+        ui.horizontal(|ui| {
+            if ui.button("◀").on_hover_text("Previous file (←)").clicked() {
+                self.viewer_step(-1);
+            }
+            if ui.button("▶").on_hover_text("Next file (→)").clicked() {
+                self.viewer_step(1);
+            }
+            ui.separator();
+            if ui.button("−").on_hover_text("Zoom out (−)").clicked() {
+                self.viewer.zoom_step(0.8);
+            }
+            if ui.button("+").on_hover_text("Zoom in (+)").clicked() {
+                self.viewer.zoom_step(1.25);
+            }
+            ui.label(format!("{:.0}%", self.viewer.displayed * 100.0));
+            if ui.button("Fit").on_hover_text("Fit window (0)").clicked() {
+                self.viewer.set_fit();
+            }
+            if ui
+                .button("100%")
+                .on_hover_text("Actual pixels, full-resolution decode (1)")
+                .clicked()
+            {
+                self.go_actual_size();
+            }
+            ui.separator();
+            ui.label(egui::RichText::new(&name).strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("✕ Close").on_hover_text("Esc").clicked() {
+                    self.close_viewer();
+                }
+            });
+        });
+
+        // Info row: shown resolution, native size, full-tier progress/notes.
+        let prev_key = (path.clone(), PREVIEW_EDGE);
+        let full_key = (path.clone(), FULL_EDGE);
+        ui.horizontal(|ui| {
+            if let Some((w, h)) = self.viewer.native {
+                ui.weak(format!("native {w}×{h}"));
+            }
+            if self.pending.contains(&full_key) {
+                ui.weak("decoding full resolution…");
+            } else if self.failed.contains(&full_key) {
+                ui.weak("full-resolution decode failed");
+            }
+            if !self.viewer.note.is_empty() {
+                ui.weak(self.viewer.note.clone());
+            }
+        });
+        ui.separator();
+
+        // Re-request the preview if its texture vanished (folder refresh,
+        // earlier failure cleared) so the viewer never sticks on "loading".
+        if !self.textures.contains_key(&prev_key)
+            && !self.pending.contains(&prev_key)
+            && !self.failed.contains(&prev_key)
+        {
+            self.request_preview(&path);
+        }
+
+        let (rect, response) =
+            ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
+        let texture = self
+            .textures
+            .get(&full_key)
+            .or_else(|| self.textures.get(&prev_key))
+            .cloned();
+
+        match &texture {
+            Some(tex) => {
+                let size = tex.size_vec2();
+                let fit = viewer::fit_scale(
+                    (size.x.max(1.0) as u32, size.y.max(1.0) as u32),
+                    (rect.width(), rect.height()),
+                );
+                let scale = match self.viewer.zoom {
+                    ZoomMode::Fit => fit,
+                    ZoomMode::Manual(zoom) => viewer::clamp_zoom(zoom),
+                };
+                self.viewer.displayed = scale;
+                if response.dragged() {
+                    self.viewer.offset += response.drag_delta();
+                }
+                if response.double_clicked() {
+                    self.viewer.set_fit();
+                }
+                let draw_rect =
+                    egui::Rect::from_center_size(rect.center() + self.viewer.offset, size * scale);
+                ui.painter().image(
+                    tex.id(),
+                    draw_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
+            None => {
+                let message = if self.failed.contains(&prev_key) {
+                    "Preview failed to decode"
+                } else {
+                    "Loading preview…"
+                };
+                ui.allocate_ui_at_rect(rect, |ui| {
+                    ui.centered_and_justified(|ui| ui.weak(message));
+                });
+            }
+        }
+
+        // Ctrl+scroll / pinch to zoom while the pointer is over the image.
+        if response.hovered() {
+            let delta = ctx.input(|input| input.zoom_delta());
+            if (delta - 1.0).abs() > f32::EPSILON {
+                self.viewer.zoom_step(delta);
+            }
         }
     }
 
@@ -365,8 +620,12 @@ impl BridgeApp {
                                 self.browser.selection.select_only(idx);
                             }
                         }
-                        if response.double_clicked() && is_dir {
-                            self.open_root(&path);
+                        if response.double_clicked() {
+                            if is_dir {
+                                self.open_root(&path);
+                            } else {
+                                self.open_viewer(&path);
+                            }
                         }
                         if !is_dir && bc_thumbnails::decoder::can_thumbnail(&path) {
                             self.request_thumbnail(&path, mtime_ns(modified), size);
@@ -398,10 +657,11 @@ impl BridgeApp {
         }
 
         if self.list_focused && !ctx.wants_keyboard_input() {
-            let (up, down, shift) = ui.input(|input| {
+            let (up, down, enter, shift) = ui.input(|input| {
                 (
                     input.key_pressed(egui::Key::ArrowUp),
                     input.key_pressed(egui::Key::ArrowDown),
+                    input.key_pressed(egui::Key::Enter),
                     input.modifiers.shift,
                 )
             });
@@ -418,6 +678,21 @@ impl BridgeApp {
                         self.browser.selection.select_range(target);
                     } else {
                         self.browser.selection.select_only(target);
+                    }
+                }
+            }
+            if enter {
+                let focused = self
+                    .browser
+                    .selection
+                    .anchor()
+                    .or_else(|| self.browser.selection.indices().next());
+                if let Some(idx) = focused {
+                    if let Some(entry) = self.browser.entries.get(idx) {
+                        if !entry.is_dir {
+                            let path = entry.path.clone();
+                            self.open_viewer(&path);
+                        }
                     }
                 }
             }
@@ -513,9 +788,13 @@ impl BridgeApp {
                         self.browser.selection.select_only(idx);
                     }
                 }
-                if response.double_clicked() && is_dir {
+                if response.double_clicked() {
                     let path = self.browser.entries[idx].path.clone();
-                    self.open_root(&path);
+                    if is_dir {
+                        self.open_root(&path);
+                    } else {
+                        self.open_viewer(&path);
+                    }
                 }
             }
         });
@@ -581,6 +860,13 @@ impl BridgeApp {
         let paths = self.selected_paths(clicked_path);
         ui.label(format!("{} selected", paths.len()));
         ui.separator();
+        if paths.len() == 1 {
+            if ui.button("Preview").clicked() {
+                self.open_viewer(&paths[0]);
+                ui.close_menu();
+            }
+            ui.separator();
+        }
         ui.menu_button("Copy to folder…", |ui| {
             ui.text_edit_singleline(&mut self.copy_destination);
             if ui.button("Copy").clicked() {
@@ -768,7 +1054,7 @@ impl BridgeApp {
                     egui::FontId::proportional(36.0),
                     egui::Color32::WHITE,
                 );
-            } else if let Some(tex) = self.textures.get(path) {
+            } else if let Some(tex) = self.textures.get(&(path.to_path_buf(), THUMB_MAX_EDGE)) {
                 let tex_size = tex.size_vec2();
                 let scale = ((rect.size().x / tex_size.x).min(rect.size().y / tex_size.y)).min(1.0);
                 let draw_rect = egui::Rect::from_center_size(rect.center(), tex_size * scale);
@@ -831,6 +1117,43 @@ impl eframe::App for BridgeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_thumbnails(ctx);
         self.poll_watcher();
+
+        // Viewer shortcuts, active only while the viewer owns the panel and
+        // no text field has focus.
+        if self.viewer.is_open() && !ctx.wants_keyboard_input() {
+            let (esc, left, right, zoom_in, zoom_out, fit, actual) = ctx.input(|input| {
+                (
+                    input.key_pressed(egui::Key::Escape),
+                    input.key_pressed(egui::Key::ArrowLeft),
+                    input.key_pressed(egui::Key::ArrowRight),
+                    input.key_pressed(egui::Key::Plus) || input.key_pressed(egui::Key::Equals),
+                    input.key_pressed(egui::Key::Minus),
+                    input.key_pressed(egui::Key::Num0),
+                    input.key_pressed(egui::Key::Num1),
+                )
+            });
+            if esc {
+                self.close_viewer();
+            }
+            if left {
+                self.viewer_step(-1);
+            }
+            if right {
+                self.viewer_step(1);
+            }
+            if zoom_in {
+                self.viewer.zoom_step(1.25);
+            }
+            if zoom_out {
+                self.viewer.zoom_step(0.8);
+            }
+            if fit {
+                self.viewer.set_fit();
+            }
+            if actual {
+                self.go_actual_size();
+            }
+        }
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -922,7 +1245,9 @@ impl eframe::App for BridgeApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            if self.browser.root.is_none() {
+            if self.viewer.is_open() {
+                self.viewer_view(ui, ctx);
+            } else if self.browser.root.is_none() {
                 ui.centered_and_justified(|ui| {
                     ui.weak("Type a folder path above and press Open.");
                 });

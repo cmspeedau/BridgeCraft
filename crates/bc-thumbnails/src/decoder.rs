@@ -58,6 +58,14 @@ pub fn decode_thumbnail(path: &Path, max_edge: u32) -> Result<Thumbnail, ThumbEr
     Ok(thumbnail_from_rgba(rgba, max_edge))
 }
 
+/// Header-only dimensions of a file the `image` crate can decode — no pixel
+/// decode happens. `None` for unknown formats and for containers whose
+/// dimensions only their own decoder knows (video, PDF, camera RAW): those
+/// report their size through an actual decode request.
+pub fn image_dimensions(path: &Path) -> Option<(u32, u32)> {
+    image::image_dimensions(path).ok()
+}
+
 /// Fit `(width, height)` inside `max_edge`, preserving aspect ratio.
 /// Returns the scaled dimensions, or `None` when no scaling is needed.
 fn scale_fit(width: u32, height: u32, max_edge: u32) -> Option<(u32, u32)> {
@@ -141,5 +149,24 @@ mod tests {
         assert!(!can_thumbnail(Path::new("legacy.ai")));
         assert!(ai::is_supported(Path::new("design.AI")));
         assert!(psd::is_supported(Path::new("design.PSD")));
+    }
+
+    #[test]
+    fn image_dimensions_reads_headers_and_rejects_garbage() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("img.png");
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            37,
+            11,
+            image::Rgba([9, 9, 9, 255]),
+        ))
+        .save(&good)
+        .unwrap();
+        assert_eq!(image_dimensions(&good), Some((37, 11)));
+
+        let garbage = dir.path().join("junk.png");
+        std::fs::write(&garbage, b"definitely not a png").unwrap();
+        assert_eq!(image_dimensions(&garbage), None);
+        assert_eq!(image_dimensions(&dir.path().join("missing.png")), None);
     }
 }
