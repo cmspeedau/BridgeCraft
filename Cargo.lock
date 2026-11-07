@@ -473,6 +473,7 @@ version = "0.1.0"
 dependencies = [
  "ffmpeg-sidecar",
  "image",
+ "libloading 0.8.9",
  "pdfium-render",
  "rusqlite",
  "tempfile",

@@ -36,15 +36,21 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    if bc_thumbnails::video::is_available() {
-        tracing::info!("video thumbnails enabled (ffmpeg found)");
-    } else {
-        tracing::info!("ffmpeg not found in PATH; video thumbnails are disabled");
-    }
-    if bc_thumbnails::pdf::is_available() {
-        tracing::info!("pdf thumbnails enabled (pdfium found)");
-    } else {
-        tracing::info!("pdfium not found; pdf thumbnails are disabled (set PDFIUM_PATH)");
+    // Report optional runtime decoders once, at startup.
+    for (kind, available, library) in [
+        ("video", bc_thumbnails::video::is_available(), "ffmpeg"),
+        ("pdf", bc_thumbnails::pdf::is_available(), "pdfium"),
+        (
+            "raw",
+            bc_thumbnails::raw::is_available(),
+            "libraw (set LIBRAW_PATH)",
+        ),
+    ] {
+        if available {
+            tracing::info!("{kind} thumbnails enabled ({library} found)");
+        } else {
+            tracing::info!("{library} not found; {kind} thumbnails are disabled");
+        }
     }
 
     let root = std::env::args().nth(1);

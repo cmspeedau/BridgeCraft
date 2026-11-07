@@ -10,6 +10,7 @@ image.workspace = true
 rusqlite.workspace = true
 ffmpeg-sidecar.workspace = true
 pdfium-render.workspace = true
+libloading.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

@@ -33,6 +33,8 @@ ffmpeg-sidecar = { version = "2.7", default-features = false }
 # `image_latest` is disabled to avoid a second copy of the `image` crate: raw
 # RGBA is all the thumbnail pipeline needs.
 pdfium-render = { version = "0.9", default-features = false, features = ["pdfium_latest", "thread_safe"] }
+# Runtime loading of a user-provided libraw for camera RAW thumbnails.
+libloading = "0.8"
 eframe = "0.27"
 egui = "0.27"
 

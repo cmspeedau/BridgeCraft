@@ -32,6 +32,16 @@ jobs:
           sudo mkdir -p /opt/pdfium
           sudo tar -xzf /tmp/pdfium.tgz -C /opt/pdfium
           echo "PDFIUM_PATH=/opt/pdfium/lib" >> "$GITHUB_ENV"
+      - name: Install LibRaw (camera RAW thumbnail tests)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libraw-dev
+      - name: Fetch RAW sample (CC0, raw.pixls.us)
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: |
+          curl -fsSL -o /tmp/sample.dng "https://raw.pixls.us/getfile.php/6584/nice/Canon%20-%20EOS-1D%20X%20-%201%3A1.dng"
+          echo "0c07c60ceda8e724534ed24ae56ec73f6040a3c9040127fcba7dc3305e59396b  /tmp/sample.dng" | sha256sum -c -
+          echo "RAW_SAMPLE=/tmp/sample.dng" >> "$GITHUB_ENV"
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy

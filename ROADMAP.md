@@ -39,7 +39,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [x] Background generation queue — **DONE** via dedicated worker thread + mpsc (no tokio needed); textures GPU-uploaded in `poll_thumbnails()`
 - [x] PDF (via pdfium bindings) — `pdfium-render` binds to a user-provided `libpdfium` at run time (not bundled; see `docs/PHASE2.md`)
 - [x] Video via ffmpeg bindings — `ffmpeg-sidecar` drives a user-installed `ffmpeg` binary (not bundled or linked; see `docs/PHASE2.md`)
-- [ ] Camera RAW support (LibRaw bindings or DNG parsing)
+- [x] Camera RAW support — `raw.rs` binds at run time to a user-installed LibRaw via `libloading` (embedded preview fast-path, full-render fallback; not bundled; see `docs/PHASE2.md`)
 - [ ] PSD/AI/Illustrator preview extraction
 - [ ] Preview quality levels: thumbnail / preview / 1:1 zoom viewer
 - [x] Batch (re)build cache command
@@ -113,7 +113,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 | Milestone | Target | Definition of Done | Status |
 |---|---|---|---|
 | M1 — Browser MVP | Q1 2027 | Browse, sort, filter, live refresh, thumbnails, basic file ops | ◐ GUI + core done; recents/trash primitives done; remaining: file-operation UI, drag & drop |
-| M2 — Preview Engine | Q2 2027 | RAW/PSD/PDF/video previews with caching | ◐ PNG/JPEG/GIF/WebP/TIFF/BMP + video (runtime ffmpeg) + PDF (runtime pdfium) + SQLite cache done |
+| M2 — Preview Engine | Q2 2027 | RAW/PSD/PDF/video previews with caching | ◐ PNG/JPEG/GIF/WebP/TIFF/BMP + video (runtime ffmpeg) + PDF (runtime pdfium) + camera RAW (runtime LibRaw) + SQLite cache done |
 | M3 — Metadata Complete | Q3 2027 | XMP/EXIF/IPTC read-write, smart collections | not started |
 | M4 — Automation | Q4 2027 | Batch ops, scripting API | not started |
 | M5 — Integrations | 2028 | Apple Photos, plugin system, ArtCraft bridge plugin, LightCraft bridge plugin | not started |
@@ -133,6 +133,7 @@ With ADR-0001 resolved (egui/eframe), filter + live refresh shipped, and virtual
 - LightCraft integration depends on an external project's evolving APIs (mitigate: version the bridge plugin against specific LightCraft releases; its MIT/Apache licensing keeps the dependency clean, and it is young/moving fast so pin early)
 - Video thumbnails require a user-installed FFmpeg binary, which is not bundled (mitigate: availability probe cached per process, videos simply skipped when absent, binary stays outside our licence surface)
 - PDF thumbnails require a user-provided Pdfium library, which is not bundled (mitigate: same availability probe and graceful skip; Pdfium's licence applies only to the user's copy)
+- Camera RAW thumbnails require a user-provided LibRaw library, which is not bundled (mitigate: same availability probe and graceful skip; LIBRAW_PATH override; embedded-preview fast-path keeps it fast; licence applies only to the user's copy)
 - Unsigned distribution artifacts will trigger OS trust warnings (macOS Gatekeeper, Windows SmartScreen) that users must dismiss manually (accepted trade-off: no signing certificates are purchased or managed)
 
 ---

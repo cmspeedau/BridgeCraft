@@ -10,7 +10,7 @@ A clean-room, cross-platform digital asset browser and file manager written in R
 |---|---|
 | `bc-core` | Filesystem scanning, watchers, selection model, app state |
 | `bc-metadata` | EXIF / IPTC / XMP / sidecar read & write |
-| `bc-thumbnails` | Thumbnail cache (SQLite), decoders (JPEG/PNG/RAW/PSD/PDF/video) |
+| `bc-thumbnails` | Thumbnail cache (SQLite); image, video (ffmpeg), PDF (pdfium) & camera RAW (LibRaw) decoders — the last three via optional run-time libraries |
 | `bc-ui` | Frontend shell (GUI framework TBD — see Phase 0 spike in ROADMAP) |
 
 ## Roadmap
@@ -26,14 +26,15 @@ cargo clippy --workspace -- -D warnings
 cargo fmt --all -- --check
 ```
 
-### Optional runtime codecs (video & PDF)
+### Optional runtime decoders (video, PDF & camera RAW)
 
-Video and PDF thumbnails use optional, locally installed libraries. Neither is linked or bundled, and builds work without them:
+Video, PDF and camera-RAW thumbnails use optional, locally installed decoders. None are linked or bundled, and builds work without them:
 
 - **Video:** a `ffmpeg` executable on `PATH` (or next to the app binary).
 - **PDF:** a Pdfium library (`libpdfium.so`, `libpdfium.dylib`, or `pdfium.dll`) located via `PDFIUM_PATH` (file or directory), next to the app binary, common install directories, or the OS loader's search path. `PDFIUM_PATH` takes priority.
+- **Camera RAW:** a LibRaw library (`libraw.so`/`.dylib`/`.dll`, including versioned sonames) located via `LIBRAW_PATH` (file or directory), next to the app binary, common install directories, or the OS loader's search path. `LIBRAW_PATH` takes priority. RAW decoding prefers the camera's embedded preview and falls back to a full LibRaw render.
 
-Without them, those files are shown without a preview and everything else works normally. Tests that need these libraries generate their own fixtures and skip when a library is unavailable.
+Without a decoder, the matching files are shown without a preview and everything else works normally. Tests that need these decoders generate their own fixtures and skip when a decoder is unavailable; a real camera-RAW file can be exercised locally with `RAW_SAMPLE=/path/to/file cargo test`.
 
 ## Releases & packaging
 

@@ -3,6 +3,7 @@
 pub mod cache;
 pub mod decoder;
 pub mod pdf;
+pub mod raw;
 pub mod video;
 
 use std::path::Path;
@@ -23,6 +24,9 @@ pub enum ThumbError {
 
     #[error("video thumbnail failed for {path}: {message}")]
     Video { path: String, message: String },
+
+    #[error("raw thumbnail failed for {path}: {message}")]
+    Raw { path: String, message: String },
 
     #[error("pdf thumbnail failed for {path}: {message}")]
     Pdf { path: String, message: String },

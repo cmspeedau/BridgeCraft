@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use crate::{pdf, video, ThumbError, Thumbnail};
+use crate::{pdf, raw, video, ThumbError, Thumbnail};
 
 /// True when `path` has the extension of an image format this crate can
 /// decode. Keep in sync with the `image` features in the workspace
@@ -24,16 +24,20 @@ pub fn can_thumbnail(path: &Path) -> bool {
     is_supported(path)
         || (video::is_supported(path) && video::is_available())
         || (pdf::is_supported(path) && pdf::is_available())
+        || (raw::is_supported(path) && raw::is_available())
 }
 
-/// Decode an image or video file and produce an RGBA thumbnail whose longest
-/// edge fits within `max_edge`, preserving aspect ratio.
+/// Decode an image, video, or RAW file and produce an RGBA thumbnail whose
+/// longest edge fits within `max_edge`, preserving aspect ratio.
 pub fn decode_thumbnail(path: &Path, max_edge: u32) -> Result<Thumbnail, ThumbError> {
     if video::is_supported(path) {
         return video::decode_thumbnail(path, max_edge);
     }
     if pdf::is_supported(path) {
         return pdf::decode_thumbnail(path, max_edge);
+    }
+    if raw::is_supported(path) {
+        return raw::decode_thumbnail(path, max_edge);
     }
 
     let display = path.display().to_string();
@@ -43,24 +47,60 @@ pub fn decode_thumbnail(path: &Path, max_edge: u32) -> Result<Thumbnail, ThumbEr
     })?;
 
     let rgba = img.into_rgba8();
-    let (w, h) = rgba.dimensions();
+    Ok(thumbnail_from_rgba(rgba, max_edge))
+}
 
-    let longest = w.max(h);
-    let scaled = if longest > max_edge && longest > 0 {
+/// Fit `(width, height)` inside `max_edge`, preserving aspect ratio.
+/// Returns the scaled dimensions, or `None` when no scaling is needed.
+fn scale_fit(width: u32, height: u32, max_edge: u32) -> Option<(u32, u32)> {
+    let longest = width.max(height);
+    if longest > max_edge && longest > 0 {
         let ratio = max_edge as f64 / longest as f64;
-        let nw = ((w as f64) * ratio).round().max(1.0) as u32;
-        let nh = ((h as f64) * ratio).round().max(1.0) as u32;
-        image::imageops::thumbnail(&rgba, nw.max(1), nh.max(1))
+        let nw = ((width as f64) * ratio).round().max(1.0) as u32;
+        let nh = ((height as f64) * ratio).round().max(1.0) as u32;
+        Some((nw.max(1), nh.max(1)))
     } else {
-        rgba
-    };
+        None
+    }
+}
 
+/// Downscale an RGBA image so its longest edge fits within `max_edge`.
+pub(crate) fn thumbnail_from_rgba(rgba: image::RgbaImage, max_edge: u32) -> Thumbnail {
+    let (w, h) = rgba.dimensions();
+    let scaled = match scale_fit(w, h, max_edge) {
+        Some((nw, nh)) => image::imageops::thumbnail(&rgba, nw, nh),
+        None => rgba,
+    };
     let (tw, th) = scaled.dimensions();
-    Ok(Thumbnail {
+    Thumbnail {
         width: tw,
         height: th,
         pixels: scaled.into_raw(),
-    })
+    }
+}
+
+/// Downscale an RGB image so its longest edge fits within `max_edge`, adding
+/// an opaque alpha channel. Scaling happens while the buffer is still RGB,
+/// which halves peak memory for large camera-RAW decodes.
+pub(crate) fn thumbnail_from_rgb(rgb: image::RgbImage, max_edge: u32) -> Thumbnail {
+    let (w, h) = rgb.dimensions();
+    let scaled = match scale_fit(w, h, max_edge) {
+        Some((nw, nh)) => image::imageops::thumbnail(&rgb, nw, nh),
+        None => rgb,
+    };
+    let (tw, th) = scaled.dimensions();
+    let pixels = scaled
+        .as_raw()
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .flat_map(|p| [p[0], p[1], p[2], 255])
+        .collect();
+    Thumbnail {
+        width: tw,
+        height: th,
+        pixels,
+    }
 }
 
 #[cfg(test)]
@@ -83,10 +123,11 @@ mod tests {
     }
 
     #[test]
-    fn can_thumbnail_gates_video_on_ffmpeg() {
+    fn can_thumbnail_gates_optional_runtimes() {
         assert!(can_thumbnail(Path::new("a.png")));
         assert!(!can_thumbnail(Path::new("notes.txt")));
         assert_eq!(can_thumbnail(Path::new("film.mp4")), video::is_available());
         assert_eq!(can_thumbnail(Path::new("doc.pdf")), pdf::is_available());
+        assert_eq!(can_thumbnail(Path::new("shot.CR2")), raw::is_available());
     }
 }
