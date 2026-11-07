@@ -48,9 +48,10 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 
 *Note: the phase is closed with that one item intentionally deferred — the metadata reader (Phase 3, #5/#6) is a hard dependency, and camera RAW already fast-paths the camera's embedded preview internally. It will be picked up as part of the metadata work in `#5–#19`.*
 
-## Phase 3 — Metadata Engine (Weeks 15–26) — NOT STARTED (skeleton only)
-- [~] `bc-metadata` crate skeleton exists with a `Reader` trait; real implementation pending (from open specs: CIPA EXIF, IPTC IIM4, ISO 16684-2 XMP)
-- [ ] Embedded metadata read/write: EXIF, IPTC-IIM, XMP
+## Phase 3 — Metadata Engine (Weeks 15–26) — ◐ started: EXIF read + metadata panel shipped (issue #6)
+- [x] EXIF reading in `bc-metadata`: pure-Rust TIFF/EXIF parser (JPEG `APP1` + TIFF/DNG containers), both byte orders, IFD0 + Exif + GPS sub-IFDs + thumbnail-IFD reference; IFD loops and absurd counts are `Malformed`, malformed input never panics; hand-built fixture tests plus a real-camera check gated behind `RAW_SAMPLE` (issue #6)
+- [x] Metadata panel: Camera Data (EXIF) section for the selected file — camera, taken, exposure, aperture, ISO, focal length, orientation, color space, software, EXIF size, GPS — above File Properties; cached per path + modified time
+- [~] Embedded metadata read/write: EXIF read done (interim flat-map keys `exif.*` / `gps.*` per issue #6, since #5 is still open); IPTC-IIM, XMP and all write paths pending
 - [ ] XMP sidecar read/write (`.xmp` files)
 - [ ] Metadata panel with editable fields
 - [ ] Custom metadata templates

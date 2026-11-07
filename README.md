@@ -14,7 +14,7 @@ A clean-room, from-scratch asset browser inspired by the workflows of classic di
 
 </div>
 
-![BridgeCraft workspace: favorites sidebar, thumbnail grid, and preview panel](docs/screenshots/workspace.png)
+![BridgeCraft workspace: favorites sidebar, thumbnail grid, and EXIF metadata panel](docs/screenshots/workspace.png)
 
 > **Status:** pre-1.0, under active development. Foundations (Phase 0) and thumbnails & previews (Phase 2) are **complete**; the browsing core (Phase 1) is done with hardening in progress, now on a new Bridge-style workspace shell. There are no installers yet — build from source (below). Phase 3 (metadata) and Phase 4 (batch operations) are open for contributors: see the [issue backlog](https://github.com/cmspeedau/BridgeCraft/issues/19).
 
@@ -26,6 +26,7 @@ A clean-room, from-scratch asset browser inspired by the workflows of classic di
 | **Views** | Thumbnail grid with zoom slider, list, and details table; "thumbnails only" mode |
 | **Select** | Click / ctrl-toggle / shift-range / select-all; right-click menu with copy, move, rename, trash & restore, permanent-delete confirm |
 | **Previews** | Instant 256 px thumbnails; click any file for a live 2048 px preview in the side panel; double-click for the full zoom viewer (100% = on-demand native decode) |
+| **Metadata** | EXIF panel for the selected file — camera, taken, exposure, aperture, ISO, focal length, orientation, color space, software, pixel size, GPS (JPEG, TIFF/DNG, both byte orders) |
 | **Formats** | PNG, JPEG, TIFF, GIF, WebP, BMP, PSD (embedded previews), PDF-compatible AI — always; video, PDF, camera RAW when a local decoder is present (see below) |
 | **Speed** | SQLite thumbnail cache keyed by `(path, size-tier)`, invalidated on file change; virtualized grid; background decode worker |
 | **Live** | Watched folders auto-refresh; cache survives restarts; `--rebuild-cache` CLI for batch warm-up |
@@ -49,7 +50,7 @@ The zoom viewer escalates through three quality tiers: the grid thumbnail, a cac
 | Crate | Purpose |
 |---|---|
 | `bc-core` | Filesystem scanning, directory watching, selection model, favorites & recents, trash bin, file operations |
-| `bc-metadata` | EXIF / IPTC / XMP / sidecar read & write *(Phase 3 — in progress)* |
+| `bc-metadata` | EXIF read from JPEG / TIFF / DNG (both byte orders, Exif & GPS sub-IFDs) shipped; IPTC / XMP / sidecars & writing in progress |
 | `bc-thumbnails` | SQLite-backed cache plus decoders: `image` (PNG/JPEG/TIFF/GIF/WebP/BMP), PSD embedded previews, Illustrator, and runtime-bound ffmpeg / pdfium / LibRaw paths |
 | `bc-ui` | egui/eframe frontend: the workspace above, virtualized grids, the zoom viewer |
 
