@@ -1,44 +1,38 @@
+<div align="center">
+
 # BridgeCraft
 
-A clean-room, cross-platform digital asset browser and file manager written in Rust.
+**Browse every asset you own — one fast, native, cross-platform browser for images, video, PDFs, and camera RAW, written entirely in Rust.**
 
-**Clean-room policy:** This project contains no Adobe code. See [CLEANROOM.md](CLEANROOM.md). All contributors must sign the attestation in [CONTRIBUTING.md](CONTRIBUTING.md) before their first contribution.
+A clean-room, from-scratch asset browser inspired by the workflows of classic digital-asset tools.
 
-## Workspace layout
+[![CI](https://github.com/cmspeedau/BridgeCraft/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/cmspeedau/BridgeCraft/actions/workflows/ci.yml)
+![100% Rust](https://img.shields.io/badge/100%25-Rust-b7410e?logo=rust)
+![Platforms](https://img.shields.io/badge/Linux%20%C2%B7%20macOS%20%C2%B7%20Windows-native-blue)
+![License](https://img.shields.io/badge/license-Apache--2.0-yellow)
+![Status](https://img.shields.io/badge/status-pre--1.0%20%C2%B7%20phases%200--2%20done-orange)
 
-| Crate | Purpose |
+</div>
+
+![BridgeCraft workspace: favorites sidebar, thumbnail grid, and preview panel](docs/screenshots/workspace.png)
+
+> **Status:** pre-1.0, under active development. Foundations (Phase 0) and thumbnails & previews (Phase 2) are **complete**; the browsing core (Phase 1) is done with hardening in progress, now on a new Bridge-style workspace shell. There are no installers yet — build from source (below). Phase 3 (metadata) and Phase 4 (batch operations) are open for contributors: see the [issue backlog](https://github.com/cmspeedau/BridgeCraft/issues/19).
+
+## Everything in the box
+
+| Area | What works today |
 |---|---|
-| `bc-core` | Filesystem scanning, watchers, selection model, app state |
-| `bc-metadata` | EXIF / IPTC / XMP / sidecar read & write |
-| `bc-thumbnails` | Thumbnail cache (SQLite); image, PSD, PDF-compatible AI, video (ffmpeg), PDF (pdfium) & camera RAW (LibRaw) decoders — optional external runtimes for video, PDF/AI and RAW |
-| `bc-ui` | egui/eframe frontend: thumbnail grid, list/details views, file operations, preview & 1:1 zoom viewer |
+| **Browse** | Folder navigation with breadcrumb chips, favorites sidebar (persistent), folders tree, recent folders, filter-as-you-type, sort by name/size/date |
+| **Views** | Thumbnail grid with zoom slider, list, and details table; "thumbnails only" mode |
+| **Select** | Click / ctrl-toggle / shift-range / select-all; right-click menu with copy, move, rename, trash & restore, permanent-delete confirm |
+| **Previews** | Instant 256 px thumbnails; click any file for a live 2048 px preview in the side panel; double-click for the full zoom viewer (100% = on-demand native decode) |
+| **Formats** | PNG, JPEG, TIFF, GIF, WebP, BMP, PSD (embedded previews), PDF-compatible AI — always; video, PDF, camera RAW when a local decoder is present (see below) |
+| **Speed** | SQLite thumbnail cache keyed by `(path, size-tier)`, invalidated on file change; virtualized grid; background decode worker |
+| **Live** | Watched folders auto-refresh; cache survives restarts; `--rebuild-cache` CLI for batch warm-up |
 
-## Roadmap
+### Preview & zoom viewer
 
-See [ROADMAP.md](ROADMAP.md). Phase 2 (Thumbnails & Previews) is **complete**: cache, all preview formats, and the preview/1:1 zoom viewer. Current focus: **Phase 3 — Metadata Engine** (contributor issues [#5–#19](https://github.com/cmspeedau/BridgeCraft/issues/19)) and the remaining Phase 1 hardening.
-
-## Building
-
-```sh
-cargo build --workspace
-cargo test --workspace
-cargo clippy --workspace -- -D warnings
-cargo fmt --all -- --check
-```
-
-### Optional runtime decoders (video, PDF/AI & camera RAW)
-
-PSD previews use embedded JPEG or 24-bit RGB image resources. PDF-compatible Illustrator (`.ai`) files use the same optional Pdfium runtime as PDFs; PostScript-only AI is reported unsupported. Video, PDF/AI and camera-RAW thumbnails use optional, locally installed decoders. None are linked or bundled, and builds work without them:
-
-- **Video:** a `ffmpeg` executable on `PATH` (or next to the app binary).
-- **PDF:** a Pdfium library (`libpdfium.so`, `libpdfium.dylib`, or `pdfium.dll`) located via `PDFIUM_PATH` (file or directory), next to the app binary, common install directories, or the OS loader's search path. `PDFIUM_PATH` takes priority.
-- **Camera RAW:** a LibRaw library (`libraw.so`/`.dylib`/`.dll`, including versioned sonames) located via `LIBRAW_PATH` (file or directory), next to the app binary, common install directories, or the OS loader's search path. `LIBRAW_PATH` takes priority. RAW decoding prefers the camera's embedded preview and falls back to a full LibRaw render.
-
-Without a decoder, the matching files are shown without a preview and everything else works normally. Tests that need these decoders generate their own fixtures and skip when a decoder is unavailable; a real camera-RAW file can be exercised locally with `RAW_SAMPLE=/path/to/file cargo test`.
-
-## Preview & zoom viewer
-
-Open a preview for any thumbnailable file by double-clicking it (or Enter in List/Details view, or **Preview** in the context menu). The viewer escalates through three quality tiers: the 256 px grid thumbnail, a cached 2048 px preview, and — when you ask for 100% — an on-demand native-resolution decode (capped at 8192 px / 64 MP so a huge file can't stall the app).
+The zoom viewer escalates through three quality tiers: the grid thumbnail, a cached 2048 px preview, and — when you ask for 100% — an on-demand native-resolution decode (capped at 8192 px / 64 MP so a huge file can't stall the app).
 
 | Key | Action |
 |---|---|
@@ -50,12 +44,57 @@ Open a preview for any thumbnailable file by double-clicking it (or Enter in Lis
 | Double-click | Reset to fit |
 | `Esc` | Close |
 
+## Under the hood
+
+| Crate | Purpose |
+|---|---|
+| `bc-core` | Filesystem scanning, directory watching, selection model, favorites & recents, trash bin, file operations |
+| `bc-metadata` | EXIF / IPTC / XMP / sidecar read & write *(Phase 3 — in progress)* |
+| `bc-thumbnails` | SQLite-backed cache plus decoders: `image` (PNG/JPEG/TIFF/GIF/WebP/BMP), PSD embedded previews, Illustrator, and runtime-bound ffmpeg / pdfium / LibRaw paths |
+| `bc-ui` | egui/eframe frontend: the workspace above, virtualized grids, the zoom viewer |
+
+The layout deliberately targets the familiar asset-browser workspace (sidebar · grid · preview panel) that tools like Adobe Bridge made standard — implemented from scratch from public behavior descriptions, per the [clean-room policy](CLEANROOM.md). Decoders that carry restrictive or optional licenses (ffmpeg, Pdfium, LibRaw) are **never bundled or linked**: BridgeCraft binds to a copy you already have, and everything degrades gracefully when one is absent.
+
+## Getting started
+
+```sh
+git clone https://github.com/cmspeedau/BridgeCraft
+cd BridgeCraft
+cargo run --release -p bc-ui -- /path/to/your/photos
+```
+
+Thumbnails cache into `.bridgecraft-thumbs.db` in the working directory. Optional runtimes unlock more formats:
+
+| Enable by installing | Gets you |
+|---|---|
+| `ffmpeg` on `PATH` | Video thumbnails (MP4, MOV, MKV, WebM, …) |
+| `libpdfium` (+ `PDFIUM_PATH` if non-standard) | PDF page thumbnails, PDF-compatible `.ai` |
+| `libraw` (+ optional `LIBRAW_PATH`) | Camera RAW thumbnails (CR2/CR3/NEF/ARW/DNG/…), preferring the camera's embedded preview |
+
+Without them, those files simply show a placeholder and everything else works.
+
+To warm the cache for a big library before first use:
+
+```sh
+cargo run --release -p bc-ui -- --rebuild-cache /path/to/library
+```
+
+## Roadmap
+
+The long-term goal is a complete clean-room replacement for classic digital-asset workflows. Phase 3 (metadata engine: EXIF/IPTC/XMP, ratings & labels, collections, search) and Phase 4 (batch rename/export, contact sheets, watched-folder automation) are tracked as [milestone issues #5–#20](https://github.com/cmspeedau/BridgeCraft/issues/20). Full plan: [ROADMAP.md](ROADMAP.md).
+
+## Contributing
+
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) first: every contributor signs a one-time clean-room attestation, and `cargo build/test/clippy/fmt` on the workspace must pass. Good starting points: [#9 sidecars](https://github.com/cmspeedau/BridgeCraft/issues/9), [#10 ratings & labels](https://github.com/cmspeedau/BridgeCraft/issues/10), [#14 batch rename](https://github.com/cmspeedau/BridgeCraft/issues/14).
+
 ## Releases & packaging
 
-Final-stage release targets: a macOS universal 2 build, Windows portable ZIP + MSI installer, and a Linux AppImage with `.zsync` delta updates.
-
-> **Note — unsigned builds (accepted trade-off):** Release artifacts are not code-signed. As a result, operating systems will show trust warnings on first launch: macOS Gatekeeper flags the app as from an *unidentified developer*, and Windows SmartScreen warns on the installer/portable binary. Users must dismiss these warnings manually (e.g. right-click → Open on macOS, "More info → Run anyway" on Windows). This trade-off is documented in the [roadmap risks](ROADMAP.md).
+Planned release targets: a macOS universal 2 build, Windows portable ZIP + MSI installer, and a Linux AppImage with `.zsync` delta updates — signed by user decision **not** to code-sign, so expect Gatekeeper/SmartScreen prompts on first launch (details in the [roadmap risks](ROADMAP.md)).
 
 ## License
 
-Apache-2.0. Third-party notices will be tracked in `THIRD_PARTY_LICENSES.md`.
+Apache-2.0. Third-party runtime notices are tracked in `THIRD_PARTY_LICENSES.md`.
+
+---
+
+*BridgeCraft is an independent project. It contains no Adobe code, assets, or trademarks, and is not affiliated with, endorsed by, or sponsored by Adobe Inc. “Adobe” and “Adobe Bridge” are trademarks or registered trademarks of Adobe Inc. in the United States and/or other countries.*
