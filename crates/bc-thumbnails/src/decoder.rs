@@ -1,8 +1,8 @@
-//! Image decoding and downscaling for thumbnails.
+//! Image and video decoding plus downscaling for thumbnails.
 
 use std::path::Path;
 
-use crate::{ThumbError, Thumbnail};
+use crate::{video, ThumbError, Thumbnail};
 
 /// True when `path` has the extension of an image format this crate can
 /// decode. Keep in sync with the `image` features in the workspace
@@ -14,9 +14,23 @@ pub fn is_supported(path: &Path) -> bool {
         .is_some_and(|ext| SUPPORTED.contains(&ext.to_ascii_lowercase().as_str()))
 }
 
-/// Decode an image file and produce an RGBA thumbnail whose longest
+/// True when a thumbnail can actually be produced for `path`: a supported
+/// image, or a video while an FFmpeg binary is available.
+///
+/// Use this (rather than [`is_supported`]) to decide what enters the
+/// thumbnail pipeline, so a machine without FFmpeg does not retry every
+/// video file it browses.
+pub fn can_thumbnail(path: &Path) -> bool {
+    is_supported(path) || (video::is_supported(path) && video::is_available())
+}
+
+/// Decode an image or video file and produce an RGBA thumbnail whose longest
 /// edge fits within `max_edge`, preserving aspect ratio.
 pub fn decode_thumbnail(path: &Path, max_edge: u32) -> Result<Thumbnail, ThumbError> {
+    if video::is_supported(path) {
+        return video::decode_thumbnail(path, max_edge);
+    }
+
     let display = path.display().to_string();
     let img = image::open(path).map_err(|source| ThumbError::Decode {
         path: display,
@@ -61,5 +75,12 @@ mod tests {
         assert!(!is_supported(Path::new("film.mp4")));
         assert!(!is_supported(Path::new("noext")));
         assert!(!is_supported(Path::new(".hidden.png.bak")));
+    }
+
+    #[test]
+    fn can_thumbnail_gates_video_on_ffmpeg() {
+        assert!(can_thumbnail(Path::new("a.png")));
+        assert!(!can_thumbnail(Path::new("notes.txt")));
+        assert_eq!(can_thumbnail(Path::new("film.mp4")), video::is_available());
     }
 }

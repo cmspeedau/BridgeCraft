@@ -110,6 +110,8 @@ pub struct BridgeApp {
     pending: HashSet<PathBuf>,
     /// Decoded thumbnails uploaded to the GPU, keyed by path.
     textures: HashMap<PathBuf, egui::TextureHandle>,
+    /// Paths that failed to decode; not retried until the next refresh.
+    failed: HashSet<PathBuf>,
 
     /// Watcher for the open root; recreated on navigation.
     watcher: Option<Watcher>,
@@ -141,6 +143,7 @@ impl BridgeApp {
             thumb_rx: res_rx,
             pending: HashSet::new(),
             textures: HashMap::new(),
+            failed: HashSet::new(),
             watcher: None,
             refresh_due: None,
         };
@@ -167,6 +170,7 @@ impl BridgeApp {
                     }
                 }
                 self.pending.clear();
+                self.failed.clear();
                 // Drop thumbnails unrelated to the new folder to bound memory use.
                 self.textures.retain(|p, _| p.starts_with(root));
                 self.attach_watcher(root);
@@ -209,6 +213,8 @@ impl BridgeApp {
                 self.refresh_due = None;
                 match self.browser.refresh_preserving_selection() {
                     Ok(()) => {
+                        // Files may have been fixed or replaced on disk.
+                        self.failed.clear();
                         self.status = format!("Refreshed ({} items)", self.browser.len());
                     }
                     Err(e) => tracing::warn!("live refresh failed: {e}"),
@@ -235,12 +241,17 @@ impl BridgeApp {
                     egui::TextureOptions::LINEAR,
                 );
                 self.textures.insert(result.path, handle);
+            } else {
+                self.failed.insert(result.path);
             }
         }
     }
 
     fn request_thumbnail(&mut self, path: &Path, mtime: i64, size: u64) {
-        if self.textures.contains_key(path) || self.pending.contains(path) {
+        if self.textures.contains_key(path)
+            || self.pending.contains(path)
+            || self.failed.contains(path)
+        {
             return;
         }
         if self
@@ -357,7 +368,7 @@ impl BridgeApp {
                         if response.double_clicked() && is_dir {
                             self.open_root(&path);
                         }
-                        if !is_dir {
+                        if !is_dir && bc_thumbnails::decoder::can_thumbnail(&path) {
                             self.request_thumbnail(&path, mtime_ns(modified), size);
                         }
                     }

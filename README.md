@@ -26,6 +26,10 @@ cargo clippy --workspace -- -D warnings
 cargo fmt --all -- --check
 ```
 
+### Video thumbnails (optional FFmpeg)
+
+Video files get thumbnails through a locally installed [`ffmpeg`](https://ffmpeg.org/) executable. BridgeCraft does not link or bundle FFmpeg, so its licence stays outside this project, and builds work without it: when `ffmpeg` is not on `PATH` (or next to the app binary), videos are shown without a preview and everything else works normally. Video tests generate their fixtures with FFmpeg and skip when it is unavailable.
+
 ## Releases & packaging
 
 Final-stage release targets: a macOS universal 2 build, Windows portable ZIP + MSI installer, and a Linux AppImage with `.zsync` delta updates.

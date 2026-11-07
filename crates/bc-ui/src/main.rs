@@ -36,6 +36,12 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    if bc_thumbnails::video::is_available() {
+        tracing::info!("video thumbnails enabled (ffmpeg found)");
+    } else {
+        tracing::info!("ffmpeg not found in PATH; video thumbnails are disabled");
+    }
+
     let root = std::env::args().nth(1);
 
     // Thumbnail cache lives next to the CWD; the worker thread owns it.
@@ -110,7 +116,7 @@ fn rebuild_cache(folder: &Path, cache_path: &Path) -> anyhow::Result<RebuildStat
                 continue;
             }
             if !metadata.is_file()
-                || !bc_thumbnails::decoder::is_supported(&path)
+                || !bc_thumbnails::decoder::can_thumbnail(&path)
                 || std::fs::canonicalize(&path).ok().as_ref() == cache_real.as_ref()
             {
                 continue;

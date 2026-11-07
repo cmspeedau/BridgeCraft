@@ -38,7 +38,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [x] Format decoders via Rust crates: PNG/JPEG/TIFF/GIF/WebP/BMP (via `image`), RGBA8 + aspect-preserving downscale (`bc-thumbnails::decoder`)
 - [x] Background generation queue — **DONE** via dedicated worker thread + mpsc (no tokio needed); textures GPU-uploaded in `poll_thumbnails()`
 - [ ] PDF (via pdfium bindings)
-- [ ] Video via ffmpeg bindings
+- [x] Video via ffmpeg bindings — `ffmpeg-sidecar` drives a user-installed `ffmpeg` binary (not bundled or linked; see `docs/PHASE2.md`)
 - [ ] Camera RAW support (LibRaw bindings or DNG parsing)
 - [ ] PSD/AI/Illustrator preview extraction
 - [ ] Preview quality levels: thumbnail / preview / 1:1 zoom viewer
@@ -113,7 +113,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 | Milestone | Target | Definition of Done | Status |
 |---|---|---|---|
 | M1 — Browser MVP | Q1 2027 | Browse, sort, filter, live refresh, thumbnails, basic file ops | ◐ GUI + core done; recents/trash primitives done; remaining: file-operation UI, drag & drop |
-| M2 — Preview Engine | Q2 2027 | RAW/PSD/PDF/video previews with caching | ◐ PNG/JPEG/GIF/WebP/TIFF/BMP + SQLite cache done |
+| M2 — Preview Engine | Q2 2027 | RAW/PSD/PDF/video previews with caching | ◐ PNG/JPEG/GIF/WebP/TIFF/BMP + video (via runtime ffmpeg) + SQLite cache done |
 | M3 — Metadata Complete | Q3 2027 | XMP/EXIF/IPTC read-write, smart collections | not started |
 | M4 — Automation | Q4 2027 | Batch ops, scripting API | not started |
 | M5 — Integrations | 2028 | Apple Photos, plugin system, ArtCraft bridge plugin, LightCraft bridge plugin | not started |
@@ -131,6 +131,7 @@ With ADR-0001 resolved (egui/eframe), filter + live refresh shipped, and virtual
 - Plugin sandboxing mistakes could expose user files (mitigate: WASM-only v1, deny-by-default capabilities, permission prompts in the plugin manager)
 - ArtCraft integration depends on an external project's evolving APIs (mitigate: version the bridge plugin against specific ArtCraft releases; its MIT/Apache licensing keeps the dependency clean)
 - LightCraft integration depends on an external project's evolving APIs (mitigate: version the bridge plugin against specific LightCraft releases; its MIT/Apache licensing keeps the dependency clean, and it is young/moving fast so pin early)
+- Video thumbnails require a user-installed FFmpeg binary, which is not bundled (mitigate: availability probe cached per process, videos simply skipped when absent, binary stays outside our licence surface)
 - Unsigned distribution artifacts will trigger OS trust warnings (macOS Gatekeeper, Windows SmartScreen) that users must dismiss manually (accepted trade-off: no signing certificates are purchased or managed)
 
 ---

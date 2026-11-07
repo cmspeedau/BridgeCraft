@@ -2,6 +2,7 @@
 
 pub mod cache;
 pub mod decoder;
+pub mod video;
 
 use std::path::Path;
 
@@ -18,6 +19,9 @@ pub enum ThumbError {
 
     #[error("cache error: {0}")]
     Cache(#[from] rusqlite::Error),
+
+    #[error("video thumbnail failed for {path}: {message}")]
+    Video { path: String, message: String },
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
