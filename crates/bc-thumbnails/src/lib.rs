@@ -3,6 +3,7 @@
 pub mod ai;
 pub mod cache;
 pub mod decoder;
+pub mod export;
 pub mod pdf;
 pub mod psd;
 pub mod raw;
