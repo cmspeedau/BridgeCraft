@@ -7,6 +7,7 @@ pub mod favorites;
 pub mod file_ops;
 pub mod fs;
 pub mod jobs;
+pub mod job_queue;
 pub mod recents;
 pub mod selection;
 pub mod trash;
