@@ -14,6 +14,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use bc_core::browser::BrowserState;
+use bc_core::export::{ExportFormat, ExportQueue, ExportRequest};
 use bc_core::favorites::Favorites;
 use bc_core::file_ops::{copy_path, delete_path, move_path, rename_path};
 use bc_core::fs::{SortDir, SortKey};
@@ -62,6 +63,39 @@ enum RightTab {
     #[default]
     Preview,
     Metadata,
+}
+
+/// Pending parameters for the Export dialog (issue #15). The dialog is a
+/// thin form over `bc_core::export`; all execution logic lives in the
+/// export queue.
+struct ExportDialog {
+    sources: Vec<PathBuf>,
+    /// Empty means "beside originals".
+    destination: String,
+    format_choice: usize,
+    quality: i32,
+    max_edge: i32,
+    /// True when some source is only decodable through the runtime-backed
+    /// thumbnail paths (RAW, PDF, video, PSD previews): worth a warning.
+    low_tier: bool,
+}
+
+impl ExportDialog {
+    fn new(sources: Vec<PathBuf>) -> Self {
+        // Warn honestly when sources only the thumbnail pipeline can read
+        // (RAW/PDF/video/PSD) ride along: they export at thumbnail quality.
+        let low_tier = sources
+            .iter()
+            .any(|path| !bc_thumbnails::decoder::is_supported(path));
+        Self {
+            sources,
+            destination: String::new(),
+            format_choice: 0,
+            quality: 85,
+            max_edge: 1024,
+            low_tier,
+        }
+    }
 }
 
 struct ThumbJob {
@@ -194,6 +228,18 @@ pub struct BridgeApp {
     dims_cache: HashMap<PathBuf, Option<(u32, u32)>>,
     /// EXIF fields cached per path, keyed with the mtime they were read at.
     exif_cache: HashMap<PathBuf, (i64, bc_metadata::Metadata)>,
+
+    // ------------------------------------------------------------- export --
+    /// Session-lifetime export job queue (all logic lives in `bc-core`).
+    export_queue: ExportQueue,
+    /// Open Export dialog parameters, if any.
+    export_dialog: Option<ExportDialog>,
+    /// Jobs list window visibility.
+    jobs_window: bool,
+    /// Count of jobs still queued/running, refreshed by the poll.
+    export_active: usize,
+    /// Jobs whose completion summary has already been put in the status bar.
+    jobs_notified: HashSet<u64>,
 }
 
 impl BridgeApp {
@@ -242,6 +288,11 @@ impl BridgeApp {
             trash_window: false,
             dims_cache: HashMap::new(),
             exif_cache: HashMap::new(),
+            export_queue: ExportQueue::new(bc_core::export::default_worker_count()),
+            export_dialog: None,
+            jobs_window: false,
+            export_active: 0,
+            jobs_notified: HashSet::new(),
         };
 
         if let Some(root) = root {
@@ -1540,6 +1591,23 @@ impl BridgeApp {
                 }
             });
         }
+        if ui
+            .button("Export…")
+            .on_hover_text("Batch resize/convert to JPEG, PNG or WebP")
+            .clicked()
+        {
+            let files: Vec<PathBuf> = paths
+                .iter()
+                .filter(|path| !path.is_dir())
+                .cloned()
+                .collect();
+            if files.is_empty() {
+                self.status = "Select files to export.".into();
+            } else {
+                self.export_dialog = Some(ExportDialog::new(files));
+            }
+            ui.close_menu();
+        }
         if ui.button("Move to BridgeCraft Trash").clicked() {
             match TrashBin::open_default() {
                 Ok(mut bin) => {
@@ -1607,6 +1675,230 @@ impl BridgeApp {
                 }
             });
         self.trash_window = open;
+    }
+
+    // ------------------------------------------------------------- export --
+
+    /// Refresh job counters, announce freshly finished jobs once, and keep
+    /// the frame clock running while work is in flight.
+    fn poll_export_jobs(&mut self, ctx: &egui::Context) {
+        let snapshots = self.export_queue.snapshot();
+        self.export_active = snapshots.iter().filter(|job| !job.finished).count();
+        for job in snapshots.iter().filter(|job| job.finished) {
+            if self.jobs_notified.insert(job.id) {
+                self.status = format!(
+                    "Export job #{} finished: {} done, {} failed, {} cancelled",
+                    job.id, job.completed, job.failed, job.cancelled
+                );
+            }
+        }
+        if self.export_active > 0 {
+            ctx.request_repaint_after(std::time::Duration::from_millis(120));
+        }
+    }
+
+    fn export_window(&mut self, ctx: &egui::Context) {
+        // Move the dialog out so the window closure can mutably borrow it
+        // without aliasing `self` (same pattern as the trash window).
+        let Some(mut dialog) = self.export_dialog.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut start = false;
+        let mut dismissed = false;
+        egui::Window::new("Export selection")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "Export {} file(s) as basename_<max edge>.<ext>; existing files are never overwritten.",
+                    dialog.sources.len()
+                ));
+                ui.horizontal(|ui| {
+                    ui.label("Into folder:");
+                    ui.add_sized(
+                        [280.0, 20.0],
+                        egui::TextEdit::singleline(&mut dialog.destination)
+                            .hint_text("empty = beside originals"),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Format:");
+                    egui::ComboBox::from_id_source("export_format")
+                        .selected_text(match dialog.format_choice {
+                            0 => "JPEG",
+                            1 => "PNG",
+                            _ => "WebP",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut dialog.format_choice, 0, "JPEG");
+                            ui.selectable_value(&mut dialog.format_choice, 1, "PNG");
+                            ui.selectable_value(&mut dialog.format_choice, 2, "WebP");
+                        });
+                    if dialog.format_choice == 0 {
+                        ui.add(egui::Slider::new(&mut dialog.quality, 30..=100).text("Quality"));
+                    }
+                    ui.add(
+                        egui::Slider::new(&mut dialog.max_edge, 64..=4096)
+                            .step_by(16.0)
+                            .text("Max edge px"),
+                    );
+                });
+                if dialog.low_tier {
+                    ui.weak(
+                        "RAW, PDF, video and Illustrator/PSD sources export at thumbnail quality.",
+                    );
+                }
+                ui.separator();
+                ui.weak(
+                    "Metadata policy: no XMP packet, rating, label or flag is copied yet — the \
+                     Phase 3 writers decide how that happens. EXIF orientation is applied to the \
+                     exported pixels.",
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Start job").clicked() {
+                        start = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        dismissed = true;
+                    }
+                });
+            });
+
+        if start {
+            let format = match dialog.format_choice {
+                0 => ExportFormat::Jpeg {
+                    quality: dialog.quality as u8,
+                },
+                1 => ExportFormat::Png,
+                _ => ExportFormat::WebP,
+            };
+            let destination = dialog.destination.trim().to_string();
+            let file_count = dialog.sources.len();
+            let request = ExportRequest {
+                sources: std::mem::take(&mut dialog.sources),
+                destination: (!destination.is_empty()).then(|| PathBuf::from(destination)),
+                format,
+                max_edge: dialog.max_edge.max(0) as u32,
+            };
+            match self.export_queue.submit(request) {
+                Ok(handle) => {
+                    self.status =
+                        format!("Export job #{} started ({file_count} file(s)).", handle.id);
+                    self.jobs_window = true;
+                }
+                Err(e) => self.status = format!("Cannot start export: {e}"),
+            }
+        } else if open && !dismissed {
+            self.export_dialog = Some(dialog);
+        }
+    }
+
+    /// Non-modal job list with per-file progress rows and a done/failed
+    /// summary — browsing stays interactive while exports run.
+    fn jobs_window(&mut self, ctx: &egui::Context) {
+        if !self.jobs_window {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Jobs")
+            .default_size([440.0, 340.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                let snapshots = self.export_queue.snapshot();
+                if snapshots.is_empty() {
+                    ui.weak("No export jobs yet. Right-click a selection and choose Export…");
+                    return;
+                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("Remove finished")
+                        .on_hover_text("Hide finished jobs from this list")
+                        .clicked()
+                    {
+                        self.export_queue.clear_finished();
+                    }
+                });
+                ui.separator();
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for job in snapshots.iter().rev() {
+                        ui.group(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.strong(format!(
+                                    "Job #{} · {} · ≤{} px",
+                                    job.id,
+                                    job.format.label(),
+                                    job.max_edge
+                                ));
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if !job.finished && ui.button("Cancel job").clicked() {
+                                            self.export_queue.cancel(job.id);
+                                        }
+                                    },
+                                );
+                            });
+                            ui.weak(format!("→ {}", job.destination));
+                            let done = job.completed + job.failed + job.cancelled;
+                            ui.add(
+                                egui::ProgressBar::new(done as f32 / job.total.max(1) as f32)
+                                    .text(format!("{done}/{}", job.total)),
+                            );
+                            ui.weak(format!(
+                                "{} done · {} failed · {} cancelled · {} queued · {} running",
+                                job.completed, job.failed, job.cancelled, job.queued, job.running
+                            ));
+                            egui::ScrollArea::vertical()
+                                .max_height(150.0)
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    for file in &job.files {
+                                        let name = file
+                                            .source
+                                            .file_name()
+                                            .map(|n| n.to_string_lossy().into_owned())
+                                            .unwrap_or_else(|| file.source.display().to_string());
+                                        match &file.state {
+                                            bc_core::jobs::FileState::Queued => {
+                                                ui.weak(format!("· {name}"));
+                                            }
+                                            bc_core::jobs::FileState::Running => {
+                                                ui.label(format!("▶ {name} — exporting…"));
+                                            }
+                                            bc_core::jobs::FileState::Done { output } => {
+                                                let out_name = output
+                                                    .file_name()
+                                                    .map(|n| n.to_string_lossy().into_owned())
+                                                    .unwrap_or_default();
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(120, 200, 120),
+                                                    format!("✓ {name} → {out_name}"),
+                                                )
+                                                .on_hover_text(output.display().to_string());
+                                            }
+                                            bc_core::jobs::FileState::Failed { message } => {
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(220, 120, 120),
+                                                    format!("✗ {name}: {message}"),
+                                                );
+                                            }
+                                            bc_core::jobs::FileState::Cancelled => {
+                                                ui.colored_label(
+                                                    egui::Color32::GRAY,
+                                                    format!("⊘ {name} cancelled"),
+                                                );
+                                            }
+                                        }
+                                    }
+                                });
+                        });
+                        ui.add_space(4.0);
+                    }
+                });
+            });
+        self.jobs_window = open;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1842,6 +2134,19 @@ impl BridgeApp {
                 ui.checkbox(&mut self.thumbs_only, "Thumbnails only")
                     .on_hover_text("Hide files BridgeCraft cannot preview");
                 ui.separator();
+                let jobs_label = if self.export_active > 0 {
+                    format!("Jobs ({})", self.export_active)
+                } else {
+                    "Jobs".to_string()
+                };
+                if ui
+                    .button(jobs_label)
+                    .on_hover_text("Show export job list")
+                    .clicked()
+                {
+                    self.jobs_window = !self.jobs_window;
+                }
+                ui.separator();
                 ui.add(
                     egui::Label::new(egui::RichText::new(&self.status).small())
                         .truncate(true)
@@ -1918,6 +2223,7 @@ fn human_size(size: u64) -> String {
 impl eframe::App for BridgeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_thumbnails(ctx);
+        self.poll_export_jobs(ctx);
         self.poll_watcher();
         self.prune_preview_textures();
 
@@ -2025,6 +2331,8 @@ impl eframe::App for BridgeApp {
 
         self.trash_window(ctx);
         self.confirm_delete_window(ctx);
+        self.export_window(ctx);
+        self.jobs_window(ctx);
     }
 }
 

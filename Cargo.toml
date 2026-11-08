@@ -23,7 +23,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-image = { version = "0.24", default-features = false, features = ["png", "jpeg", "gif", "webp", "tiff", "bmp"] }
+# `webp-encoder` adds the WebP encoder used by the export pipeline; the
+# `webp` feature alone is decoder-only. The encoder arrives via the `webp`
+# crate, which statically links the vendored (BSD-3-Clause) libwebp C code —
+# permissive, compiled from source at build time, listed in
+# THIRD_PARTY_LICENSES.md.
+image = { version = "0.24", default-features = false, features = ["png", "jpeg", "gif", "webp", "webp-encoder", "tiff", "bmp"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 # Drives a locally installed `ffmpeg` binary; no FFmpeg libraries are linked
 # or bundled. The download feature is disabled on purpose: BridgeCraft never

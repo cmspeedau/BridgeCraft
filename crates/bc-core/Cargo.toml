@@ -7,6 +7,9 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+bc-metadata = { path = "../bc-metadata" }
+bc-thumbnails = { path = "../bc-thumbnails" }
+image.workspace = true
 notify.workspace = true
 serde.workspace = true
 serde_json.workspace = true
