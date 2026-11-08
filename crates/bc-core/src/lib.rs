@@ -2,9 +2,11 @@
 
 pub mod browser;
 pub mod entry;
+pub mod export;
 pub mod favorites;
 pub mod file_ops;
 pub mod fs;
+pub mod jobs;
 pub mod job_queue;
 pub mod recents;
 pub mod selection;

@@ -631,6 +631,15 @@ fn orientation_text(n: u16) -> String {
     format!("{label} ({n})")
 }
 
+/// EXIF orientation code (1..=8) from the `exif.Orientation` field this
+/// module writes, for consumers that need the number rather than the label
+/// (the export pipeline bakes the rotation into pixel data).
+pub fn orientation_code(meta: &crate::Metadata) -> Option<u16> {
+    let text = meta.get("exif.Orientation")?;
+    let code: u16 = text.strip_suffix(')')?.rsplit_once('(')?.1.parse().ok()?;
+    (1..=8).contains(&code).then_some(code)
+}
+
 fn color_space_text(n: u16) -> String {
     match n {
         1 => "sRGB",
@@ -930,6 +939,21 @@ mod tests {
     fn plain_jpeg_without_exif_is_empty_not_an_error() {
         let jpeg = vec![0xFF, 0xD8, 0xFF, 0xDA, 0, 0, 0, 0];
         assert!(read_exif(&jpeg).unwrap().is_empty());
+    }
+
+    #[test]
+    fn orientation_code_extracts_the_numeric_code() {
+        let mut meta = crate::Metadata::new();
+        meta.insert("exif.Orientation".into(), "Rotate 90 CW (6)".into());
+        assert_eq!(orientation_code(&meta), Some(6));
+        meta.insert("exif.Orientation".into(), "Normal (1)".into());
+        assert_eq!(orientation_code(&meta), Some(1));
+        // Out-of-range codes and malformed text yield no code, never a panic.
+        meta.insert("exif.Orientation".into(), "Unknown (42)".into());
+        assert_eq!(orientation_code(&meta), None);
+        meta.insert("exif.Orientation".into(), "garbage".into());
+        assert_eq!(orientation_code(&meta), None);
+        assert_eq!(orientation_code(&crate::Metadata::new()), None);
     }
 
     #[test]

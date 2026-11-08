@@ -30,6 +30,7 @@ A clean-room, from-scratch asset browser inspired by the workflows of classic di
 | **Formats** | PNG, JPEG, TIFF, GIF, WebP, BMP, PSD (embedded previews), PDF-compatible AI — always; video, PDF, camera RAW when a local decoder is present (see below) |
 | **Speed** | SQLite thumbnail cache keyed by `(path, size-tier)`, invalidated on file change; virtualized grid; background decode worker |
 | **Live** | Watched folders auto-refresh; cache survives restarts; `--rebuild-cache` CLI for batch warm-up |
+| **Export** | Right-click → Export…: batch resize/convert to JPEG (quality knob), PNG or WebP as a background job — non-modal job list with per-file progress, cancellation, collision-safe `basename_<max edge>.<ext>` naming, and no half-written files |
 
 ### Preview & zoom viewer
 
@@ -45,11 +46,37 @@ The zoom viewer escalates through three quality tiers: the grid thumbnail, a cac
 | Double-click | Reset to fit |
 | `Esc` | Close |
 
+## Batch export
+
+Right-click a selection (or a single file) and choose **Export…**: pick a
+destination folder (or leave it beside the originals), a format, and a
+maximum long edge. The job runs on a bounded worker pool in the background
+(default: half your cores) — the **Jobs** list in the status bar shows one
+progress row per file with a done/failed summary, and browsing stays fully
+usable while it runs.
+
+Guarantees and current trade-offs:
+
+- Outputs are named `basename_<max edge>.<ext>` (`photo_1024.jpg`) and never
+  overwrite: collisions get `_1`, `_2`, … suffixes. Bytes land via a temp
+  file plus rename, so a cancelled or failed export can never leave a
+  truncated file behind.
+- **EXIF orientation is applied to the exported pixels**, not copied as a
+  tag. No other metadata is copied yet — XMP packets, ratings, labels and
+  flags move once the Phase 3 writers land, and the dialog says so.
+- Camera RAW, PDF, video and Illustrator/PSD sources go through the same
+  decode path as thumbnails, so they **export at thumbnail quality** for
+  now; plain raster formats export at full resolution up to your chosen
+  max edge.
+- WebP is lossless (VP8L) with alpha preserved; JPEG flattens transparency
+  onto white; PNG keeps alpha.
+- Downscaling only: sources smaller than the max edge are not upscaled.
+
 ## Under the hood
 
 | Crate | Purpose |
 |---|---|
-| `bc-core` | Filesystem scanning, directory watching, selection model, favorites & recents, trash bin, file operations |
+| `bc-core` | Filesystem scanning, directory watching, selection model, favorites & recents, trash bin, file operations, queued batch-export pipeline |
 | `bc-metadata` | EXIF read from JPEG / TIFF / DNG (both byte orders, Exif & GPS sub-IFDs) shipped; IPTC / XMP / sidecars & writing in progress |
 | `bc-thumbnails` | SQLite-backed cache plus decoders: `image` (PNG/JPEG/TIFF/GIF/WebP/BMP), PSD embedded previews, Illustrator, and runtime-bound ffmpeg / pdfium / LibRaw paths |
 | `bc-ui` | egui/eframe frontend: the workspace above, virtualized grids, the zoom viewer |

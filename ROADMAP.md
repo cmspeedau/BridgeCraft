@@ -61,7 +61,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 
 ## Phase 4 — Batch Operations & Automation (Weeks 24–34)
 - [ ] Batch rename (token-based patterns)
-- [ ] Batch resize/convert/export
+- [x] Batch resize/convert/export (issue #15: queued `bc-core` export pipeline + jobs UI; JPEG/PNG/WebP, orientation applied, metadata copy deferred to the Phase 3 writers)
 - [ ] Contact sheet / PDF contact sheet output
 - [ ] Watched-folder auto-processing
 - [ ] Scripting/automation API (Lua or WASM plugins)
