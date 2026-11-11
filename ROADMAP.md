@@ -55,7 +55,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [x] XMP sidecar read/write (`.xmp` files) — `bc-metadata::xmp` (parse/serialize + atomic file I/O)
 - [ ] Metadata panel with editable fields
 - [ ] Custom metadata templates
-- [ ] Keyword hierarchy management & tagging
+- [x] Keyword hierarchy management & tagging (`bc-metadata::keywords`: dc:subject `Parent|Child` convention, tree/type-ahead/tag-count logic; UI panel deferred to #11)
 - [x] Star ratings, color labels, approve/reject flags (typed API in `bc-metadata::ratings`; UI editor deferred to #11)
 - [ ] Metadata-driven search & smart collections (query builder)
 

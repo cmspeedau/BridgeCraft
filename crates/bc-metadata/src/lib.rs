@@ -9,6 +9,7 @@
 
 pub mod exif;
 pub mod iptc;
+pub mod keywords;
 pub mod ratings;
 pub mod xmp;
 
