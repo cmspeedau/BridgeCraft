@@ -8,6 +8,7 @@
 //! Clean-room per CLEANROOM.md. See `docs/design/0005-structured-metadata-model.md`.
 
 pub mod exif;
+pub mod exif_write;
 pub mod iptc;
 pub mod keywords;
 pub mod ratings;
