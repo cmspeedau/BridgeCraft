@@ -44,9 +44,11 @@ fn rename_contexts(sources: &[PathBuf]) -> Vec<RenameContext> {
         .enumerate()
         .map(|(index, path)| {
             let mut context = RenameContext::from_path(path.clone(), index);
-            let sidecar = bc_metadata::xmp::sidecar_path(path);
-            if let Ok(metadata) = bc_metadata::xmp::read_xmp_file(&sidecar) {
-                context.keywords = bc_metadata::keywords::subjects(&metadata);
+            if path.is_file() {
+                let sidecar = bc_metadata::xmp::sidecar_path(path);
+                if let Ok(metadata) = bc_metadata::xmp::read_xmp_file(&sidecar) {
+                    context.keywords = bc_metadata::keywords::subjects(&metadata);
+                }
             }
             context
         })
@@ -94,6 +96,28 @@ mod tests {
         let plan = dialog.preview.as_ref().unwrap();
         assert_eq!(plan[0].target.file_name().unwrap(), "asset_01.jpg");
         assert_eq!(plan[1].target.file_name().unwrap(), "asset_02.png");
+    }
+
+    #[test]
+    fn preview_has_stable_source_order_and_sidecar_keywords() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("z-last.jpg");
+        let second = temp.path().join("a-first.jpg");
+        std::fs::write(&first, b"1").unwrap();
+        std::fs::write(&second, b"2").unwrap();
+        let sidecar = bc_metadata::xmp::sidecar_path(&second);
+        let mut metadata = bc_metadata::Metadata::new();
+        bc_metadata::keywords::set_subjects(&mut metadata, vec!["Studio".to_string()]);
+        bc_metadata::xmp::write_xmp_file(&sidecar, &metadata).unwrap();
+
+        let mut dialog = RenameDialog::new(vec![first.clone(), second.clone()]);
+        dialog.pattern = "{keyword#1}_{seq:1>2}".into();
+        dialog.rebuild_preview();
+        let plan = dialog.preview.as_ref().unwrap();
+        assert_eq!(plan[0].source, first);
+        assert_eq!(plan[1].source, second);
+        assert_eq!(plan[0].target.file_name().unwrap(), "_01.jpg");
+        assert_eq!(plan[1].target.file_name().unwrap(), "Studio_02.jpg");
     }
 
     #[test]
