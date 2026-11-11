@@ -35,6 +35,9 @@ const TAG_SOFTWARE: u16 = 0x0131;
 const TAG_DATE_TIME: u16 = 0x0132;
 const TAG_IMAGE_WIDTH: u16 = 0x0100;
 const TAG_IMAGE_HEIGHT: u16 = 0x0101;
+const TAG_IMAGE_DESCRIPTION: u16 = 0x010E;
+const TAG_ARTIST: u16 = 0x013B;
+const TAG_COPYRIGHT: u16 = 0x8298;
 const TAG_THUMBNAIL_OFFSET: u16 = 0x0201;
 const TAG_THUMBNAIL_LENGTH: u16 = 0x0202;
 const TAG_EXIF_IFD: u16 = 0x8769;
@@ -457,6 +460,21 @@ impl<'a> Tiff<'a> {
                     if let Some(v) = Self::ascii(entry) {
                         self.out
                             .set_text(NS_EXIF, "DateTime", normalize_exif_date(&v));
+                    }
+                }
+                TAG_IMAGE_DESCRIPTION => {
+                    if let Some(v) = Self::ascii(entry) {
+                        self.out.set_text(NS_EXIF, "ImageDescription", v);
+                    }
+                }
+                TAG_ARTIST => {
+                    if let Some(v) = Self::ascii(entry) {
+                        self.out.set_text(NS_EXIF, "Artist", v);
+                    }
+                }
+                TAG_COPYRIGHT => {
+                    if let Some(v) = Self::ascii(entry) {
+                        self.out.set_text(NS_EXIF, "Copyright", v);
                     }
                 }
                 TAG_ORIENTATION => {

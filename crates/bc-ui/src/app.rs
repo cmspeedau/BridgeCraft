@@ -25,6 +25,7 @@ use bc_core::watcher::Watcher;
 use bc_thumbnails::{CacheStore, Thumbnail};
 use eframe::egui;
 
+use crate::metadata_edit::{self, BulkReport, MetadataForm};
 use crate::viewer::{self, ViewerState, ZoomMode, FULL_EDGE, PREVIEW_EDGE};
 
 /// Default grid cell width; the status-bar zoom slider ranges from this.
@@ -226,8 +227,19 @@ pub struct BridgeApp {
     trash_window: bool,
     /// Header-only dimensions, cached per path for the Metadata panel.
     dims_cache: HashMap<PathBuf, Option<(u32, u32)>>,
-    /// EXIF fields cached per path, keyed with the mtime they were read at.
+    /// EXIF fields cached per path, keyed with the mtime they were read at
+    /// (including the sidecar's, when one exists).
     exif_cache: HashMap<PathBuf, (i64, bc_metadata::Metadata)>,
+    /// Editable metadata form for the single selection.
+    metadata_form: MetadataForm,
+    metadata_form_path: Option<PathBuf>,
+    metadata_form_mtime: i64,
+    metadata_status: Option<String>,
+    /// Multi-selection bulk editor buffers.
+    bulk_description: String,
+    bulk_artist: String,
+    bulk_copyright: String,
+    bulk_report: Option<BulkReport>,
 
     // ------------------------------------------------------------- export --
     /// Session-lifetime export job queue (all logic lives in `bc-core`).
@@ -288,6 +300,14 @@ impl BridgeApp {
             trash_window: false,
             dims_cache: HashMap::new(),
             exif_cache: HashMap::new(),
+            metadata_form: MetadataForm::default(),
+            metadata_form_path: None,
+            metadata_form_mtime: 0,
+            metadata_status: None,
+            bulk_description: String::new(),
+            bulk_artist: String::new(),
+            bulk_copyright: String::new(),
+            bulk_report: None,
             export_queue: ExportQueue::new(bc_core::export::default_worker_count()),
             export_dialog: None,
             jobs_window: false,
@@ -706,23 +726,21 @@ impl BridgeApp {
         self.dims_cache.get(path).copied().flatten()
     }
 
-    /// EXIF fields for a file, cached until the file's modified time moves.
+    /// Metadata for a file, cached until the file or its sidecar changes.
     /// Failed reads cache an empty map so the panel does not retry per frame.
     fn exif_for(&mut self, path: &Path, mtime: i64) -> Option<bc_metadata::Metadata> {
+        let sidecar_mtime = std::fs::metadata(bc_metadata::xmp::sidecar_path(path))
+            .and_then(|m| m.modified())
+            .ok();
+        let stamp = mtime.max(mtime_ns(sidecar_mtime));
         if let Some((cached_mtime, meta)) = self.exif_cache.get(path) {
-            if *cached_mtime == mtime {
+            if *cached_mtime == stamp {
                 return Some(meta.clone());
             }
         }
-        let meta = match bc_metadata::exif::read_exif_file(path) {
-            Ok(meta) => meta,
-            Err(e) => {
-                tracing::debug!("exif read failed for {}: {e}", path.display());
-                bc_metadata::Metadata::new()
-            }
-        };
+        let meta = metadata_edit::read_panel_metadata(path);
         self.exif_cache
-            .insert(path.to_path_buf(), (mtime, meta.clone()));
+            .insert(path.to_path_buf(), (stamp, meta.clone()));
         Some(meta)
     }
 
@@ -751,22 +769,26 @@ impl BridgeApp {
         let count = self.browser.selection.len();
         let single = self.single_selection();
         let Some(idx) = single else {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                if count == 0 {
-                    ui.weak("Nothing selected.");
-                } else {
-                    ui.label(format!("{count} selected"));
-                    let total = self.selected_total_size();
-                    ui.weak(format!("{} total", human_size(total)));
-                    for path in self.selected_paths(Path::new("")).iter().take(200) {
-                        ui.weak(
-                            path.file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| path.display().to_string()),
-                        );
+            if count > 0 && self.right_tab == RightTab::Metadata {
+                self.bulk_metadata_panel(ui, count);
+            } else {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    if count == 0 {
+                        ui.weak("Nothing selected.");
+                    } else {
+                        ui.label(format!("{count} selected"));
+                        let total = self.selected_total_size();
+                        ui.weak(format!("{} total", human_size(total)));
+                        for path in self.selected_paths(Path::new("")).iter().take(200) {
+                            ui.weak(
+                                path.file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| path.display().to_string()),
+                            );
+                        }
                     }
-                }
-            });
+                });
+            }
             return;
         };
 
@@ -852,10 +874,11 @@ impl BridgeApp {
                         .map(|ext| format!("{} file", ext.to_string_lossy().to_uppercase()))
                         .unwrap_or_else(|| "File".to_owned())
                 };
+                let mtime = mtime_ns(entry.modified);
                 let exif = if entry.is_dir || !bc_thumbnails::decoder::can_thumbnail(&path) {
                     None
                 } else {
-                    self.exif_for(&path, mtime_ns(entry.modified))
+                    self.exif_for(&path, mtime)
                 };
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     if let Some(meta) = exif.as_ref().filter(|meta| !meta.is_empty()) {
@@ -881,7 +904,6 @@ impl BridgeApp {
                             ("Focal Length", "FocalLength"),
                             ("Orientation", "Orientation"),
                             ("Color Space", "ColorSpace"),
-                            ("Software", "Software"),
                         ] {
                             if let Some(v) = meta.text(bc_metadata::NS_EXIF, local) {
                                 Self::prop_row(ui, label, v.to_string());
@@ -895,6 +917,8 @@ impl BridgeApp {
                         }
                         ui.separator();
                     }
+                    self.metadata_form_ui(ui, &path, mtime);
+                    ui.separator();
                     ui.add(
                         egui::Label::new(egui::RichText::new("File Properties").weak().small())
                             .selectable(false),
@@ -918,6 +942,248 @@ impl BridgeApp {
                 });
             }
         }
+    }
+
+    /// Editable metadata form for the single selection: dirty rows are
+    /// tinted, Save writes through the #5 policy and Revert restores the
+    /// values loaded from disk.
+    fn metadata_form_ui(&mut self, ui: &mut egui::Ui, path: &Path, mtime: i64) {
+        let needs_load =
+            self.metadata_form_path.as_deref() != Some(path) || self.metadata_form_mtime != mtime;
+        if needs_load {
+            let meta = self.exif_for(path, mtime).unwrap_or_default();
+            self.metadata_form.load(&meta);
+            self.metadata_form_path = Some(path.to_path_buf());
+            self.metadata_form_mtime = mtime;
+            self.metadata_status = None;
+        }
+
+        ui.add(egui::Label::new(egui::RichText::new("Metadata").weak().small()).selectable(false));
+        for value in self.metadata_form.values_mut() {
+            let dirty = value.is_dirty();
+            let label = if dirty {
+                format!("• {}", value.spec.label)
+            } else {
+                value.spec.label.to_string()
+            };
+            let rich = if dirty {
+                egui::RichText::new(label)
+                    .small()
+                    .color(ui.visuals().warn_fg_color)
+            } else {
+                egui::RichText::new(label).weak().small()
+            };
+            if value.spec.multiline {
+                ui.add(egui::Label::new(rich).selectable(false));
+                ui.add(
+                    egui::TextEdit::multiline(&mut value.current)
+                        .font(egui::TextStyle::Small)
+                        .desired_rows(2)
+                        .desired_width(f32::INFINITY),
+                );
+            } else {
+                ui.horizontal(|ui| {
+                    ui.add_sized([76.0, 16.0], egui::Label::new(rich).selectable(false));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut value.current)
+                            .font(egui::TextStyle::Small)
+                            .desired_width(f32::INFINITY),
+                    );
+                });
+            }
+        }
+
+        let dirty_count = self.metadata_form.dirty_count();
+        ui.horizontal(|ui| {
+            let dirty = self.metadata_form.is_dirty();
+            if ui
+                .add_enabled(dirty, egui::Button::new("Save").small())
+                .clicked()
+            {
+                let changes = self.metadata_form.dirty_changes();
+                let report = metadata_edit::apply_changes(
+                    std::slice::from_ref(&path.to_path_buf()),
+                    &changes,
+                    bc_metadata::WritePolicy::Auto,
+                );
+                match report.failures.first() {
+                    Some(failure) => {
+                        self.metadata_status = Some(format!("Save failed: {}", failure.error));
+                    }
+                    None => {
+                        self.exif_cache.remove(path);
+                        let saved = metadata_edit::read_panel_metadata(path);
+                        self.metadata_form.load(&saved);
+                        self.metadata_form_mtime =
+                            mtime_ns(std::fs::metadata(path).and_then(|m| m.modified()).ok());
+                        self.metadata_status = Some("Saved.".to_string());
+                        self.status = format!("Saved metadata for {}", path.display());
+                    }
+                }
+            }
+            if ui
+                .add_enabled(dirty, egui::Button::new("Revert").small())
+                .clicked()
+            {
+                self.metadata_form.revert();
+                self.metadata_status = None;
+            }
+            if dirty_count > 0 {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!("{dirty_count} unsaved"))
+                            .small()
+                            .color(ui.visuals().warn_fg_color),
+                    )
+                    .selectable(false),
+                );
+            }
+        });
+        if let Some(status) = &self.metadata_status {
+            ui.add(egui::Label::new(egui::RichText::new(status).small()).selectable(false));
+        }
+    }
+
+    /// Multi-selection bulk editor: the fields that make sense to stamp
+    /// across many files, with a per-file result summary.
+    fn bulk_metadata_panel(&mut self, ui: &mut egui::Ui, count: usize) {
+        let paths: Vec<PathBuf> = self
+            .browser
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| self.browser.selection.contains(*idx))
+            .map(|(_, entry)| entry.path.clone())
+            .collect();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!("Bulk edit — {count} selected"))
+                        .strong()
+                        .small(),
+                )
+                .selectable(false),
+            );
+            ui.weak(format!(
+                "{} total. Empty fields are left unchanged.",
+                human_size(self.selected_total_size())
+            ));
+            ui.separator();
+
+            for spec in metadata_edit::EDITABLE_FIELDS
+                .iter()
+                .filter(|spec| spec.bulk)
+            {
+                ui.add(egui::Label::new(
+                    egui::RichText::new(spec.label).weak().small(),
+                ));
+                let buffer = match spec.id.name {
+                    "ImageDescription" => &mut self.bulk_description,
+                    "Artist" => &mut self.bulk_artist,
+                    "Copyright" => &mut self.bulk_copyright,
+                    _ => continue,
+                };
+                if spec.multiline {
+                    ui.add(
+                        egui::TextEdit::multiline(buffer)
+                            .font(egui::TextStyle::Small)
+                            .desired_rows(2)
+                            .desired_width(f32::INFINITY),
+                    );
+                } else {
+                    ui.add(
+                        egui::TextEdit::singleline(buffer)
+                            .font(egui::TextStyle::Small)
+                            .desired_width(f32::INFINITY),
+                    );
+                }
+            }
+
+            let has_value = !self.bulk_description.trim().is_empty()
+                || !self.bulk_artist.trim().is_empty()
+                || !self.bulk_copyright.trim().is_empty();
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(has_value, egui::Button::new("Apply to selection").small())
+                    .clicked()
+                {
+                    let mut changes = Vec::new();
+                    for (name, value) in [
+                        ("ImageDescription", &self.bulk_description),
+                        ("Artist", &self.bulk_artist),
+                        ("Copyright", &self.bulk_copyright),
+                    ] {
+                        if !value.trim().is_empty() {
+                            changes.push(metadata_edit::FieldChange {
+                                id: metadata_edit::FieldId {
+                                    namespace: bc_metadata::NS_EXIF,
+                                    name,
+                                },
+                                value: value.clone(),
+                            });
+                        }
+                    }
+                    let report = metadata_edit::apply_changes(
+                        &paths,
+                        &changes,
+                        bc_metadata::WritePolicy::Auto,
+                    );
+                    self.status = format!(
+                        "Bulk metadata: {} saved, {} failed",
+                        report.succeeded,
+                        report.failures.len()
+                    );
+                    self.exif_cache.clear();
+                    self.metadata_form_path = None;
+                    self.bulk_report = Some(report);
+                }
+                if ui.add(egui::Button::new("Clear").small()).clicked() {
+                    self.bulk_description.clear();
+                    self.bulk_artist.clear();
+                    self.bulk_copyright.clear();
+                    self.bulk_report = None;
+                }
+            });
+
+            if let Some(report) = &self.bulk_report {
+                if report.failures.is_empty() {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!("{} file(s) saved.", report.succeeded))
+                                .small(),
+                        )
+                        .selectable(false),
+                    );
+                } else {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!(
+                                "{} saved, {} failed",
+                                report.succeeded,
+                                report.failures.len()
+                            ))
+                            .small()
+                            .color(ui.visuals().error_fg_color),
+                        )
+                        .selectable(false),
+                    );
+                    egui::CollapsingHeader::new("Failed files").show(ui, |ui| {
+                        for failure in &report.failures {
+                            ui.weak(format!("{}: {}", failure.path.display(), failure.error));
+                        }
+                    });
+                }
+            }
+
+            ui.separator();
+            for path in paths.iter().take(200) {
+                ui.weak(
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string()),
+                );
+            }
+        });
     }
 
     /// Preview-tier textures belong to the viewer and the metadata panel

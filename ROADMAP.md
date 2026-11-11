@@ -53,7 +53,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [x] Metadata panel: Camera Data (EXIF) section for the selected file — camera, taken, exposure, aperture, ISO, focal length, orientation, color space, software, EXIF size, GPS — above File Properties; cached per path + modified time
 - [~] Embedded metadata read/write: EXIF read (issue #5 model) and EXIF write for JPEG/TIFF (issue #7) landed; IPTC-IIM read/write for JPEG APP13 (issue #8); XMP sidecar read/write (issue #9); TIFF IPTC container and embedded XMP still pending
 - [x] XMP sidecar read/write (`.xmp` files) — `bc-metadata::xmp` (parse/serialize + atomic file I/O)
-- [ ] Metadata panel with editable fields
+- [x] Metadata panel with editable fields — grouped list, dirty tracking, Save/Revert via the #5 write policy (`bc-ui::metadata_edit`), multi-selection bulk editor with per-file failure reporting
 - [ ] Custom metadata templates
 - [x] Keyword hierarchy management & tagging (`bc-metadata::keywords`: dc:subject `Parent|Child` convention, tree/type-ahead/tag-count logic; UI panel deferred to #11)
 - [x] Star ratings, color labels, approve/reject flags (typed API in `bc-metadata::ratings`; UI editor deferred to #11)

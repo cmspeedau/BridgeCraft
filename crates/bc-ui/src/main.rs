@@ -1,6 +1,7 @@
 //! BridgeCraft — clean-room asset browser in Rust (egui/eframe frontend).
 
 mod app;
+mod metadata_edit;
 mod viewer;
 
 use std::path::{Path, PathBuf};
