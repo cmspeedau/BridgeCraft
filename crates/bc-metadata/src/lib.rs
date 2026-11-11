@@ -8,6 +8,7 @@
 //! Clean-room per CLEANROOM.md. See `docs/design/0005-structured-metadata-model.md`.
 
 pub mod exif;
+pub mod ratings;
 pub mod xmp;
 
 use serde::{Deserialize, Serialize};
@@ -22,6 +23,9 @@ use thiserror::Error;
 /// is namespace-agnostic (any string), so XMP readers use full URIs below.
 pub const NS_EXIF: &str = "exif";
 pub const NS_GPS: &str = "gps";
+
+/// BridgeCraft-namespaced XMP extension namespace (issue #10, approve/reject flags).
+pub const NS_BRIDGECRAFT: &str = "https://bridgecraft.app/xmp/1.0/";
 
 /// XMP / Dublin Core / Photoshop / TIFF / IPTC namespace URIs (ISO 16684-1).
 pub const NS_DC: &str = "http://purl.org/dc/elements/1.1/";

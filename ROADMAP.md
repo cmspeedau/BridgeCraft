@@ -56,7 +56,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [ ] Metadata panel with editable fields
 - [ ] Custom metadata templates
 - [ ] Keyword hierarchy management & tagging
-- [ ] Star ratings, color labels, approve/reject flags
+- [x] Star ratings, color labels, approve/reject flags (typed API in `bc-metadata::ratings`; UI editor deferred to #11)
 - [ ] Metadata-driven search & smart collections (query builder)
 
 ## Phase 4 — Batch Operations & Automation (Weeks 24–34)
