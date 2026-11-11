@@ -869,22 +869,22 @@ impl BridgeApp {
                             Self::prop_row(ui, "Camera", v);
                         }
                         if let Some(v) = meta
-                            .get("exif.DateTimeOriginal")
-                            .or_else(|| meta.get("exif.DateTime"))
+                            .text(bc_metadata::NS_EXIF, "DateTimeOriginal")
+                            .or_else(|| meta.text(bc_metadata::NS_EXIF, "DateTime"))
                         {
-                            Self::prop_row(ui, "Taken", v.clone());
+                            Self::prop_row(ui, "Taken", v.to_string());
                         }
-                        for (label, key) in [
-                            ("Exposure", "exif.ExposureTime"),
-                            ("Aperture", "exif.FNumber"),
-                            ("ISO", "exif.ISOSpeedRatings"),
-                            ("Focal Length", "exif.FocalLength"),
-                            ("Orientation", "exif.Orientation"),
-                            ("Color Space", "exif.ColorSpace"),
-                            ("Software", "exif.Software"),
+                        for (label, local) in [
+                            ("Exposure", "ExposureTime"),
+                            ("Aperture", "FNumber"),
+                            ("ISO", "ISOSpeedRatings"),
+                            ("Focal Length", "FocalLength"),
+                            ("Orientation", "Orientation"),
+                            ("Color Space", "ColorSpace"),
+                            ("Software", "Software"),
                         ] {
-                            if let Some(v) = meta.get(key) {
-                                Self::prop_row(ui, label, v.clone());
+                            if let Some(v) = meta.text(bc_metadata::NS_EXIF, local) {
+                                Self::prop_row(ui, label, v.to_string());
                             }
                         }
                         if let Some(v) = exif_image_size(meta) {
@@ -2174,32 +2174,35 @@ impl BridgeApp {
 /// Make + Model as one line; a Make duplicated as the Model's prefix is
 /// dropped so "Canon" + "Canon EOS-1D X" reads as just the model.
 fn format_camera(meta: &bc_metadata::Metadata) -> Option<String> {
-    match (meta.get("exif.Make"), meta.get("exif.Model")) {
-        (Some(make), Some(model)) => Some(if model.starts_with(make.as_str()) {
-            model.clone()
+    match (
+        meta.text(bc_metadata::NS_EXIF, "Make"),
+        meta.text(bc_metadata::NS_EXIF, "Model"),
+    ) {
+        (Some(make), Some(model)) => Some(if model.starts_with(make) {
+            model.to_string()
         } else {
             format!("{make} {model}")
         }),
-        (Some(make), None) => Some(make.clone()),
-        (None, Some(model)) => Some(model.clone()),
+        (Some(make), None) => Some(make.to_string()),
+        (None, Some(model)) => Some(model.to_string()),
         (None, None) => None,
     }
 }
 
 /// EXIF-reported pixel dimensions as one line.
 fn exif_image_size(meta: &bc_metadata::Metadata) -> Option<String> {
-    let width = meta.get("exif.PixelWidth")?;
-    let height = meta.get("exif.PixelHeight")?;
+    let width = meta.text(bc_metadata::NS_EXIF, "PixelWidth")?;
+    let height = meta.text(bc_metadata::NS_EXIF, "PixelHeight")?;
     Some(format!("{width} × {height}"))
 }
 
 /// GPS position (plus altitude when present) as one line; needs both
 /// latitude and longitude to be worth showing.
 fn exif_gps(meta: &bc_metadata::Metadata) -> Option<String> {
-    let lat = meta.get("gps.Latitude")?;
-    let lon = meta.get("gps.Longitude")?;
+    let lat = meta.text(bc_metadata::NS_GPS, "Latitude")?;
+    let lon = meta.text(bc_metadata::NS_GPS, "Longitude")?;
     let mut text = format!("{lat}, {lon}");
-    if let Some(alt) = meta.get("gps.Altitude") {
+    if let Some(alt) = meta.text(bc_metadata::NS_GPS, "Altitude") {
         text.push_str(&format!(" · {alt}"));
     }
     Some(text)
@@ -2424,10 +2427,17 @@ mod tests {
     }
 
     fn exif_fixture(pairs: &[(&str, &str)]) -> bc_metadata::Metadata {
-        pairs
-            .iter()
-            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-            .collect()
+        let mut m = bc_metadata::Metadata::new();
+        for (key, value) in pairs {
+            let (ns, name) = key.split_once('.').unwrap();
+            let ns = match ns {
+                "exif" => bc_metadata::NS_EXIF,
+                "gps" => bc_metadata::NS_GPS,
+                other => other,
+            };
+            m.set_text(ns, name, (*value).to_string());
+        }
+        m
     }
 
     #[test]

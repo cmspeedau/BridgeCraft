@@ -16,7 +16,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-use crate::{Metadata, MetadataError, Reader};
+use crate::{Metadata, MetadataError, Reader, NS_EXIF, NS_GPS};
 
 /// Upper bound on bytes [`read_exif_file`] buffers. EXIF structures live at
 /// the head of the file; tag payloads beyond the cap are skipped.
@@ -440,29 +440,29 @@ impl<'a> Tiff<'a> {
             match entry.tag {
                 TAG_MAKE => {
                     if let Some(v) = Self::ascii(entry) {
-                        self.out.insert("exif.Make".into(), v);
+                        self.out.set_text(NS_EXIF, "Make", v);
                     }
                 }
                 TAG_MODEL => {
                     if let Some(v) = Self::ascii(entry) {
-                        self.out.insert("exif.Model".into(), v);
+                        self.out.set_text(NS_EXIF, "Model", v);
                     }
                 }
                 TAG_SOFTWARE => {
                     if let Some(v) = Self::ascii(entry) {
-                        self.out.insert("exif.Software".into(), v);
+                        self.out.set_text(NS_EXIF, "Software", v);
                     }
                 }
                 TAG_DATE_TIME => {
                     if let Some(v) = Self::ascii(entry) {
                         self.out
-                            .insert("exif.DateTime".into(), normalize_exif_date(&v));
+                            .set_text(NS_EXIF, "DateTime", normalize_exif_date(&v));
                     }
                 }
                 TAG_ORIENTATION => {
                     if let Some(&n) = self.shorts(entry).first() {
                         self.out
-                            .insert("exif.Orientation".into(), orientation_text(n));
+                            .set_text(NS_EXIF, "Orientation", orientation_text(n));
                     }
                 }
                 _ => {}
@@ -482,7 +482,9 @@ impl<'a> Tiff<'a> {
                 _ => continue,
             };
             if let Some(&n) = self.longs(entry).first() {
-                self.out.insert(key.to_string(), n.to_string());
+                // key is "exif.<Field>"
+                let field = key.strip_prefix("exif.").unwrap_or(key);
+                self.out.set_text(NS_EXIF, field, n.to_string());
             }
         }
     }
@@ -493,13 +495,14 @@ impl<'a> Tiff<'a> {
                 TAG_EXPOSURE_TIME => {
                     if let Some(&(n, d)) = self.rationals(entry).first() {
                         self.out
-                            .insert("exif.ExposureTime".into(), format_exposure(n, d));
+                            .set_text(NS_EXIF, "ExposureTime", format_exposure(n, d));
                     }
                 }
                 TAG_FNUMBER => {
                     if let Some(&(n, d)) = self.rationals(entry).first() {
-                        self.out.insert(
-                            "exif.FNumber".into(),
+                        self.out.set_text(
+                            NS_EXIF,
+                            "FNumber",
                             format!("f/{:.1}", n as f64 / d as f64),
                         );
                     }
@@ -507,8 +510,9 @@ impl<'a> Tiff<'a> {
                 TAG_ISO => {
                     let values = self.shorts(entry);
                     if !values.is_empty() {
-                        self.out.insert(
-                            "exif.ISOSpeedRatings".into(),
+                        self.out.set_text(
+                            NS_EXIF,
+                            "ISOSpeedRatings",
                             values
                                 .iter()
                                 .map(u16::to_string)
@@ -520,13 +524,14 @@ impl<'a> Tiff<'a> {
                 TAG_DATE_TIME_ORIGINAL => {
                     if let Some(v) = Self::ascii(entry) {
                         self.out
-                            .insert("exif.DateTimeOriginal".into(), normalize_exif_date(&v));
+                            .set_text(NS_EXIF, "DateTimeOriginal", normalize_exif_date(&v));
                     }
                 }
                 TAG_FOCAL_LENGTH => {
                     if let Some(&(n, d)) = self.rationals(entry).first() {
-                        self.out.insert(
-                            "exif.FocalLength".into(),
+                        self.out.set_text(
+                            NS_EXIF,
+                            "FocalLength",
                             format!("{:.1} mm", n as f64 / d as f64),
                         );
                     }
@@ -534,17 +539,17 @@ impl<'a> Tiff<'a> {
                 TAG_COLOR_SPACE => {
                     if let Some(&n) = self.shorts(entry).first() {
                         self.out
-                            .insert("exif.ColorSpace".into(), color_space_text(n));
+                            .set_text(NS_EXIF, "ColorSpace", color_space_text(n));
                     }
                 }
                 TAG_PIXEL_X => {
                     if let Some(&n) = self.longs(entry).first() {
-                        self.out.insert("exif.PixelWidth".into(), n.to_string());
+                        self.out.set_text(NS_EXIF, "PixelWidth", n.to_string());
                     }
                 }
                 TAG_PIXEL_Y => {
                     if let Some(&n) = self.longs(entry).first() {
-                        self.out.insert("exif.PixelHeight".into(), n.to_string());
+                        self.out.set_text(NS_EXIF, "PixelHeight", n.to_string());
                     }
                 }
                 _ => {}
@@ -577,17 +582,16 @@ impl<'a> Tiff<'a> {
             }
         }
         if let (Some(v), Some(r)) = (lat, lat_ref) {
-            self.out
-                .insert("gps.Latitude".into(), format!("{v:.5} {r}"));
+            self.out.set_text(NS_GPS, "Latitude", format!("{v:.5} {r}"));
         }
         if let (Some(v), Some(r)) = (lon, lon_ref) {
             self.out
-                .insert("gps.Longitude".into(), format!("{v:.5} {r}"));
+                .set_text(NS_GPS, "Longitude", format!("{v:.5} {r}"));
         }
         if let Some(v) = alt {
             let sign = if alt_ref == 1 { "-" } else { "" };
             self.out
-                .insert("gps.Altitude".into(), format!("{sign}{v:.1} m"));
+                .set_text(NS_GPS, "Altitude", format!("{sign}{v:.1} m"));
         }
     }
 }
@@ -635,7 +639,7 @@ fn orientation_text(n: u16) -> String {
 /// module writes, for consumers that need the number rather than the label
 /// (the export pipeline bakes the rotation into pixel data).
 pub fn orientation_code(meta: &crate::Metadata) -> Option<u16> {
-    let text = meta.get("exif.Orientation")?;
+    let text = meta.text(crate::NS_EXIF, "Orientation")?;
     let code: u16 = text.strip_suffix(')')?.rsplit_once('(')?.1.parse().ok()?;
     (1..=8).contains(&code).then_some(code)
 }
@@ -854,70 +858,31 @@ mod tests {
     fn reads_a_hand_built_little_endian_tiff() {
         let file = layout_and_parse(true);
         let meta = read_exif(&file).unwrap();
+        assert_eq!(meta.text(NS_EXIF, "Make"), Some("Bridge Test Cam"));
+        assert_eq!(meta.text(NS_EXIF, "Model"), Some("BTC Z1"));
+        assert_eq!(meta.text(NS_EXIF, "Orientation"), Some("Rotate 90 CW (6)"));
+        assert_eq!(meta.text(NS_EXIF, "ExposureTime"), Some("1/400 s"));
+        assert_eq!(meta.text(NS_EXIF, "FNumber"), Some("f/7.1"));
+        assert_eq!(meta.text(NS_EXIF, "ISOSpeedRatings"), Some("2000"));
         assert_eq!(
-            meta.get("exif.Make").map(String::as_str),
-            Some("Bridge Test Cam")
-        );
-        assert_eq!(meta.get("exif.Model").map(String::as_str), Some("BTC Z1"));
-        assert_eq!(
-            meta.get("exif.Orientation").map(String::as_str),
-            Some("Rotate 90 CW (6)")
-        );
-        assert_eq!(
-            meta.get("exif.ExposureTime").map(String::as_str),
-            Some("1/400 s")
-        );
-        assert_eq!(meta.get("exif.FNumber").map(String::as_str), Some("f/7.1"));
-        assert_eq!(
-            meta.get("exif.ISOSpeedRatings").map(String::as_str),
-            Some("2000")
-        );
-        assert_eq!(
-            meta.get("exif.DateTimeOriginal").map(String::as_str),
+            meta.text(NS_EXIF, "DateTimeOriginal"),
             Some("2014-10-18 12:23:43")
         );
-        assert_eq!(
-            meta.get("exif.PixelWidth").map(String::as_str),
-            Some("5184")
-        );
-        assert_eq!(
-            meta.get("exif.ColorSpace").map(String::as_str),
-            Some("sRGB")
-        );
-        assert_eq!(
-            meta.get("exif.ThumbnailWidth").map(String::as_str),
-            Some("320")
-        );
-        assert_eq!(
-            meta.get("exif.ThumbnailOffset").map(String::as_str),
-            Some("4096")
-        );
-        assert_eq!(
-            meta.get("gps.Latitude").map(String::as_str),
-            Some("47.60621 N")
-        );
-        assert_eq!(
-            meta.get("gps.Longitude").map(String::as_str),
-            Some("122.32000 W")
-        );
+        assert_eq!(meta.text(NS_EXIF, "PixelWidth"), Some("5184"));
+        assert_eq!(meta.text(NS_EXIF, "ColorSpace"), Some("sRGB"));
+        assert_eq!(meta.text(NS_EXIF, "ThumbnailWidth"), Some("320"));
+        assert_eq!(meta.text(NS_EXIF, "ThumbnailOffset"), Some("4096"));
+        assert_eq!(meta.text(NS_GPS, "Latitude"), Some("47.60621 N"));
+        assert_eq!(meta.text(NS_GPS, "Longitude"), Some("122.32000 W"));
     }
 
     #[test]
     fn reads_big_endian_tiff() {
         let file = layout_and_parse(false);
         let meta = read_exif(&file).unwrap();
-        assert_eq!(
-            meta.get("exif.Make").map(String::as_str),
-            Some("Bridge Test Cam")
-        );
-        assert_eq!(
-            meta.get("exif.DateTime").map(String::as_str),
-            Some("2014-10-18 12:20:00")
-        );
-        assert_eq!(
-            meta.get("exif.FocalLength").map(String::as_str),
-            Some("105.0 mm")
-        );
+        assert_eq!(meta.text(NS_EXIF, "Make"), Some("Bridge Test Cam"));
+        assert_eq!(meta.text(NS_EXIF, "DateTime"), Some("2014-10-18 12:20:00"));
+        assert_eq!(meta.text(NS_EXIF, "FocalLength"), Some("105.0 mm"));
     }
 
     #[test]
@@ -932,7 +897,7 @@ mod tests {
         jpeg.extend(&tiff);
         jpeg.extend([0xFF, 0xD9]); // EOI
         let meta = read_exif(&jpeg).unwrap();
-        assert_eq!(meta.get("exif.Model").map(String::as_str), Some("BTC Z1"));
+        assert_eq!(meta.text(NS_EXIF, "Model"), Some("BTC Z1"));
     }
 
     #[test]
@@ -944,14 +909,18 @@ mod tests {
     #[test]
     fn orientation_code_extracts_the_numeric_code() {
         let mut meta = crate::Metadata::new();
-        meta.insert("exif.Orientation".into(), "Rotate 90 CW (6)".into());
+        meta.set_text(
+            crate::NS_EXIF,
+            "Orientation",
+            "Rotate 90 CW (6)".to_string(),
+        );
         assert_eq!(orientation_code(&meta), Some(6));
-        meta.insert("exif.Orientation".into(), "Normal (1)".into());
+        meta.set_text(crate::NS_EXIF, "Orientation", "Normal (1)".to_string());
         assert_eq!(orientation_code(&meta), Some(1));
         // Out-of-range codes and malformed text yield no code, never a panic.
-        meta.insert("exif.Orientation".into(), "Unknown (42)".into());
+        meta.set_text(crate::NS_EXIF, "Orientation", "Unknown (42)".to_string());
         assert_eq!(orientation_code(&meta), None);
-        meta.insert("exif.Orientation".into(), "garbage".into());
+        meta.set_text(crate::NS_EXIF, "Orientation", "garbage".to_string());
         assert_eq!(orientation_code(&meta), None);
         assert_eq!(orientation_code(&crate::Metadata::new()), None);
     }
@@ -1018,8 +987,10 @@ mod tests {
         let path = Path::new(&sample);
         let meta = read_exif_file(path).expect("camera RAW must expose EXIF");
         assert!(
-            meta.iter()
-                .any(|(k, _)| k == "exif.Make" || k == "exif.Model"),
+            meta.properties().iter().any(|(k, _)| {
+                (k.namespace == crate::NS_EXIF && k.name == "Make")
+                    || (k.namespace == crate::NS_EXIF && k.name == "Model")
+            }),
             "expected camera make/model EXIF in {}: {meta:?}",
             path.display()
         );
