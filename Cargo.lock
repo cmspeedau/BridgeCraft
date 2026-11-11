@@ -497,6 +497,7 @@ dependencies = [
  "eframe",
  "egui",
  "image",
+ "serde_json",
  "tempfile",
  "tracing",
  "tracing-subscriber",

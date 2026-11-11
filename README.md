@@ -24,7 +24,7 @@ A clean-room, from-scratch asset browser inspired by the workflows of classic di
 |---|---|
 | **Browse** | Folder navigation with breadcrumb chips, favorites sidebar (persistent), folders tree, recent folders, filter-as-you-type, sort by name/size/date |
 | **Views** | Thumbnail grid with zoom slider, list, and details table; "thumbnails only" mode |
-| **Select** | Click / ctrl-toggle / shift-range / select-all; right-click menu with copy, move, rename, trash & restore, permanent-delete confirm |
+| **Select** | Click / ctrl-toggle / shift-range / select-all; right-click menu with copy, move, single-file rename, token-based batch rename with preview/apply and undo, trash & restore, permanent-delete confirm |
 | **Previews** | Instant 256 px thumbnails; click any file for a live 2048 px preview in the side panel; double-click for the full zoom viewer (100% = on-demand native decode) |
 | **Metadata** | Metadata panel for the selected file — editable description, artist, copyright, make, model, software and date taken (saved in place for JPEG/TIFF, XMP sidecar for RAW), plus read-only camera/exposure/GPS fields (JPEG, TIFF/DNG, both byte orders) |
 | **Formats** | PNG, JPEG, TIFF, GIF, WebP, BMP, PSD (embedded previews), PDF-compatible AI — always; video, PDF, camera RAW when a local decoder is present (see below) |

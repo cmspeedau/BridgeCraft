@@ -1,6 +1,7 @@
 //! BridgeCraft — clean-room asset browser in Rust (egui/eframe frontend).
 
 mod app;
+mod batch_rename_ui;
 mod metadata_edit;
 mod viewer;
 

@@ -25,6 +25,7 @@ use bc_core::watcher::Watcher;
 use bc_thumbnails::{CacheStore, Thumbnail};
 use eframe::egui;
 
+use crate::batch_rename_ui;
 use crate::metadata_edit::{self, BulkReport, MetadataForm};
 use crate::viewer::{self, ViewerState, ZoomMode, FULL_EDGE, PREVIEW_EDGE};
 
@@ -225,6 +226,8 @@ pub struct BridgeApp {
     /// Open-folder path field (toggled by the Open button / Ctrl+O).
     open_field: bool,
     trash_window: bool,
+    /// Pattern preview/apply dialog for batch rename.
+    rename_dialog: Option<batch_rename_ui::RenameDialog>,
     /// Header-only dimensions, cached per path for the Metadata panel.
     dims_cache: HashMap<PathBuf, Option<(u32, u32)>>,
     /// EXIF fields cached per path, keyed with the mtime they were read at
@@ -298,6 +301,7 @@ impl BridgeApp {
             thumbs_only: false,
             open_field: false,
             trash_window: false,
+            rename_dialog: None,
             dims_cache: HashMap::new(),
             exif_cache: HashMap::new(),
             metadata_form: MetadataForm::default(),
@@ -1839,6 +1843,40 @@ impl BridgeApp {
                 ui.close_menu();
             }
         });
+        if !paths.is_empty() && ui.button("Batch rename…").clicked() {
+            self.rename_dialog = Some(batch_rename_ui::RenameDialog::new(paths.clone()));
+            ui.close_menu();
+        }
+        if let Ok(journal) = batch_rename_ui::journal_path() {
+            let can_undo = journal.exists()
+                && paths.iter().any(|selected| {
+                    let Ok(contents) = std::fs::read_to_string(&journal) else {
+                        return false;
+                    };
+                    let Ok(record) =
+                        serde_json::from_str::<bc_core::batch_rename::UndoJournal>(&contents)
+                    else {
+                        return false;
+                    };
+                    record
+                        .operations
+                        .iter()
+                        .any(|op| selected == Path::new(&op.from) || selected == Path::new(&op.to))
+                });
+            if ui
+                .add_enabled(can_undo, egui::Button::new("Undo last batch rename"))
+                .clicked()
+            {
+                match bc_core::batch_rename::undo(&journal) {
+                    Ok(count) => {
+                        self.status = format!("Restored {count} item(s) from the last rename.");
+                        self.refresh_now();
+                    }
+                    Err(error) => self.status = format!("Rename undo failed: {error}"),
+                }
+                ui.close_menu();
+            }
+        }
         if paths.len() == 1 {
             ui.horizontal(|ui| {
                 ui.label("Rename:");
@@ -2058,6 +2096,101 @@ impl BridgeApp {
             }
         } else if open && !dismissed {
             self.export_dialog = Some(dialog);
+        }
+    }
+
+    /// Preview, validate and apply a token-based rename batch. The dialog
+    /// keeps preview and apply separate so a malformed/colliding plan cannot
+    /// change the filesystem.
+    fn rename_window(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.rename_dialog.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut dismissed = false;
+        let mut apply = false;
+        egui::Window::new("Batch rename")
+            .default_size([620.0, 460.0])
+            .collapsible(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(format!("Rename {} selected item(s) with a pattern:", dialog.sources.len()));
+                let response = ui.add_sized(
+                    [ui.available_width(), 24.0],
+                    egui::TextEdit::singleline(&mut dialog.pattern)
+                        .hint_text("e.g. {date:%Y-%m-%d}_{name}_{seq:0>3}"),
+                );
+                if response.changed() {
+                    dialog.rebuild_preview();
+                }
+                ui.weak("Tokens: {name}, {name:upper}, {name:lower}, {name:title}, {ext}, {date:%Y-%m-%d}, {seq:WIDTH} or {seq:START>WIDTH}, {keyword#N}. The original extension is kept automatically unless {ext} is used.");
+                ui.separator();
+
+                match &dialog.preview {
+                    Ok(plan) => {
+                        ui.horizontal(|ui| {
+                            ui.strong(format!("Preview · {} item(s)", plan.len()));
+                            let changed = plan.iter().filter(|item| item.source != item.target).count();
+                            ui.weak(format!("{changed} rename(s)"));
+                        });
+                        egui::ScrollArea::vertical().max_height(270.0).show(ui, |ui| {
+                            for item in plan {
+                                ui.horizontal(|ui| {
+                                    ui.label(batch_rename_ui::display_name(&item.source));
+                                    ui.weak("→");
+                                    ui.strong(batch_rename_ui::display_name(&item.target));
+                                });
+                            }
+                        });
+                        if plan.is_empty() {
+                            ui.weak("Select one or more files to preview a rename.");
+                        }
+                    }
+                    Err(error) => {
+                        ui.colored_label(ui.visuals().error_fg_color, format!("Cannot preview: {error}"));
+                    }
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let can_apply = matches!(&dialog.preview, Ok(plan) if !plan.is_empty());
+                    if ui.add_enabled(can_apply, egui::Button::new("Apply rename batch")).clicked() {
+                        apply = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        dismissed = true;
+                    }
+                });
+            });
+
+        if apply {
+            // Re-run the planner immediately before touching disk to catch a
+            // destination created while the user was reviewing the preview.
+            dialog.rebuild_preview();
+            let result = dialog
+                .preview
+                .as_ref()
+                .map_err(Clone::clone)
+                .and_then(|plan| {
+                    let journal = batch_rename_ui::journal_path()?;
+                    bc_core::batch_rename::apply(plan, &journal).map_err(|error| error.to_string())
+                });
+            match result {
+                Ok(count) => {
+                    self.status = format!(
+                        "Renamed {count} item(s). Undo is available from the selection menu."
+                    );
+                    self.rename_dialog = None;
+                    self.refresh_now();
+                }
+                Err(error) => {
+                    self.status = format!("Batch rename failed: {error}");
+                    if open && !dismissed {
+                        self.rename_dialog = Some(dialog);
+                    }
+                }
+            }
+        } else if open && !dismissed {
+            self.rename_dialog = Some(dialog);
         }
     }
 
@@ -2600,6 +2733,7 @@ impl eframe::App for BridgeApp {
 
         self.trash_window(ctx);
         self.confirm_delete_window(ctx);
+        self.rename_window(ctx);
         self.export_window(ctx);
         self.jobs_window(ctx);
     }
