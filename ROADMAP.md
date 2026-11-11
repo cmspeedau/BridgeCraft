@@ -60,7 +60,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [ ] Metadata-driven search & smart collections (query builder)
 
 ## Phase 4 — Batch Operations & Automation (Weeks 24–34)
-- [ ] Batch rename (token-based patterns)
+- [~] Batch rename (token-based patterns) — engine in `bc-core::batch_rename` (parser, planner with collision checks, journaled apply/undo); preview-and-apply UI deferred
 - [x] Batch resize/convert/export (issue #15: queued `bc-core` export pipeline + jobs UI; JPEG/PNG/WebP, orientation applied, metadata copy deferred to the Phase 3 writers)
 - [ ] Contact sheet / PDF contact sheet output
 - [ ] Watched-folder auto-processing

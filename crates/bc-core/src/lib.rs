@@ -1,5 +1,6 @@
 //! bc-core: filesystem scanning, watchers, selection model, and app state.
 
+pub mod batch_rename;
 pub mod browser;
 pub mod entry;
 pub mod export;
