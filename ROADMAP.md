@@ -30,7 +30,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [~] Virtual folder tree with favorites, recent folders, shared collections — favorites & recents shipped with the shell above; shared collections remain pending
 - [x] List & details view modes (Bridge parity: Thumbnails / List / Details; Filmstrip remains future work)
 - [x] Copy / move / rename / delete (with recents/bin) — core operations implemented; persistent recents are bounded, managed trash supports move/list/restore, and permanent delete is separate; browser/UI integration complete (file operations, recents, and trash/restore)
-- [~] Drag & drop (internal reordering + OS interop) — transfer helpers and tests landed; full GUI wiring pending
+- [ ] Drag & drop (internal reordering + OS interop)
 - [x] **Phase 1 fix-up:** list/details views
 
 ## Phase 2 — Thumbnails & Previews (Weeks 9–20) — ✅ COMPLETE
@@ -54,7 +54,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [~] Embedded metadata read/write: EXIF read (issue #5 model) and EXIF write for JPEG/TIFF (issue #7) landed; IPTC-IIM read/write for JPEG APP13 (issue #8); XMP sidecar read/write (issue #9); TIFF IPTC container and embedded XMP still pending
 - [x] XMP sidecar read/write (`.xmp` files) — `bc-metadata::xmp` (parse/serialize + atomic file I/O)
 - [x] Metadata panel with editable fields — grouped list, dirty tracking, Save/Revert via the #5 write policy (`bc-ui::metadata_edit`), multi-selection bulk editor with per-file failure reporting
-- [x] Custom metadata templates
+- [ ] Custom metadata templates
 - [x] Keyword hierarchy management & tagging (`bc-metadata::keywords`: dc:subject `Parent|Child` convention, tree/type-ahead/tag-count logic; UI panel deferred to #11)
 - [x] Star ratings, color labels, approve/reject flags (typed API in `bc-metadata::ratings`; UI editor deferred to #11)
 - [x] Metadata-driven search & smart collections (query builder)
@@ -64,7 +64,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [x] Batch resize/convert/export (issue #15: queued `bc-core` export pipeline + jobs UI; JPEG/PNG/WebP, orientation applied, metadata copy deferred to the Phase 3 writers)
 - [x] Contact sheet / PDF contact sheet output
 - [x] Watched-folder auto-processing — persisted rules, settle gate, bounded worker queue, preferences/history UI and docs landed; metadata-index action now available via the search index
-- [x] Scripting/automation API (Lua or WASM plugins) — embedded Lua host with sandbox, timeout, capability table, and tests
+- [~] Scripting/automation API (Lua or WASM plugins) — RFC posted (`docs/design/scripting-rfc.md`), engine decision (Lua) awaiting/recorded sign-off; implementation pending
 
 ## Phase 5 — Integrations & Plugin Ecosystem (clean-room equivalents) (Weeks 30–40)
 - [ ] Export/publish pipelines (replaces CC Libraries)
