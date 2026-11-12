@@ -30,7 +30,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [~] Virtual folder tree with favorites, recent folders, shared collections — favorites & recents shipped with the shell above; shared collections remain pending
 - [x] List & details view modes (Bridge parity: Thumbnails / List / Details; Filmstrip remains future work)
 - [x] Copy / move / rename / delete (with recents/bin) — core operations implemented; persistent recents are bounded, managed trash supports move/list/restore, and permanent delete is separate; browser/UI integration complete (file operations, recents, and trash/restore)
-- [ ] Drag & drop (internal reordering + OS interop)
+- [~] Drag & drop (internal reordering + OS interop) — transfer helpers and tests landed; full GUI wiring pending
 - [x] **Phase 1 fix-up:** list/details views
 
 ## Phase 2 — Thumbnails & Previews (Weeks 9–20) — ✅ COMPLETE

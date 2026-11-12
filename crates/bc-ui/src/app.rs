@@ -17,7 +17,9 @@ use bc_core::auto_process::{AutoAction, AutoProcessor, AutoRule};
 use bc_core::browser::BrowserState;
 use bc_core::export::{ExportFormat, ExportQueue, ExportRequest};
 use bc_core::favorites::Favorites;
-use bc_core::file_ops::{copy_path, delete_path, move_path, rename_path};
+use bc_core::file_ops::{
+    copy_path, delete_path, move_path, rename_path, transfer_into_folder, TransferMode,
+};
 use bc_core::fs::{SortDir, SortKey};
 use bc_core::recents::Recents;
 use bc_core::selection::Selection;
@@ -2859,6 +2861,47 @@ fn exif_gps(meta: &bc_metadata::Metadata) -> Option<String> {
     Some(text)
 }
 
+/// Transfer mode for a drop: hold Alt to copy, otherwise move.
+#[allow(dead_code)]
+fn drop_mode(alt_down: bool) -> TransferMode {
+    if alt_down {
+        TransferMode::Copy
+    } else {
+        TransferMode::Move
+    }
+}
+
+/// Apply a drag-and-drop transfer via `bc-core` and render the outcome as a
+/// status line.
+#[allow(dead_code)]
+fn apply_transfer(sources: &[PathBuf], destination: &Path, mode: TransferMode) -> String {
+    let verb = match mode {
+        TransferMode::Move => "Moved",
+        TransferMode::Copy => "Copied",
+    };
+    match transfer_into_folder(sources, destination, mode) {
+        Ok(report) => {
+            let mut status = format!(
+                "{verb} {} item(s) into {}",
+                report.transferred,
+                destination.display()
+            );
+            if report.skipped > 0 {
+                status += &format!(", skipped {} already in destination", report.skipped);
+            }
+            if let Some((path, error)) = report.errors.first() {
+                status += &format!(
+                    "; {} failed, first: {}: {error}",
+                    report.errors.len(),
+                    path.display()
+                );
+            }
+            status
+        }
+        Err(error) => format!("Drop rejected: {error}"),
+    }
+}
+
 fn human_size(size: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut v = size as f64;
@@ -3133,5 +3176,73 @@ mod tests {
             exif_image_size(&exif_fixture(&[("exif.PixelWidth", "5184")])).as_deref(),
             None
         );
+    }
+
+    fn touch(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, b"payload").unwrap();
+        path
+    }
+
+    #[test]
+    fn drop_mode_maps_alt_to_copy() {
+        assert_eq!(drop_mode(false), TransferMode::Move);
+        assert_eq!(drop_mode(true), TransferMode::Copy);
+    }
+
+    #[test]
+    fn move_drop_relocates_and_copy_drop_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = touch(dir.path(), "a.txt");
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+
+        let status = apply_transfer(std::slice::from_ref(&source), &target, TransferMode::Move);
+        assert!(status.starts_with("Moved 1 item(s)"), "{status}");
+        assert!(!source.exists());
+        assert!(target.join("a.txt").exists());
+
+        let status = apply_transfer(&[target.join("a.txt")], dir.path(), TransferMode::Copy);
+        assert!(status.starts_with("Copied 1 item(s)"), "{status}");
+        assert!(dir.path().join("a.txt").exists());
+        assert!(target.join("a.txt").exists());
+    }
+
+    #[test]
+    fn move_drop_into_same_folder_skips() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = touch(dir.path(), "a.txt");
+
+        let status = apply_transfer(
+            std::slice::from_ref(&source),
+            dir.path(),
+            TransferMode::Move,
+        );
+        assert!(status.contains("skipped 1"), "{status}");
+        assert!(source.exists());
+    }
+
+    #[test]
+    fn copy_collision_is_reported_and_leaves_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = touch(dir.path(), "a.txt");
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        touch(&target, "a.txt");
+
+        let status = apply_transfer(std::slice::from_ref(&source), &target, TransferMode::Copy);
+        assert!(status.contains("1 failed"), "{status}");
+        assert!(source.exists());
+    }
+
+    #[test]
+    fn folder_drop_into_itself_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+
+        let status = apply_transfer(std::slice::from_ref(&sub), &sub, TransferMode::Move);
+        assert!(status.starts_with("Drop rejected"), "{status}");
+        assert!(sub.exists());
     }
 }
