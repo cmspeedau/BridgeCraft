@@ -71,13 +71,13 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [x] Version control / version stacks for assets
 - [ ] Migration importer (reads existing Bridge caches read-only where formats are documented)
 - [ ] **Apple Photos support**: read-only integration with the macOS Photos library
-  - [~] Locate and open the user's `Photos.sqlite` library (read-only; never write to it) via `photoslibrary`-style access on macOS (locator + read-only open + synthetic-DB tests; macOS validation pending)
+  - [ ] Locate and open the user's `Photos.sqlite` library (read-only; never write to it) via `photoslibrary`-style access on macOS
   - [~] Enumerate moments/albums as virtual folders in the browser tree; surface originals + edits as entries (virtual-folder abstraction landed; Apple Photos adapter pending)
   - [ ] Extract assets (originals and current renditions) into the thumbnail pipeline and preview viewer; iCloud-shared (`cloudPlaceholder`) items show a downloaded-on-demand state
   - [ ] Metadata mapping: Photos keywords/albums/favorites → bc-metadata tags (Phase 3 alignment)
   - [ ] Platform gate: macOS-only feature, compiled out elsewhere; user must grant disk access
   - *Clean-room note: spec from public Photos library schema documentation and observed behavior only; no Apple code.*
-- [ ] **Plugin system for BridgeCraft** (successor to the Phase 4 scripting API; Bridges-style extension model)
+- [~] **Plugin system for BridgeCraft** (manifest discovery, capabilities, permissions, host API surface; WASM runtime pending) (successor to the Phase 4 scripting API; Bridges-style extension model)
   - [ ] Plugin manifest + loader: local plugins discovered from a plugins directory; manifest declares name, version, entry points, and capabilities (menu items, panel, context-menu hooks)
   - [ ] Plugin API surface (Rust trait + WASM host boundary): access to browser selection, current folder, thumbnails, metadata read, and file operations through a permissioned host API
   - [ ] Sandboxing: WASM plugins run isolated with explicit capabilities (fs paths, network off by default); native plugins out of scope for v1

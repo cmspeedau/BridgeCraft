@@ -1,15 +1,15 @@
 //! bc-core: filesystem scanning, watchers, selection model, and app state.
 
-pub mod apple_photos;
 pub mod auto_process;
-pub use apple_photos::*;
 pub mod contact_sheet;
 pub mod metadata_index;
+pub mod plugins;
 pub mod publish;
 pub use metadata_index as search;
 pub use metadata_index as metadata_search;
 pub use metadata_index as index;
 pub use metadata_index::*;
+pub use plugins::*;
 pub mod batch_rename;
 pub mod browser;
 pub mod entry;
