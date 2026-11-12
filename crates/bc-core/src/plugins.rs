@@ -27,21 +27,12 @@ pub enum Capability {
     Network,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PluginPermissions {
     #[serde(default)]
     pub filesystem_paths: Vec<PathBuf>,
     #[serde(default)]
     pub network: bool,
-}
-
-impl Default for PluginPermissions {
-    fn default() -> Self {
-        Self {
-            filesystem_paths: Vec::new(),
-            network: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
