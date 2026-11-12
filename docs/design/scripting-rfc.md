@@ -1,68 +1,56 @@
-# RFC: Scripting / Automation API Engine Choice (issue #18)
-
-## Summary
-
-Propose **embedded Lua (`mlua`)** as the first scripting engine for BridgeCraft
-automation. WASM remains a future option for packaged plugins, but Lua ships
-first because it matches the "quick scripts in a folder" workflow and keeps the
-host API surface small and auditable.
-
-## Options considered
-
-### Option A — embedded Lua (`mlua`, MIT/Apache-2.0)
-
-- Tiny startup cost; scripts are plain text files in `<config>/scripts/`.
-- Trivial sandbox: deny `os`/`io`/`debug`/`package`, expose only capability
-  APIs. Sandboxing is a policy decision, not a runtime boundary, which keeps
-  it understandable.
-- Copy-paste friendly for power users; no toolchain required.
-- Weakness: no hard memory cap by default; mitigated with instruction-count
-  hooks and wall-clock timeouts.
-
-### Option B — WASM (`wasmtime`/Extism, MIT/Apache-2.0)
-
-- Hard resource limits and capability-based host functions by construction.
-- Any source language.
-- Weakness: users need a toolchain to author scripts; heavier first-run cost;
-  larger dependency surface to vet.
-
-### Option C — both
-
-Likely end state, but not the start: doubling the engine doubles the
-sandboxing and host-API maintenance burden before we have a single user.
+# Scripting / Automation API (issue #18)
 
 ## Decision
 
-**Lua first.** Revisit WASM once the plugin system (roadmap Phase 5) needs a
-packaged, distributable boundary; the host API sketched below is engine-neutral
-so a later WASM host can reuse it.
+BridgeCraft uses **WebAssembly (WASM)** for automation scripts and plugins. The
+`wasmi` interpreter already used by the plugin host is also the scripting
+runtime, avoiding a second execution engine and keeping one auditable sandbox
+and host ABI. Native plugins, WASI, ambient filesystem access, and ambient
+network access are not part of v1.
 
-## Host API surface (sketched)
+Scripts are discovered from `<config>/scripts/` as local plugin-style
+subdirectories. Each script directory contains `plugin.json` and its declared
+WASM module. The manifest declares requested capabilities and explicit
+filesystem roots. User grants are persisted separately, default to denied,
+and cannot exceed what the manifest requests.
 
-All access goes through capability functions; no ambient filesystem:
+## Host API
 
-- `bc.selection()` — list of selected paths.
-- `bc.current_folder()` — browsed root.
-- `bc.metadata(path)` / `bc.set_metadata(path, table)` — via `bc-metadata`.
-- `bc.rename_plan(pattern, paths)` / `bc.rename_apply(plan)` — via `bc-core`
-  rename engine, journaled for undo.
-- `bc.export_job(request)` — submit to the bounded export queue.
-- `bc.smart_collection_predicate(fn)` — register a predicate over indexed
-  metadata (issue #13).
-- `bc.log(...)` / `bc.notify(...)` — surface results in the script results
-  list view.
+WASM guests import only explicitly implemented functions from the
+`bridgecraft` module. All functions enforce granted capabilities and relevant
+filesystem roots before calling the native host:
 
-## Sandbox & limits
+- `selection_count` / `selection_path` — selection access, gated by
+  `selection_read`.
+- `current_folder` — browsed folder, gated by `current_folder_read`.
+- `metadata_read` — serialized metadata, gated by `metadata_read` and an
+  explicit filesystem-root grant.
+- `thumbnail_read` — thumbnail bytes, gated by `thumbnail_read` and an
+  explicit filesystem-root grant.
+- `file_rename`, `file_copy`, and `file_move` — file operations, gated by
+  `file_ops` and explicit grants for source and destination paths.
+- `log` — append bounded UTF-8 output to the invocation result.
 
-- No globals beyond the `bc` table; `os`, `io`, `debug`, `package`,
-  `require` (except a vetted `bc` module) are removed.
-- Wall-clock timeout (default 5 s) and instruction-count cap per invocation.
-- Scripts live in `<config>/scripts/`; no path outside capability APIs.
-- Errors are collected per script and shown in a list view with per-script
-  results; a failing script never aborts the host.
+Network may be declared in the manifest for forward compatibility, but no
+network host function is currently linked. A network grant does not create
+network access.
 
-## Follow-up issues
+## Sandbox and limits
 
-- Implementation: script host on a background thread, script discovery,
-  results view.
-- Later: WASM host reusing the same capability API for packaged plugins.
+- `wasmi` executes modules without WASI or ambient imports.
+- WASM fuel is the deterministic execution bound; linear memory and module
+  sizes are capped. Elapsed-time checks are diagnostic and are not represented
+  as an interruptible hard timeout.
+- Scripts and plugins have isolated persisted enablement and grants.
+- Invalid manifests, modules, and guest traps are surfaced per invocation;
+  failures in `run_all` do not stop other scripts.
+- Scripts run only after explicit discovery and must resolve to a discovered
+  module beneath the scripts directory.
+
+## Current scope and follow-ups
+
+The script host exposes discovery, execution, per-script results, persistent
+enablement/grants, and the same permissioned native host interface as plugins.
+The UI results view and a script authoring/toolchain workflow remain follow-up
+work. Plugin panels are declared but not rendered in v1. API imports and guest
+memory buffers are versioned by the plugin API version in `plugin.json`.

@@ -64,7 +64,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [x] Batch resize/convert/export (issue #15: queued `bc-core` export pipeline + jobs UI; JPEG/PNG/WebP, orientation applied, metadata copy deferred to the Phase 3 writers)
 - [x] Contact sheet / PDF contact sheet output
 - [x] Watched-folder auto-processing — persisted rules, settle gate, bounded worker queue, preferences/history UI and docs landed; metadata-index action now available via the search index
-- [ ] Scripting/automation API (Lua or WASM plugins)
+- [x] Scripting/automation API (WASM): local manifest-based scripts use the shared `wasmi` sandbox, fuel/memory limits, default-deny persisted capability and filesystem grants, and permissioned selection/current-folder/metadata/thumbnail/file-operation host imports; per-script failures are isolated
 
 ## Phase 5 — Integrations & Plugin Ecosystem (clean-room equivalents) (Weeks 30–40)
 - [ ] Export/publish pipelines (replaces CC Libraries)
@@ -77,13 +77,13 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
   - [ ] Metadata mapping: Photos keywords/albums/favorites → bc-metadata tags (Phase 3 alignment)
   - [ ] Platform gate: macOS-only feature, compiled out elsewhere; user must grant disk access
   - *Clean-room note: spec from public Photos library schema documentation and observed behavior only; no Apple code.*
-- [~] **Plugin system for BridgeCraft** (manifest discovery, capabilities, permissions, host API surface; WASM runtime pending) (successor to the Phase 4 scripting API; Bridges-style extension model)
-  - [ ] Plugin manifest + loader: local plugins discovered from a plugins directory; manifest declares name, version, entry points, and capabilities (menu items, panel, context-menu hooks)
-  - [ ] Plugin API surface (Rust trait + WASM host boundary): access to browser selection, current folder, thumbnails, metadata read, and file operations through a permissioned host API
-  - [ ] Sandboxing: WASM plugins run isolated with explicit capabilities (fs paths, network off by default); native plugins out of scope for v1
-  - [ ] UI extension points: plugin-registered panels, toolbar/menu actions, and batch-processing hooks
-  - [ ] Plugin manager dialog: list, enable/disable, permissions review
-  - *Relationship to Phase 4: the Phase 4 Lua/WASM scripting API is the automation surface; this is the packaged, distributable plugin layer built on top of it.*
+- [~] **Plugin system for BridgeCraft** (successor to the Phase 4 scripting API; Bridges-style extension model)
+  - [x] Plugin manifest + loader: local plugins discovered from a plugins directory; manifest declares name, version, entry points, and capabilities (menu items, panel, context-menu hooks)
+  - [x] Plugin API surface (Rust trait + WASM host boundary): selection/current-folder access and permissioned metadata, thumbnail, rename, copy and move operations are implemented
+  - [x] Sandboxing: WASM plugins run in wasmi without WASI/ambient imports, with fuel and memory limits; explicit grants are default-deny and network calls are not provided
+  - [~] UI extension points: toolbar/menu actions, context-menu actions and panel placeholders are wired; batch-processing hook execution and actual plugin panel rendering remain
+  - [x] Plugin manager dialog: list, enable/disable, requested capability/path review, and persisted grants
+  - *Relationship to Phase 4: the Phase 4 WASM scripting API is the automation surface; this is the packaged, distributable plugin layer built on top of the same runtime and permissioned host boundary.*
 - [ ] **ArtCraft bridge plugin** (first-party plugin targeting [storytold/artcraft](https://github.com/storytold/artcraft))
   - [ ] ArtCraft is a Rust, MIT/Apache-2.0 dual-licensed "IDE for artists" (AI image/video generation with Photoshop-style 2D/3D canvas compositing, layers, masking, inpainting) — a natural round-trip target for asset workflows, and its permissive license allows direct API integration (no clean-room constraints needed for this partner)
   - [ ] Round-trip workflow: "Edit in ArtCraft" context-menu action on selected images → open in ArtCraft canvas → on save/export, updated file lands back in the browsed folder and the watcher refresh picks it up automatically (Phase 1 live refresh makes this near-free)

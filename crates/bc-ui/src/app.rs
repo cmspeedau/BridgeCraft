@@ -19,6 +19,7 @@ use bc_core::export::{ExportFormat, ExportQueue, ExportRequest};
 use bc_core::favorites::Favorites;
 use bc_core::file_ops::{copy_path, delete_path, move_path, rename_path};
 use bc_core::fs::{SortDir, SortKey};
+use bc_core::plugins::{Capability as PluginCapability, PluginHost, PluginManager};
 use bc_core::recents::Recents;
 use bc_core::selection::Selection;
 use bc_core::trash::TrashBin;
@@ -269,6 +270,11 @@ pub struct BridgeApp {
     export_active: usize,
     /// Jobs whose completion summary has already been put in the status bar.
     jobs_notified: HashSet<u64>,
+    /// Local WASM plugin registry; discovery is explicit from the manager dialog.
+    plugin_manager: PluginManager,
+    plugin_manager_error: Option<String>,
+    plugin_manager_window: bool,
+    plugin_panel_open: HashSet<String>,
 }
 
 impl BridgeApp {
@@ -343,6 +349,13 @@ impl BridgeApp {
             jobs_window: false,
             export_active: 0,
             jobs_notified: HashSet::new(),
+            plugin_manager: PluginManager::open_default().unwrap_or_else(|error| {
+                tracing::warn!("plugin manager unavailable: {error}");
+                PluginManager::new()
+            }),
+            plugin_manager_error: None,
+            plugin_manager_window: false,
+            plugin_panel_open: HashSet::new(),
         };
 
         match AutoProcessor::open_default(cache_path.clone()) {
@@ -1805,7 +1818,85 @@ impl BridgeApp {
 
     fn selection_context_menu(&mut self, ui: &mut egui::Ui, clicked_path: &Path) {
         let paths = self.selected_paths(clicked_path);
+        let context_actions: Vec<_> = self
+            .plugin_manager
+            .plugins_with_capability(PluginCapability::ContextMenu)
+            .into_iter()
+            .flat_map(|plugin| {
+                plugin
+                    .manifest
+                    .entry_points
+                    .context_menu
+                    .iter()
+                    .map(move |action| {
+                        (
+                            plugin.id.clone(),
+                            action.id.clone(),
+                            action.label.clone(),
+                            action.function.clone(),
+                        )
+                    })
+            })
+            .collect();
         ui.label(format!("{} selected", paths.len()));
+        for (plugin_id, action_id, label, function) in context_actions {
+            if ui.button(label).clicked() {
+                let host = UiPluginHost::from_app(self);
+                self.status = match self.plugin_manager.run_wasm(
+                    &plugin_id,
+                    function.as_deref().or(Some(action_id.as_str())),
+                    &host,
+                ) {
+                    Ok(run) => format!(
+                        "Plugin completed in {:?}: {}",
+                        run.elapsed,
+                        run.output.join(" · ")
+                    ),
+                    Err(error) => format!("Plugin failed: {error}"),
+                };
+                ui.close_menu();
+            }
+        }
+        let batch_hooks: Vec<_> = self
+            .plugin_manager
+            .plugins_with_capability(PluginCapability::BatchHook)
+            .into_iter()
+            .flat_map(|plugin| {
+                plugin
+                    .manifest
+                    .entry_points
+                    .batch_hooks
+                    .iter()
+                    .map(move |action| {
+                        (
+                            plugin.id.clone(),
+                            action.id.clone(),
+                            action.label.clone(),
+                            action.function.clone(),
+                        )
+                    })
+            })
+            .collect();
+        if paths.len() > 1 {
+            for (plugin_id, action_id, label, function) in batch_hooks {
+                if ui.button(format!("Batch: {label}")).clicked() {
+                    let host = UiPluginHost::from_app(self);
+                    self.status = match self.plugin_manager.run_wasm(
+                        &plugin_id,
+                        function.as_deref().or(Some(action_id.as_str())),
+                        &host,
+                    ) {
+                        Ok(run) => format!(
+                            "Batch plugin completed in {:?}: {}",
+                            run.elapsed,
+                            run.output.join(" · ")
+                        ),
+                        Err(error) => format!("Batch plugin failed: {error}"),
+                    };
+                    ui.close_menu();
+                }
+            }
+        }
         ui.separator();
         if paths.len() == 1 {
             if ui.button("Preview").clicked() {
@@ -2227,6 +2318,130 @@ impl BridgeApp {
         }
     }
 
+    fn plugin_manager_window(&mut self, ctx: &egui::Context) {
+        if !self.plugin_manager_window {
+            return;
+        }
+        let mut open = self.plugin_manager_window;
+        let mut rediscover = false;
+        egui::Window::new("Plugin manager")
+            .open(&mut open)
+            .default_width(600.0)
+            .show(ctx, |ui| {
+                ui.label("Local WASM plugins only. Modules receive explicit host imports and run without WASI.");
+                if let Some(path) = self.plugin_manager.plugins_dir() {
+                    ui.weak(format!("Plugins folder: {}", path.display()));
+                }
+                if ui.button("Rescan plugins").clicked() {
+                    rediscover = true;
+                }
+                if let Some(error) = &self.plugin_manager_error {
+                    ui.colored_label(egui::Color32::LIGHT_RED, error);
+                }
+                if self.plugin_manager.plugins().is_empty() {
+                    ui.weak("No plugins found. Install a plugin directory containing plugin.json and its WASM module.");
+                }
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    let ids: Vec<_> = self.plugin_manager.plugins().iter().map(|plugin| plugin.id.clone()).collect();
+                    for id in ids {
+                        let Some(plugin) = self.plugin_manager.find(&id) else { continue; };
+                        let name = plugin.manifest.name.clone();
+                        let version = plugin.manifest.version.clone();
+                        let description = plugin.manifest.description.clone();
+                        let enabled = plugin.enabled;
+                        let requested_capabilities = plugin.manifest.capabilities.clone();
+                        let requested_paths = plugin.manifest.permissions.filesystem_paths.clone();
+                        let requested_network = plugin.manifest.permissions.network;
+                        let grants = plugin.grants.clone();
+                        let extension_count = plugin.manifest.entry_points.menu_actions.len()
+                            + plugin.manifest.entry_points.context_menu.len()
+                            + plugin.manifest.entry_points.batch_hooks.len()
+                            + plugin.manifest.entry_points.panels.len();
+                        ui.group(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.strong(format!("{name} · {version}"));
+                                let mut enabled = enabled;
+                                if ui.checkbox(&mut enabled, "Enabled").changed() {
+                                    if let Err(error) = self.plugin_manager.set_enabled(&id, enabled) {
+                                        self.plugin_manager_error = Some(error.to_string());
+                                    }
+                                }
+                            });
+                            if !description.is_empty() { ui.label(description); }
+                            ui.weak(format!("{extension_count} declared extension(s)"));
+                            ui.label("Requested capabilities (grant explicitly):");
+                            ui.horizontal_wrapped(|ui| {
+                                for capability in &requested_capabilities {
+                                    let mut granted = grants.capabilities.contains(capability);
+                                    if ui.checkbox(&mut granted, format!("{capability:?}")).changed() {
+                                        let mut updated = grants.clone();
+                                        if granted { updated.capabilities.insert(*capability); }
+                                        else { updated.capabilities.remove(capability); }
+                                        if let Err(error) = self.plugin_manager.set_grants(&id, updated) {
+                                            self.plugin_manager_error = Some(error.to_string());
+                                        }
+                                    }
+                                }
+                            });
+                            if requested_paths.is_empty() {
+                                ui.weak("Filesystem paths: none requested");
+                            } else {
+                                ui.label("Filesystem roots (grant explicitly):");
+                                for path in requested_paths {
+                                    let mut granted = grants.filesystem_paths.contains(&path);
+                                    if ui.checkbox(&mut granted, path.display().to_string()).changed() {
+                                        let mut updated = grants.clone();
+                                        if granted { updated.filesystem_paths.push(path.clone()); }
+                                        else { updated.filesystem_paths.retain(|existing| existing != &path); }
+                                        if let Err(error) = self.plugin_manager.set_grants(&id, updated) {
+                                            self.plugin_manager_error = Some(error.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                            if requested_network {
+                                let mut granted = grants.network;
+                                if ui.checkbox(&mut granted, "Grant network permission (no network host functions in v1)").changed() {
+                                    let mut updated = grants.clone();
+                                    updated.network = granted;
+                                    if let Err(error) = self.plugin_manager.set_grants(&id, updated) {
+                                        self.plugin_manager_error = Some(error.to_string());
+                                    }
+                                }
+                            } else {
+                                ui.weak("Network access is not requested and is denied by default.");
+                            }
+                            let panels: Vec<_> = self.plugin_manager.find(&id).into_iter()
+                                .flat_map(|plugin| plugin.manifest.entry_points.panels.iter().map(|panel| (panel.id.clone(), panel.title.clone(), panel.description.clone())))
+                                .collect();
+                            for (panel_id, title, panel_description) in panels {
+                                let panel_key = format!("{id}:{panel_id}");
+                                ui.horizontal(|ui| {
+                                    ui.label(format!("Panel: {title}"));
+                                    let shown = self.plugin_panel_open.contains(&panel_key);
+                                    if ui.button(if shown { "Hide" } else { "Show" }).clicked() {
+                                        if shown { self.plugin_panel_open.remove(&panel_key); }
+                                        else { self.plugin_panel_open.insert(panel_key.clone()); }
+                                    }
+                                });
+                                if self.plugin_panel_open.contains(&panel_key) {
+                                    ui.weak(if panel_description.is_empty() { "Plugin panel rendering is not available in v1." } else { &panel_description });
+                                }
+                            }
+                        });
+                    }
+                });
+            });
+        self.plugin_manager_window = open;
+        if rediscover {
+            self.plugin_manager_error = self
+                .plugin_manager
+                .discover()
+                .err()
+                .map(|error| error.to_string());
+        }
+    }
+
     fn auto_process_window(&mut self, ctx: &egui::Context) {
         if !self.auto_window {
             return;
@@ -2634,6 +2849,55 @@ impl BridgeApp {
                 if ui.button("Refresh").on_hover_text("Refresh (F5)").clicked() {
                     self.refresh_now();
                 }
+                if ui
+                    .button("Plugins…")
+                    .on_hover_text("Manage local WASM plugins and permissions")
+                    .clicked()
+                {
+                    self.plugin_manager_window = true;
+                }
+                let menu_actions: Vec<_> = self
+                    .plugin_manager
+                    .plugins_with_capability(PluginCapability::MenuAction)
+                    .into_iter()
+                    .flat_map(|plugin| {
+                        plugin
+                            .manifest
+                            .entry_points
+                            .menu_actions
+                            .iter()
+                            .map(move |action| {
+                                (
+                                    plugin.id.clone(),
+                                    action.id.clone(),
+                                    action.label.clone(),
+                                    action.function.clone(),
+                                )
+                            })
+                    })
+                    .collect();
+                if !menu_actions.is_empty() {
+                    ui.menu_button("Plugins", |ui| {
+                        for (plugin_id, action_id, label, function) in &menu_actions {
+                            if ui.button(label).clicked() {
+                                let host = UiPluginHost::from_app(self);
+                                self.status = match self.plugin_manager.run_wasm(
+                                    plugin_id,
+                                    function.as_deref().or(Some(action_id.as_str())),
+                                    &host,
+                                ) {
+                                    Ok(run) => format!(
+                                        "Plugin completed in {:?}: {}",
+                                        run.elapsed,
+                                        run.output.join(" · ")
+                                    ),
+                                    Err(error) => format!("Plugin failed: {error}"),
+                                };
+                                ui.close_menu();
+                            }
+                        }
+                    });
+                }
                 ui.separator();
                 if ui.button("Select All").clicked() {
                     self.select_all_visible();
@@ -2859,6 +3123,71 @@ fn exif_gps(meta: &bc_metadata::Metadata) -> Option<String> {
     Some(text)
 }
 
+struct UiPluginHost {
+    selected: Vec<PathBuf>,
+    folder: Option<PathBuf>,
+}
+
+impl UiPluginHost {
+    fn from_app(app: &BridgeApp) -> Self {
+        Self {
+            selected: app
+                .browser
+                .selection
+                .indices()
+                .filter_map(|index| {
+                    app.browser
+                        .entries
+                        .get(index)
+                        .map(|entry| entry.path.clone())
+                })
+                .collect(),
+            folder: app.browser.root.clone(),
+        }
+    }
+}
+
+impl PluginHost for UiPluginHost {
+    fn selected_paths(&self) -> Vec<PathBuf> {
+        self.selected.clone()
+    }
+    fn current_folder(&self) -> Option<PathBuf> {
+        self.folder.clone()
+    }
+
+    fn read_metadata(&self, path: &Path) -> bc_core::Result<String> {
+        let metadata = bc_metadata::exif::read_exif_file(path)
+            .or_else(|_| bc_metadata::iptc::read_iptc_file(path))
+            .or_else(|_| bc_metadata::xmp::read_xmp_file(path))
+            .map_err(|error| {
+                bc_core::CoreError::InvalidOperation(format!("metadata read failed: {error}"))
+            })?;
+        serde_json::to_string(&metadata).map_err(|error| {
+            bc_core::CoreError::InvalidOperation(format!("metadata encode failed: {error}"))
+        })
+    }
+
+    fn read_thumbnail(&self, path: &Path, max_edge: u32) -> bc_core::Result<Vec<u8>> {
+        let thumbnail = bc_thumbnails::decoder::decode_thumbnail(path, max_edge.min(4096))
+            .map_err(|error| {
+                bc_core::CoreError::InvalidOperation(format!("thumbnail decode failed: {error}"))
+            })?;
+        let rgba = image::RgbaImage::from_raw(thumbnail.width, thumbnail.height, thumbnail.pixels)
+            .ok_or_else(|| {
+                bc_core::CoreError::InvalidOperation(
+                    "thumbnail pixel buffer is inconsistent".into(),
+                )
+            })?;
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(rgba)
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .map_err(|error| {
+                bc_core::CoreError::InvalidOperation(format!("thumbnail encoding failed: {error}"))
+            })?;
+        Ok(cursor.into_inner())
+    }
+}
+
 fn human_size(size: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut v = size as f64;
@@ -2995,6 +3324,7 @@ impl eframe::App for BridgeApp {
         self.export_window(ctx);
         self.jobs_window(ctx);
         self.auto_process_window(ctx);
+        self.plugin_manager_window(ctx);
     }
 }
 

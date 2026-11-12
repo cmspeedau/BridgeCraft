@@ -15,6 +15,7 @@ bc-core = { path = "../bc-core" }
 bc-metadata = { path = "../bc-metadata" }
 bc-thumbnails = { path = "../bc-thumbnails" }
 eframe.workspace = true
+image.workspace = true
 egui.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

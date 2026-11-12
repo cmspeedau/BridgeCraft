@@ -13,6 +13,7 @@ confirmed to be Apache-2.0 / MIT / BSD / ISC compatible (see CLEANROOM.md).
 | [`libwebp-sys`](https://crates.io/crates/libwebp-sys) | MIT (vendored libwebp C code: BSD-3-Clause) | Static C encoder backend used by the `webp` crate | Compiled from vendored source at build time; all licences are permissive |
 | [`quick-xml`](https://crates.io/crates/quick-xml) | MIT | XML parsing/serialization for XMP sidecar packets (issue #9) | Pure Rust; no network or system dependencies |
 | [`roxmltree`](https://crates.io/crates/roxmltree) | MIT OR Apache-2.0 | Read-only XML tree parsing for XMP sidecar packets (issue #9) | Pure Rust; no network or system dependencies |
+| [`wasmi`](https://crates.io/crates/wasmi) | MIT OR Apache-2.0 | Executes isolated WebAssembly automation scripts and plugin modules | No WASI or ambient filesystem/network imports are linked |
 
 ## Runtime dependencies (not distributed)
 
