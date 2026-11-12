@@ -17,7 +17,9 @@ pub mod file_ops;
 pub mod fs;
 pub mod jobs;
 pub mod recents;
+pub mod scripting;
 pub mod selection;
+pub use scripting::*;
 pub mod trash;
 pub mod watcher;
 
