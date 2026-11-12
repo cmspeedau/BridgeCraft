@@ -57,7 +57,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [ ] Custom metadata templates
 - [x] Keyword hierarchy management & tagging (`bc-metadata::keywords`: dc:subject `Parent|Child` convention, tree/type-ahead/tag-count logic; UI panel deferred to #11)
 - [x] Star ratings, color labels, approve/reject flags (typed API in `bc-metadata::ratings`; UI editor deferred to #11)
-- [~] Metadata-driven search & smart collections (query builder)
+- [x] Metadata-driven search & smart collections (query builder)
 
 ## Phase 4 — Batch Operations & Automation (Weeks 24–34)
 - [x] Batch rename (token-based patterns) — `bc-core::batch_rename` parser/planner/journaled apply/undo plus `bc-ui` preview/apply dialog, pattern validation, and undo action
