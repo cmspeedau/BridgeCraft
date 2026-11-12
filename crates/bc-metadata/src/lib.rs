@@ -13,6 +13,8 @@ pub mod iptc;
 pub mod keywords;
 pub mod ratings;
 pub mod search;
+pub mod templates;
+pub use templates::*;
 pub mod xmp;
 pub use search as extract;
 pub use search as projection;
