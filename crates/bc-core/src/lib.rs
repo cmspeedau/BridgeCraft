@@ -1,6 +1,8 @@
 //! bc-core: filesystem scanning, watchers, selection model, and app state.
 
+pub mod apple_photos;
 pub mod auto_process;
+pub use apple_photos::*;
 pub mod contact_sheet;
 pub mod metadata_index;
 pub mod publish;

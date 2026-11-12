@@ -71,7 +71,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [x] Version control / version stacks for assets
 - [ ] Migration importer (reads existing Bridge caches read-only where formats are documented)
 - [ ] **Apple Photos support**: read-only integration with the macOS Photos library
-  - [ ] Locate and open the user's `Photos.sqlite` library (read-only; never write to it) via `photoslibrary`-style access on macOS
+  - [~] Locate and open the user's `Photos.sqlite` library (read-only; never write to it) via `photoslibrary`-style access on macOS (locator + read-only open + synthetic-DB tests; macOS validation pending)
   - [~] Enumerate moments/albums as virtual folders in the browser tree; surface originals + edits as entries (virtual-folder abstraction landed; Apple Photos adapter pending)
   - [ ] Extract assets (originals and current renditions) into the thumbnail pipeline and preview viewer; iCloud-shared (`cloudPlaceholder`) items show a downloaded-on-demand state
   - [ ] Metadata mapping: Photos keywords/albums/favorites → bc-metadata tags (Phase 3 alignment)
