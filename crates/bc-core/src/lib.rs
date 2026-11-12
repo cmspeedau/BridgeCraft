@@ -21,6 +21,8 @@ pub mod scripting;
 pub mod selection;
 pub use scripting::*;
 pub mod trash;
+pub mod virtual_folders;
+pub use virtual_folders::*;
 pub mod version_stacks;
 pub use version_stacks as versions;
 pub use version_stacks::*;
