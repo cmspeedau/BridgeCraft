@@ -1,6 +1,11 @@
 //! bc-core: filesystem scanning, watchers, selection model, and app state.
 
 pub mod auto_process;
+pub mod metadata_index;
+pub use metadata_index as search;
+pub use metadata_index as metadata_search;
+pub use metadata_index as index;
+pub use metadata_index::*;
 pub mod batch_rename;
 pub mod browser;
 pub mod entry;

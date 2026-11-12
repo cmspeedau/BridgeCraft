@@ -12,8 +12,14 @@ pub mod exif_write;
 pub mod iptc;
 pub mod keywords;
 pub mod ratings;
+pub mod search;
 pub mod xmp;
+pub use search as extract;
+pub use search as projection;
+pub use search as searchable;
+pub use search as metadata_search;
 
+pub use search::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;

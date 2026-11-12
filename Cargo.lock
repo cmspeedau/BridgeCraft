@@ -453,6 +453,7 @@ dependencies = [
  "bc-thumbnails",
  "image",
  "notify",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
