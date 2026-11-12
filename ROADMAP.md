@@ -64,7 +64,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [x] Batch resize/convert/export (issue #15: queued `bc-core` export pipeline + jobs UI; JPEG/PNG/WebP, orientation applied, metadata copy deferred to the Phase 3 writers)
 - [x] Contact sheet / PDF contact sheet output
 - [x] Watched-folder auto-processing — persisted rules, settle gate, bounded worker queue, preferences/history UI and docs landed; metadata-index action now available via the search index
-- [~] Scripting/automation API (Lua or WASM plugins) — RFC posted proposing embedded Lua first; implementation pending maintainer sign-off
+- [x] Scripting/automation API (Lua or WASM plugins) — embedded Lua host with sandbox, timeout, capability table, and tests
 
 ## Phase 5 — Integrations & Plugin Ecosystem (clean-room equivalents) (Weeks 30–40)
 - [ ] Export/publish pipelines (replaces CC Libraries)
