@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 
+use bc_core::auto_process::{AutoAction, AutoProcessor, AutoRule};
 use bc_core::browser::BrowserState;
 use bc_core::export::{ExportFormat, ExportQueue, ExportRequest};
 use bc_core::favorites::Favorites;
@@ -228,6 +229,19 @@ pub struct BridgeApp {
     trash_window: bool,
     /// Pattern preview/apply dialog for batch rename.
     rename_dialog: Option<batch_rename_ui::RenameDialog>,
+    /// Watched-folder auto-action engine and quiet status/history view.
+    auto_processor: Option<AutoProcessor>,
+    auto_window: bool,
+    auto_watch_root: String,
+    auto_extensions: String,
+    auto_pattern: String,
+    auto_min_size: String,
+    auto_settle_seconds: String,
+    auto_action_thumbnail: bool,
+    auto_action_rename: bool,
+    auto_action_export: bool,
+    auto_action_dated_move: bool,
+    auto_started: Instant,
     /// Header-only dimensions, cached per path for the Metadata panel.
     dims_cache: HashMap<PathBuf, Option<(u32, u32)>>,
     /// EXIF fields cached per path, keyed with the mtime they were read at
@@ -265,7 +279,7 @@ impl BridgeApp {
     ) -> Self {
         let (job_tx, job_rx) = channel::<ThumbJob>();
         let (res_tx, res_rx) = channel::<ThumbResult>();
-        spawn_thumb_worker(cache_path, job_rx, res_tx);
+        spawn_thumb_worker(cache_path.clone(), job_rx, res_tx);
 
         let (favorites, favorites_error) = match Favorites::open_default() {
             Ok(store) => (Some(store), None),
@@ -302,6 +316,18 @@ impl BridgeApp {
             open_field: false,
             trash_window: false,
             rename_dialog: None,
+            auto_processor: None,
+            auto_window: false,
+            auto_watch_root: String::new(),
+            auto_extensions: "jpg,dng,nef,arw".into(),
+            auto_pattern: "{name}_{seq:0>3}".into(),
+            auto_min_size: "0".into(),
+            auto_settle_seconds: "2".into(),
+            auto_action_thumbnail: true,
+            auto_action_rename: false,
+            auto_action_export: false,
+            auto_action_dated_move: false,
+            auto_started: Instant::now(),
             dims_cache: HashMap::new(),
             exif_cache: HashMap::new(),
             metadata_form: MetadataForm::default(),
@@ -318,6 +344,13 @@ impl BridgeApp {
             export_active: 0,
             jobs_notified: HashSet::new(),
         };
+
+        match AutoProcessor::open_default(cache_path.clone()) {
+            Ok(processor) => {
+                app.auto_processor = Some(processor);
+            }
+            Err(error) => tracing::warn!("auto-processing unavailable: {error}"),
+        }
 
         if let Some(root) = root {
             app.open_root(Path::new(&root));
@@ -2194,6 +2227,200 @@ impl BridgeApp {
         }
     }
 
+    fn auto_process_window(&mut self, ctx: &egui::Context) {
+        if !self.auto_window {
+            return;
+        }
+        let mut open = true;
+        let mut remove_rule = None;
+        egui::Window::new("Watched folders")
+            .default_size([560.0, 470.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                let Some(processor) = self.auto_processor.as_mut() else {
+                    ui.colored_label(
+                        ui.visuals().error_fg_color,
+                        "Auto-processing is unavailable; check the application log.",
+                    );
+                    return;
+                };
+                ui.label("Watch a folder and apply actions after incoming files stop changing.");
+                let current_settle = processor.settle_duration().as_secs_f64();
+                if self.auto_settle_seconds == "2" && current_settle != 2.0 {
+                    self.auto_settle_seconds = format!("{current_settle}");
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Root:");
+                    ui.add_sized(
+                        [300.0, 20.0],
+                        egui::TextEdit::singleline(&mut self.auto_watch_root)
+                            .hint_text("/path/to/ingest"),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Extensions:");
+                    ui.add_sized(
+                        [220.0, 20.0],
+                        egui::TextEdit::singleline(&mut self.auto_extensions)
+                            .hint_text("jpg,dng,nef (blank = any)"),
+                    );
+                    ui.label("Min bytes:");
+                    ui.add_sized(
+                        [80.0, 20.0],
+                        egui::TextEdit::singleline(&mut self.auto_min_size),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Settle seconds:");
+                    ui.add_sized(
+                        [60.0, 20.0],
+                        egui::TextEdit::singleline(&mut self.auto_settle_seconds),
+                    );
+                    if ui.button("Settle delay").clicked() {
+                        match self.auto_settle_seconds.parse::<u64>() {
+                            Ok(seconds) => match processor.set_settle(Duration::from_secs(seconds))
+                            {
+                                Ok(()) => self.status = "Settle delay saved.".into(),
+                                Err(error) => {
+                                    self.status = format!("Could not save settle delay: {error}")
+                                }
+                            },
+                            Err(error) => self.status = format!("Invalid settle delay: {error}"),
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.auto_action_thumbnail, "Thumbnail");
+                    ui.checkbox(&mut self.auto_action_rename, "Rename");
+                    ui.checkbox(&mut self.auto_action_export, "Export PNG");
+                    ui.checkbox(&mut self.auto_action_dated_move, "Dated folder");
+                });
+                if self.auto_action_rename {
+                    ui.horizontal(|ui| {
+                        ui.label("Pattern:");
+                        ui.add_sized(
+                            [360.0, 20.0],
+                            egui::TextEdit::singleline(&mut self.auto_pattern),
+                        );
+                    });
+                }
+                if ui.button("Add watched-folder rule").clicked() {
+                    let root = PathBuf::from(self.auto_watch_root.trim());
+                    let extensions = self
+                        .auto_extensions
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|ext| !ext.is_empty())
+                        .map(|ext| ext.trim_start_matches('.').to_ascii_lowercase())
+                        .collect();
+                    let min_size = self.auto_min_size.trim().parse::<u64>().unwrap_or(0);
+                    let mut actions = Vec::new();
+                    if self.auto_action_thumbnail {
+                        actions.push(AutoAction::GenerateThumbnail { max_edge: 256 });
+                    }
+                    if self.auto_action_rename {
+                        actions.push(AutoAction::Rename {
+                            pattern: self.auto_pattern.clone(),
+                        });
+                    }
+                    if self.auto_action_export {
+                        actions.push(AutoAction::Export {
+                            max_edge: 1024,
+                            format: bc_core::auto_process::AutoExportFormat::Png,
+                        });
+                    }
+                    if self.auto_action_dated_move {
+                        actions.push(AutoAction::MoveToDatedFolder);
+                    }
+                    let id = format!(
+                        "rule-{}",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis())
+                            .unwrap_or(0)
+                    );
+                    let rule = AutoRule {
+                        id,
+                        name: format!(
+                            "Watch {}",
+                            root.file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| root.display().to_string())
+                        ),
+                        root,
+                        enabled: true,
+                        extensions,
+                        min_size,
+                        subfolder_pattern: None,
+                        actions,
+                        consecutive_failures: 0,
+                        disabled_reason: None,
+                    };
+                    match processor.add_rule(rule) {
+                        Ok(()) => self.status = "Watched-folder rule added.".into(),
+                        Err(error) => self.status = format!("Could not add rule: {error}"),
+                    }
+                }
+                ui.separator();
+                ui.strong(format!("Queued actions: {}", processor.queued_count()));
+                egui::ScrollArea::vertical()
+                    .max_height(150.0)
+                    .show(ui, |ui| {
+                        for rule in processor.rules() {
+                            ui.horizontal(|ui| {
+                                let state = if rule.enabled { "Watching" } else { "Disabled" };
+                                ui.strong(format!("{} · {state}", rule.name));
+                                ui.weak(rule.root.display().to_string());
+                                if ui
+                                    .small_button(if rule.enabled { "Pause" } else { "Enable" })
+                                    .clicked()
+                                {
+                                    match processor.set_rule_enabled(&rule.id, !rule.enabled) {
+                                        Ok(_) => {}
+                                        Err(error) => {
+                                            self.status = format!("Could not update rule: {error}")
+                                        }
+                                    }
+                                }
+                                if ui.small_button("Remove").clicked() {
+                                    remove_rule = Some(rule.id.clone());
+                                }
+                            });
+                            if let Some(reason) = rule.disabled_reason {
+                                ui.colored_label(ui.visuals().error_fg_color, reason);
+                            }
+                        }
+                    });
+                ui.separator();
+                ui.strong("Recent auto-action history");
+                egui::ScrollArea::vertical()
+                    .max_height(130.0)
+                    .show(ui, |ui| {
+                        for item in processor.history().iter().rev().take(100) {
+                            let status = match &item.result {
+                                Ok(()) => "Done".to_string(),
+                                Err(error) => format!("Failed: {error}"),
+                            };
+                            ui.horizontal(|ui| {
+                                ui.label(&item.rule_name);
+                                ui.weak(item.path.display().to_string());
+                                ui.label(status);
+                            });
+                        }
+                    });
+            });
+        if let Some(rule_id) = remove_rule {
+            if let Some(processor) = self.auto_processor.as_mut() {
+                match processor.remove_rule(&rule_id) {
+                    Ok(true) => self.status = "Watched-folder rule removed.".into(),
+                    Ok(false) => {}
+                    Err(error) => self.status = format!("Could not remove rule: {error}"),
+                }
+            }
+        }
+        self.auto_window = open;
+    }
+
     /// Non-modal job list with per-file progress rows and a done/failed
     /// summary — browsing stays interactive while exports run.
     fn jobs_window(&mut self, ctx: &egui::Context) {
@@ -2533,6 +2760,31 @@ impl BridgeApp {
                 ui.checkbox(&mut self.thumbs_only, "Thumbnails only")
                     .on_hover_text("Hide files BridgeCraft cannot preview");
                 ui.separator();
+                let auto_queued = self
+                    .auto_processor
+                    .as_ref()
+                    .map(AutoProcessor::queued_count)
+                    .unwrap_or(0);
+                let auto_pending = self
+                    .auto_processor
+                    .as_ref()
+                    .map(AutoProcessor::pending_count)
+                    .unwrap_or(0);
+                let auto_label = if auto_queued > 0 {
+                    format!("Auto ({auto_queued} queued)")
+                } else if auto_pending > 0 {
+                    format!("Auto ({auto_pending} settling)")
+                } else {
+                    "Auto".to_string()
+                };
+                if ui
+                    .button(auto_label)
+                    .on_hover_text("Watched-folder rules and action history")
+                    .clicked()
+                {
+                    self.auto_window = !self.auto_window;
+                }
+                ui.separator();
                 let jobs_label = if self.export_active > 0 {
                     format!("Jobs ({})", self.export_active)
                 } else {
@@ -2625,6 +2877,12 @@ fn human_size(size: u64) -> String {
 impl eframe::App for BridgeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_thumbnails(ctx);
+        if let Some(processor) = &mut self.auto_processor {
+            processor.poll(self.auto_started.elapsed());
+            if processor.queued_count() > 0 || processor.watches_roots() {
+                ctx.request_repaint_after(Duration::from_millis(250));
+            }
+        }
         self.poll_export_jobs(ctx);
         self.poll_watcher();
         self.prune_preview_textures();
@@ -2736,6 +2994,7 @@ impl eframe::App for BridgeApp {
         self.rename_window(ctx);
         self.export_window(ctx);
         self.jobs_window(ctx);
+        self.auto_process_window(ctx);
     }
 }
 

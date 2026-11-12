@@ -63,7 +63,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [x] Batch rename (token-based patterns) — `bc-core::batch_rename` parser/planner/journaled apply/undo plus `bc-ui` preview/apply dialog, pattern validation, and undo action
 - [x] Batch resize/convert/export (issue #15: queued `bc-core` export pipeline + jobs UI; JPEG/PNG/WebP, orientation applied, metadata copy deferred to the Phase 3 writers)
 - [ ] Contact sheet / PDF contact sheet output
-- [ ] Watched-folder auto-processing
+- [~] Watched-folder auto-processing — persisted rules, settle gate, bounded worker queue, preferences/history UI and docs landed; metadata-index action remains unavailable until the search index is implemented
 - [ ] Scripting/automation API (Lua or WASM plugins)
 
 ## Phase 5 — Integrations & Plugin Ecosystem (clean-room equivalents) (Weeks 30–40)
