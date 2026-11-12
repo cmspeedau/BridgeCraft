@@ -105,6 +105,10 @@ pub enum AutoAction {
         format: AutoExportFormat,
     },
     MoveToDatedFolder,
+    ExtractMetadata,
+    IndexMetadata,
+    UpdateSearchIndex,
+    IndexIntoMetadataIndex,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -189,6 +193,7 @@ struct Shared {
     cache_path: PathBuf,
     journal_path: PathBuf,
     config_path: PathBuf,
+    index_path: PathBuf,
     rename_lock: Mutex<()>,
 }
 
@@ -226,6 +231,10 @@ impl AutoProcessor {
             cache_path,
             journal_path,
             config_path: config_path.to_path_buf(),
+            index_path: config_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("metadata.sqlite"),
             rename_lock: Mutex::new(()),
         });
         let workers = (0..MAX_WORKERS)
@@ -672,6 +681,15 @@ fn run_actions(shared: &Shared, rule: &AutoRule, path: &Path) -> std::result::Re
                 }
                 current_path = target;
             }
+            AutoAction::ExtractMetadata
+            | AutoAction::IndexMetadata
+            | AutoAction::UpdateSearchIndex
+            | AutoAction::IndexIntoMetadataIndex => {
+                let index = crate::metadata_index::MetadataIndex::open(&shared.index_path)
+                    .or_else(|_| crate::metadata_index::MetadataIndex::open_in_memory())
+                    .map_err(|error| error.to_string())?;
+                let _ = index.index_path(&current_path);
+            }
         }
     }
     Ok(())
@@ -1032,6 +1050,7 @@ mod tests {
             cache_path: temp.path().join("thumbs.sqlite"),
             journal_path: temp.path().join("last-rename.json"),
             config_path: temp.path().join("auto-rules.json"),
+            index_path: temp.path().join("metadata.sqlite"),
             rename_lock: Mutex::new(()),
         };
         let mut configured = rule(temp.path());
