@@ -1,6 +1,8 @@
 //! bc-core: filesystem scanning, watchers, selection model, and app state.
 
 pub mod auto_process;
+pub mod contact_sheet;
+pub use contact_sheet::*;
 pub mod metadata_index;
 pub use metadata_index as search;
 pub use metadata_index as metadata_search;
