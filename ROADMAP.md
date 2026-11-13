@@ -70,11 +70,11 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [ ] Export/publish pipelines (replaces CC Libraries)
 - [x] Version control / version stacks for assets
 - [ ] Migration importer (reads existing Bridge caches read-only where formats are documented)
-- [ ] **Apple Photos support**: read-only integration with the macOS Photos library
-  - [ ] Locate and open the user's `Photos.sqlite` library (read-only; never write to it) via `photoslibrary`-style access on macOS
-  - [~] Enumerate moments/albums as virtual folders in the browser tree; surface originals + edits as entries (virtual-folder abstraction landed; Apple Photos adapter pending)
-  - [ ] Extract assets (originals and current renditions) into the thumbnail pipeline and preview viewer; iCloud-shared (`cloudPlaceholder`) items show a downloaded-on-demand state
-  - [ ] Metadata mapping: Photos keywords/albums/favorites → bc-metadata tags (Phase 3 alignment)
+- [ ] **Apple Photos support**: deferred (see “Under consideration”)
+  - [ ] Read-only integration with the macOS Photos library; revisit only if a clean-room approach using documented public APIs proves viable
+  - [ ] Locate and open the user's `Photos.sqlite` library (read-only; never write to it) via documented macOS APIs
+  - [ ] Enumerate moments/albums as virtual folders; surface originals and edited renditions through the thumbnail and preview pipeline
+  - [ ] Map Photos keywords, albums and favorites to BridgeCraft metadata and virtual folders
   - [ ] Platform gate: macOS-only feature, compiled out elsewhere; user must grant disk access
   - *Clean-room note: spec from public Photos library schema documentation and observed behavior only; no Apple code.*
 - [~] **Plugin system for BridgeCraft** (successor to the Phase 4 scripting API; Bridges-style extension model)
@@ -123,11 +123,15 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 | M2 — Preview Engine | Q2 2027 | RAW/PSD/PDF/video previews with caching | ✅ PNG/JPEG/GIF/WebP/TIFF/BMP + video/PDF/camera RAW (runtime libs) + PSD/AI + SQLite cache + preview/1:1 zoom viewer |
 | M3 — Metadata Complete | Q3 2027 | XMP/EXIF/IPTC read-write, smart collections | not started |
 | M4 — Automation | Q4 2027 | Batch ops, scripting API | not started |
-| M5 — Integrations | 2028 | Apple Photos, plugin system, ArtCraft bridge plugin, PhotoCraft and LightCraft desktop integrations | not started |
+| M5 — Integrations | 2028 | Plugin system, ArtCraft bridge plugin, PhotoCraft and LightCraft desktop integrations | not started |
 | M6 — 1:1 Parity Audit & Release | 2028 | Feature checklist parity vs. Bridge 2026 user guide; universal macOS build, Windows portable+MSI, AppImage+.zsync published (unsigned) | not started |
 
 ## Critical Path
 With ADR-0001 resolved (egui/eframe), filter + live refresh shipped, and virtualized grid rendering complete, the remaining critical path is: **file-operation UI → drag & drop**. Recents and managed-trash primitives are implemented in `bc-core`; the browser/UI integration remains. Metadata engine (Phase 3) can proceed in parallel.
+
+## Under consideration
+
+- **Apple Photos integration** — deferred for now. A first-party, read-only Apple Photos locator was previously explored, but it remains macOS-specific, depends on undocumented Photos library behavior, and is not part of the current cross-platform roadmap. Revisit only if a clean-room approach with documented public APIs proves viable.
 
 ## Risks
 - RAW format coverage breadth (mitigate: LibRaw bindings)
