@@ -1,5 +1,9 @@
 //! bc-core: filesystem scanning, watchers, selection model, and app state.
 
+pub mod lightcraft;
+pub mod photocraft;
+pub use lightcraft::LightCraftBridge;
+pub use photocraft::*;
 pub mod auto_process;
 pub mod contact_sheet;
 pub mod metadata_index;

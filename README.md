@@ -33,6 +33,8 @@ A clean-room, from-scratch asset browser inspired by the workflows of classic di
 | **Export** | Right-click → Export…: batch resize/convert to JPEG (quality knob), PNG or WebP as a background job — non-modal job list with per-file progress, cancellation, collision-safe `basename_<max edge>.<ext>` naming, and no half-written files |
 | **Automation** | Status-bar **Auto** opens watched-folder rules with configurable settle time, extension/size filters, thumbnail/rename/export/dated-move actions, bounded workers and persisted history |
 | **Automation & plugins** | Local manifest-based WASM scripts use the shared `wasmi` sandbox with fuel and memory limits, default-deny persisted capability/filesystem grants, and a permissioned host API; local plugins add manager UI and granted menu/context/batch actions. No WASI or network host functions; declared panels are placeholders. |
+| **PhotoCraft** | Right-click → Edit in PhotoCraft opens selected files in the installed PhotoCraft desktop app. Configure its executable with `PHOTOCRAFT_PATH` or the PhotoCraft settings window. |
+| **LightCraft** | Right-click → Edit in LightCraft imports selected files into the installed LightCraft photo library. Configure its executable with `LIGHTCRAFT_PATH` or the LightCraft settings window. |
 
 ### Preview & zoom viewer
 

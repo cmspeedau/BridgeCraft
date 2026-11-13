@@ -24,6 +24,7 @@ use bc_core::recents::Recents;
 use bc_core::selection::Selection;
 use bc_core::trash::TrashBin;
 use bc_core::watcher::Watcher;
+use bc_core::{lightcraft, photocraft};
 use bc_thumbnails::{CacheStore, Thumbnail};
 use eframe::egui;
 
@@ -275,6 +276,12 @@ pub struct BridgeApp {
     plugin_manager_error: Option<String>,
     plugin_manager_window: bool,
     plugin_panel_open: HashSet<String>,
+    photocraft_bridge: photocraft::PhotoCraftBridge,
+    photocraft_executable_input: String,
+    photocraft_settings_window: bool,
+    lightcraft_bridge: lightcraft::LightCraftBridge,
+    lightcraft_executable_input: String,
+    lightcraft_settings_window: bool,
 }
 
 impl BridgeApp {
@@ -356,6 +363,12 @@ impl BridgeApp {
             plugin_manager_error: None,
             plugin_manager_window: false,
             plugin_panel_open: HashSet::new(),
+            photocraft_bridge: photocraft::PhotoCraftBridge::new(),
+            photocraft_executable_input: String::new(),
+            photocraft_settings_window: false,
+            lightcraft_bridge: lightcraft::LightCraftBridge::new(),
+            lightcraft_executable_input: String::new(),
+            lightcraft_settings_window: false,
         };
 
         match AutoProcessor::open_default(cache_path.clone()) {
@@ -2020,6 +2033,54 @@ impl BridgeApp {
             });
         }
         if ui
+            .add_enabled(
+                self.photocraft_bridge.executable().is_some(),
+                egui::Button::new("Edit in PhotoCraft"),
+            )
+            .on_hover_text("Open the selected files directly in PhotoCraft")
+            .clicked()
+        {
+            let files: Vec<PathBuf> = paths
+                .iter()
+                .filter(|path| !path.is_dir())
+                .cloned()
+                .collect();
+            if files.is_empty() {
+                self.status = "Select files to edit in PhotoCraft.".into();
+            } else {
+                match self.photocraft_bridge.edit(&files) {
+                    Ok(()) => {
+                        self.status = format!("Opened {} item(s) in PhotoCraft", files.len());
+                    }
+                    Err(error) => self.status = format!("Could not open PhotoCraft: {error}"),
+                }
+            }
+            ui.close_menu();
+        }
+        if ui
+            .add_enabled(
+                self.lightcraft_bridge.executable().is_some(),
+                egui::Button::new("Edit in LightCraft"),
+            )
+            .on_hover_text("Import the selected files into LightCraft's photo library")
+            .clicked()
+        {
+            let files: Vec<PathBuf> = paths
+                .iter()
+                .filter(|path| !path.is_dir())
+                .cloned()
+                .collect();
+            if files.is_empty() {
+                self.status = "Select files to open in LightCraft.".into();
+            } else {
+                match self.lightcraft_bridge.edit(&files) {
+                    Ok(()) => self.status = format!("Opened {} item(s) in LightCraft", files.len()),
+                    Err(error) => self.status = format!("Could not open LightCraft: {error}"),
+                }
+            }
+            ui.close_menu();
+        }
+        if ui
             .button("Export…")
             .on_hover_text("Batch resize/convert to JPEG, PNG or WebP")
             .clicked()
@@ -2316,6 +2377,103 @@ impl BridgeApp {
         } else if open && !dismissed {
             self.rename_dialog = Some(dialog);
         }
+    }
+
+    fn lightcraft_settings_window(&mut self, ctx: &egui::Context) {
+        if !self.lightcraft_settings_window {
+            return;
+        }
+        let mut open = self.lightcraft_settings_window;
+        egui::Window::new("LightCraft integration")
+            .open(&mut open)
+            .default_width(520.0)
+            .show(ctx, |ui| {
+                ui.label("Select a LightCraft executable, AppImage, or install directory.");
+                ui.horizontal(|ui| {
+                    ui.label("Path:");
+                    ui.text_edit_singleline(&mut self.lightcraft_executable_input);
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Use path").clicked() {
+                        let raw_path = self.lightcraft_executable_input.trim();
+                        let result = if raw_path.is_empty() {
+                            Err("Enter a LightCraft executable, AppImage, or install directory.".to_string())
+                        } else {
+                            self.lightcraft_bridge
+                                .set_executable(PathBuf::from(raw_path))
+                                .map_err(|error| error.to_string())
+                        };
+                        match result {
+                            Ok(()) => self.status = "LightCraft executable configured.".into(),
+                            Err(error) => self.status = format!("LightCraft path invalid: {error}"),
+                        }
+                    }
+                    if ui.button("Discover").clicked() {
+                        match self.lightcraft_bridge.discover() {
+                            Some(path) => {
+                                self.lightcraft_executable_input = path.display().to_string();
+                                self.status = format!("Found LightCraft at {}", path.display());
+                            }
+                            None => self.status = "LightCraft was not found.".into(),
+                        }
+                    }
+                });
+                match self.lightcraft_bridge.executable() {
+                    Some(path) => ui.label(format!("Configured: {}", path.display())),
+                    None => ui.weak("No LightCraft executable configured."),
+                };
+                ui.weak("Selected files are imported into the LightCraft library; non-destructive edits and exports are managed there.");
+            });
+        self.lightcraft_settings_window = open;
+    }
+
+    fn photocraft_settings_window(&mut self, ctx: &egui::Context) {
+        if !self.photocraft_settings_window {
+            return;
+        }
+        let mut open = self.photocraft_settings_window;
+        egui::Window::new("PhotoCraft integration")
+            .open(&mut open)
+            .default_width(520.0)
+            .show(ctx, |ui| {
+                ui.label("Select a PhotoCraft executable, AppImage, or install directory.");
+                ui.horizontal(|ui| {
+                    ui.label("Path:");
+                    ui.text_edit_singleline(&mut self.photocraft_executable_input);
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Use path").clicked() {
+                        let raw_path = self.photocraft_executable_input.trim();
+                        let path = if raw_path.is_empty() {
+                            None
+                        } else {
+                            Some(PathBuf::from(raw_path))
+                        };
+                        let result = path.ok_or_else(|| {
+                            "Enter a PhotoCraft executable, AppImage, or install directory.".to_string()
+                        }).and_then(|path| self.photocraft_bridge.set_executable(path).map_err(|error| error.to_string()));
+                        match result {
+                            Ok(()) => self.status = "PhotoCraft executable configured.".into(),
+                            Err(error) => self.status = format!("PhotoCraft path invalid: {error}"),
+                        }
+                    }
+                    if ui.button("Discover").clicked() {
+                        match self.photocraft_bridge.discover() {
+                            Some(path) => {
+                                self.photocraft_executable_input = path.display().to_string();
+                                self.status = format!("Found PhotoCraft at {}", path.display());
+                            }
+                            None => self.status = "PhotoCraft was not found.".into(),
+                        }
+                    }
+                });
+                match self.photocraft_bridge.executable() {
+                    Some(path) => ui.label(format!("Configured: {}", path.display())),
+                    None => ui.weak("No PhotoCraft executable configured."),
+                };
+                ui.weak("Selected files are passed to PhotoCraft's documented desktop file-open interface.");
+            });
+        self.photocraft_settings_window = open;
     }
 
     fn plugin_manager_window(&mut self, ctx: &egui::Context) {
@@ -2856,6 +3014,34 @@ impl BridgeApp {
                 {
                     self.plugin_manager_window = true;
                 }
+                if ui
+                    .button("LightCraft…")
+                    .on_hover_text("Configure LightCraft executable")
+                    .clicked()
+                {
+                    self.lightcraft_settings_window = true;
+                    if self.lightcraft_executable_input.is_empty() {
+                        self.lightcraft_executable_input = self
+                            .lightcraft_bridge
+                            .executable()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_default();
+                    }
+                }
+                if ui
+                    .button("PhotoCraft…")
+                    .on_hover_text("Configure PhotoCraft executable")
+                    .clicked()
+                {
+                    self.photocraft_settings_window = true;
+                    if self.photocraft_executable_input.is_empty() {
+                        self.photocraft_executable_input = self
+                            .photocraft_bridge
+                            .executable()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_default();
+                    }
+                }
                 let menu_actions: Vec<_> = self
                     .plugin_manager
                     .plugins_with_capability(PluginCapability::MenuAction)
@@ -3325,6 +3511,8 @@ impl eframe::App for BridgeApp {
         self.jobs_window(ctx);
         self.auto_process_window(ctx);
         self.plugin_manager_window(ctx);
+        self.photocraft_settings_window(ctx);
+        self.lightcraft_settings_window(ctx);
     }
 }
 

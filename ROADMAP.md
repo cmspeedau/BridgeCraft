@@ -84,19 +84,22 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
   - [~] UI extension points: toolbar/menu actions, context-menu actions and panel placeholders are wired; batch-processing hook execution and actual plugin panel rendering remain
   - [x] Plugin manager dialog: list, enable/disable, requested capability/path review, and persisted grants
   - *Relationship to Phase 4: the Phase 4 WASM scripting API is the automation surface; this is the packaged, distributable plugin layer built on top of the same runtime and permissioned host boundary.*
-- [ ] **ArtCraft bridge plugin** (first-party plugin targeting [storytold/artcraft](https://github.com/storytold/artcraft))
-  - [ ] ArtCraft is a Rust, MIT/Apache-2.0 dual-licensed "IDE for artists" (AI image/video generation with Photoshop-style 2D/3D canvas compositing, layers, masking, inpainting) — a natural round-trip target for asset workflows, and its permissive license allows direct API integration (no clean-room constraints needed for this partner)
-  - [ ] Round-trip workflow: "Edit in ArtCraft" context-menu action on selected images → open in ArtCraft canvas → on save/export, updated file lands back in the browsed folder and the watcher refresh picks it up automatically (Phase 1 live refresh makes this near-free)
-  - [ ] Asset hand-off: send BridgeCraft selections (with XMP sidecar metadata, once Phase 3 lands) into ArtCraft projects as layers/ingredients; receive exports back as versioned assets (version stacks integration)
-  - [ ] Discovery: locate the ArtCraft executable/library on Win/macOS/Linux (it ships for all three), or let the user point at an install
-  - [ ] Implement as the first consumer of the plugin system above to prove the API surface
-- [ ] **LightCraft bridge plugin** (first-party plugin targeting [storytold/lightcraft](https://github.com/storytold/lightcraft))
-  - [ ] LightCraft is a Rust, MIT/Apache-2.0 dual-licensed, non-destructive photo library and raw developer written in pure Rust (the Lightroom analogue to ArtCraft's Photoshop analogue), cross-platform on macOS/Windows/Linux plus WASM — a natural round-trip target for photo culling and RAW workflows, and its permissive license allows direct API integration (no clean-room constraints needed for this partner)
-  - [ ] Round-trip workflow: "Edit in LightCraft" context-menu action on selected images/RAWs → develop non-destructively in LightCraft → on export, rendered files land back in the browsed folder and the watcher refresh picks them up automatically (Phase 1 live refresh makes this near-free)
-  - [ ] Library-aware hand-off: send BridgeCraft selections (with XMP sidecar metadata and ratings/labels, once Phase 3 lands) into LightCraft's library; receive develop settings and exports back as versioned assets (version stacks integration)
-  - [ ] RAW synergy: LightCraft's Rust RAW decoding can complement Phase 2's camera-RAW plans (evaluate reusing its decoders via the plugin boundary rather than duplicating LibRaw bindings)
-  - [ ] Discovery: locate the LightCraft executable/library on Win/macOS/Linux (it ships for all three), or let the user point at an install
-  - [ ] Implement alongside ArtCraft as a second consumer of the plugin system to prove the API surface generalizes beyond a single partner
+- [~] **ArtCraft bridge integration** (first-party integration targeting [storytold/artcraft](https://github.com/storytold/artcraft))
+  - [x] ArtCraft is a Rust, MIT/Apache-2.0 dual-licensed "IDE for artists" (AI image/video generation with 2D/3D compositing); the permissive license allows direct integration, subject to respecting upstream notices
+  - [~] Round-trip workflow: a native "Edit in ArtCraft" context-menu action launches the app and prepares a hand-off; automatic file-open/save-back is pending a confirmed public ArtCraft file-open interface (the inspected desktop entry point currently declares no CLI arguments)
+  - [~] Asset hand-off: BridgeCraft creates a portable per-asset bundle containing original files, adjacent XMP sidecars, and a JSON manifest; ArtCraft project/layer ingestion is pending an upstream interface. Export-to-version-stack registration helper is implemented; UI workflow wiring remains
+  - [~] Discovery: `ARTCRAFT_PATH` override (file or install directory), app-adjacent, platform install locations, then `PATH`; an API for selecting an install is available, but no preferences UI yet
+  - [ ] Implement as the first consumer of the plugin system above to prove the API surface; current native bridge is not yet a WASM plugin because launching host applications is intentionally not exposed to sandboxed plugins
+- [~] **PhotoCraft desktop integration** (separate from the ArtCraft roadmap item; targets the installed [storytold/photocraft](https://github.com/storytold/photocraft) app)
+  - [x] Discover PhotoCraft using `PHOTOCRAFT_PATH`, standard install locations, PATH, and Linux desktop-entry AppImage locations
+  - [x] Add an "Edit in PhotoCraft" context-menu action that opens selected files using PhotoCraft's documented desktop CLI
+  - [~] Core helpers create XMP-aware hand-off bundles and register exported files as version-stack entries; automatic export tracking and settings persistence remain future work
+- [~] **LightCraft desktop integration** (first-party integration targeting [storytold/lightcraft](https://github.com/storytold/lightcraft); this is distinct from a sandboxed WASM plugin)
+  - [x] LightCraft is a permissively licensed, pure-Rust non-destructive photo library and RAW developer, available on macOS, Windows, Linux, and WASM
+  - [x] Native "Edit in LightCraft" context-menu action passes selected files to LightCraft's documented desktop CLI, which imports them into its library
+  - [~] Discovery supports `LIGHTCRAFT_PATH`, standard install locations, PATH, Linux desktop-entry AppImages, and a settings window for manual configuration
+  - [ ] Round-trip export tracking, automatic registration of exports as version-stack entries, and transfer of develop settings/ratings/labels
+  - [ ] Evaluate reuse of LightCraft's Rust RAW decoding through a documented, compatible library boundary; current BridgeCraft decoding remains unchanged
 
 ## Phase 6 — Polish, Packaging & 1:1 Parity (Weeks 36–52)
 - [ ] Keyboard shortcut parity + custom shortcut editor
@@ -120,7 +123,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 | M2 — Preview Engine | Q2 2027 | RAW/PSD/PDF/video previews with caching | ✅ PNG/JPEG/GIF/WebP/TIFF/BMP + video/PDF/camera RAW (runtime libs) + PSD/AI + SQLite cache + preview/1:1 zoom viewer |
 | M3 — Metadata Complete | Q3 2027 | XMP/EXIF/IPTC read-write, smart collections | not started |
 | M4 — Automation | Q4 2027 | Batch ops, scripting API | not started |
-| M5 — Integrations | 2028 | Apple Photos, plugin system, ArtCraft bridge plugin, LightCraft bridge plugin | not started |
+| M5 — Integrations | 2028 | Apple Photos, plugin system, ArtCraft bridge plugin, PhotoCraft and LightCraft desktop integrations | not started |
 | M6 — 1:1 Parity Audit & Release | 2028 | Feature checklist parity vs. Bridge 2026 user guide; universal macOS build, Windows portable+MSI, AppImage+.zsync published (unsigned) | not started |
 
 ## Critical Path
