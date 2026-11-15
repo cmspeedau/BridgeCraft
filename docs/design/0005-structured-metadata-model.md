@@ -68,7 +68,16 @@ from the next source. This is implemented as an ordered merge where later
 (lower-priority) sources only insert properties not already present. A future
 option to expose per-source provenance on each `Value` is out of scope for v1.
 
-## 4. Write policy (maintainer sign-off required)
+## 4. Write policy (signed off 2026-11-15)
+
+Signed off by the maintainer on 2026-11-15, with one addition that §4 did not
+state and the implementation needs: **because §3 puts the sidecar above the
+embedded packet when reading, a save that writes in place must update an
+existing sidecar in the same operation, and must write the sidecar first.**
+Otherwise a sidecar from another application would keep hiding the user's new
+rating, and a partially failed save would leave the higher-priority layer
+stale. Both halves are implemented and tested in
+`crates/bc-ui/src/metadata_edit.rs::save_tags`.
 
 Default policy for v1:
 
@@ -83,6 +92,17 @@ Default policy for v1:
   metadata.
 - Policy is exposed as a `WritePolicy` enum (`InPlace`, `Sidecar`, `Auto`)
   passed to writers, defaulting to `Auto` (which resolves per the rules above).
+
+Implementation status as of 2026-11-15:
+
+| Rule | Status |
+|---|---|
+| Sidecar for RAW, original never touched | Done, for text fields and for tags |
+| In-place EXIF for JPEG/TIFF text fields | Done (issue #7) |
+| In-place XMP for tags (rating, label, flag, keywords) in JPEG/TIFF | Done |
+| Keep an existing sidecar in sync, sidecar written first | Done |
+| In-place XMP for **PNG** | Not done: PNG carries XMP in an `iTXt` keyword chunk, which no writer here implements yet, so PNG falls back to the sidecar |
+| IPTC-IIM written back into TIFF (tag 34377 or 33723) | Not done; reading it is done, writing is still JPEG `APP13` only |
 
 This default is conservative (no surprise sidecar files) and matches the clean-room
 "do not surprise the user's filesystem" principle. Sign-off requested because it

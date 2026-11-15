@@ -53,9 +53,10 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 ## Phase 3 — Metadata Engine (Weeks 15–26) — ◐ started: EXIF read + metadata panel shipped (issue #6)
 - [x] EXIF reading in `bc-metadata`: pure-Rust TIFF/EXIF parser (JPEG `APP1` + TIFF/DNG containers), both byte orders, IFD0 + Exif + GPS sub-IFDs + thumbnail-IFD reference; IFD loops and absurd counts are `Malformed`, malformed input never panics; hand-built fixture tests plus a real-camera check gated behind `RAW_SAMPLE` (issue #6)
 - [x] Metadata panel: Camera Data (EXIF) section for the selected file — camera, taken, exposure, aperture, ISO, focal length, orientation, color space, software, EXIF size, GPS — above File Properties; cached per path + modified time
-- [~] Embedded metadata read/write: EXIF read (issue #5 model) and EXIF write for JPEG/TIFF (issue #7) landed; IPTC-IIM read/write for JPEG APP13 (issue #8); XMP sidecar read/write (issue #9). **Reading is now complete** (`bc-metadata::embedded`): the XMP packet in JPEG `APP1` and TIFF tag 700, the Photoshop resource block in TIFF tag 34377, and a raw IIM dataset in TIFF tag 33723. **Writing** the packet and the TIFF IPTC block is not implemented, because it changes where tag edits land and that is the unsigned-off storage policy below, not an oversight
+- [~] Embedded metadata read/write: EXIF read (issue #5 model) and EXIF write for JPEG/TIFF (issue #7) landed; IPTC-IIM read/write for JPEG APP13 (issue #8); XMP sidecar read/write (issue #9). **Reading is complete** (`bc-metadata::embedded`): the XMP packet in JPEG `APP1` and TIFF tag 700, the Photoshop resource block in TIFF tag 34377, and a raw IIM dataset in TIFF tag 33723. **Writing**: the XMP packet now goes into JPEG and TIFF in place, with an existing sidecar updated in the same save and written first (design/0005 §4, signed off). Still open: PNG (needs an `iTXt` writer, sidecar in the meantime) and writing IPTC-IIM back into TIFF containers
+- [x] Tags keep both layers honest: `save_tags` writes the sidecar before the file, so the layer that wins on read can never hide a change the user just made. Covered by `a_jpeg_keeps_tags_in_the_file_and_does_not_grow_a_sidecar` and `an_existing_sidecar_is_updated_so_it_cannot_hide_the_change`
 - [x] Panel read precedence implemented as `docs/design/0005-structured-metadata-model.md` §3 specifies: EXIF, then IPTC-IIM, then embedded XMP, then `.xmp` sidecar, merging property by property so a higher layer that lacks a field does not erase the lower layer's value. The plugin host now uses the same chain, so a script and the panel cannot disagree about what a file says
-- [ ] Write policy sign-off (design/0005 §4): decide whether rating, label, flag and keywords move from the sidecar into the file for JPEG/TIFF once embedded XMP can be written. §4 as written ("in-place preferred, no auto-sidecar when embedded metadata exists") is not what ships today and is still marked pending maintainer sign-off
+- [x] Write policy signed off (2026-11-15): tags go in place for JPEG/TIFF, sidecar for RAW and PNG, and an existing sidecar is synced, written first. Recorded in `docs/design/0005-structured-metadata-model.md` §4 with an implementation status table, and §3's read precedence is now implemented in the panel chain
 - [x] XMP sidecar read/write (`.xmp` files) — `bc-metadata::xmp` (parse/serialize + atomic file I/O)
 - [x] Metadata panel with editable fields: grouped list, dirty tracking, Save/Revert via the #5 write policy (`bc-ui::metadata_edit`), multi-selection bulk editor with per-file failure reporting. Sidecar properties now merge in full, so `dc:` and `xmp:` values written by this app or another tool reach the panel instead of being filtered out
 - [~] Custom metadata templates: `bc-metadata::templates` has the model (Replace/Merge/Append), JSON persistence (`<data>/BridgeCraft/metadata_templates`) and tests, but nothing calls it: no save/apply UI and no path that writes a template onto a file
@@ -121,7 +122,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 |---|---|---|---|
 | M1 — Browser MVP | Q1 2027 | Browse, sort, filter, live refresh, thumbnails, basic file ops | ◐ shipped including internal drag & drop; remaining: grid failure states, folder-open error surfacing, outbound OS drag |
 | M2 — Preview Engine | Q2 2027 | RAW/PSD/PDF/video previews with caching | ✅ PNG/JPEG/GIF/WebP/TIFF/BMP + video/PDF/camera RAW (runtime libs) + PSD/AI + SQLite cache + preview/1:1 zoom viewer |
-| M3 — Metadata Complete | Q3 2027 | XMP/EXIF/IPTC read-write, smart collections | ◐ EXIF read/write, IPTC-IIM, XMP sidecars, the editable panel, the tag editor with sidecar storage, and reading every embedded layer (XMP in JPEG APP1 / TIFF 700, IPTC in TIFF 34377 / 33723) with the documented precedence are shipped; writing embedded packets and the smart-collection UI remain |
+| M3 — Metadata Complete | Q3 2027 | XMP/EXIF/IPTC read-write, smart collections | ◐ EXIF read/write, IPTC-IIM, XMP sidecars, the editable panel, the tag editor, and embedded XMP read **and write** for JPEG/TIFF with the documented precedence are shipped; PNG in-place XMP, IPTC-in-TIFF writing and the smart-collection UI remain |
 | M4 — Automation | Q4 2027 | Batch ops, scripting API | ◐ batch rename, export pipeline + jobs UI, contact-sheet core, watched-folder automation and the WASM sandbox done; scripting and contact-sheet UI remain |
 | M5 — Integrations | 2028 | Plugin system, ArtCraft bridge plugin, PhotoCraft and LightCraft desktop integrations | ◐ plugin system, plugin manager and PhotoCraft/LightCraft launch actions shipped; ArtCraft not started, plugin panels and hand-off wiring remain |
 | M6 — 1:1 Parity Audit & Release | 2028 | Feature checklist parity vs. Bridge 2026 user guide; universal macOS build, Windows portable+MSI, AppImage+.zsync published (unsigned) | not started |
@@ -138,7 +139,8 @@ With ADR-0001 resolved (egui/eframe), the Phase 1 shell shipped (filter, live re
 - **Emoji as UI glyphs.** The folder marker in the grid and in the list/details rows is a literal `📁` drawn with the proportional font (`bc-ui::app::cell`, `content_list`), which renders inconsistently across platforms and cannot be themed or recolored. The new rating stars are drawn shapes for exactly that reason; the folder marker is the remaining one.
 - **Two JPEG marker walks.** `bc-metadata::embedded::for_each_jpeg_segment` and `bc-metadata::exif_write::find_app1` both walk the marker list, with the same rules for padding and standalone markers. `is_tiff` is already shared so the two cannot disagree about what a TIFF is; the marker walk should be unified the same way, because a segment both code paths skip silently would drop or duplicate an APP1.
 - **Third-party format checks are opt-in.** `XMP_SAMPLE` and `RAW_SAMPLE` gate real-file checks (see the tests). They are the only evidence that the readers agree with what other applications write, and neither runs in CI: CI has no sample file to point them at. Publishing a CC0 sample to the repository would make them normal tests instead of local ones.
-- **Tags live only in the sidecar.** Rating, label, flag and keywords are written to `.xmp` beside the original for every format, because they have no EXIF equivalent and embedded XMP writing is still open. Consequences to settle when it lands: JPEG and TIFF should carry the packet in place (matching `docs/design/0005` §4), the export pipeline should copy it (it currently drops all metadata), and sorting or filtering by rating/label should read the search index rather than stat and parse one sidecar per row per frame, which is what the grid and details overlays do today.
+- **Where tags live, and the cost of keeping two layers honest.** Rating, label, flag and keywords are written into JPEG and TIFF files as an embedded XMP packet, and to the sidecar for RAW and PNG. When a sidecar exists it is updated in the same save, *first*, because reading prioritizes the sidecar above the packet and a stale sidecar would silently hide the user's change. That is two copies of the same four properties on purpose (decided 2026-11-15), so any new tag property has to be written and read on both layers, and `save_tags` is the only place that should do it. Two things still follow from it: the export pipeline drops all metadata (it currently refuses to copy anything), and sorting or filtering by rating/label should read the search index rather than stat and parse one sidecar plus one packet per visible row per frame, which is what the grid and details overlays do today.
+- **Unreadable packets are refused, so a file can become untaggable in place.** `existing_packet` refuses a JPEG or TIFF whose packet cannot be turned into properties, for two distinct reasons, each with its own test: the XML is broken (an undeclared namespace prefix, which `parse_xmp` reports as `MalformedPacket`), or it is well-formed but nothing in it is in a namespace we understand (parses to empty, refused by the guard added in slice 4). Refusing is right, because merging into an empty result and writing back would erase the other application's properties. The consequence for the user: with a sidecar present the save still lands and the panel shows the new value (`a_refused_packet_leaves_the_sidecar_updated_and_reports_it`), and either way the refusal reason reaches the status line verbatim through `Save failed: {error}`. What is not handled is the read side of the same file: a packet we cannot parse makes the item look simply *unrated*, with nothing saying why. The proper fix is a fallback that keeps the unrecognized bytes verbatim and merges around them, not a relaxed guard; short of that, the tags row should say the packet exists but is unreadable instead of showing zero stars.
 - **No Bridge shortcut layer for tags.** Setting a rating or label from the keyboard today means Tab to the control and press Enter or Space. Bridge's `Ctrl+1`..`5` shortcuts are widely documented behavior, but the exact modifier chords across platforms are not something I have a source for, so they are left to the Phase 6 shortcut parity audit rather than guessed at here.
 
 ## Truth pass log (2026-11-15)
@@ -206,6 +208,46 @@ Not done, and it needs your decision rather than mine: **writing** embedded XMP
 and the TIFF IPTC block. §4 of the design doc is still unsigned off, and moving
 tag edits from the sidecar into the file changes what happens to the original on
 every save.
+
+### Embedded metadata writing (slice 4, shipped 2026-11-15)
+
+Storage policy signed off, so tags now go where design/0005 §4 said they should:
+
+- `bc-metadata::xmp::write_embedded_xmp` writes the packet into a JPEG `APP1`
+  (replacing an existing one in place, or inserting after the EXIF `APP1`) and
+  into TIFF tag 700 through `exif_write::write_tiff_bytes_tag`, so the TIFF
+  rewrite path is shared with the EXIF writer rather than duplicated.
+- **Merge, never replace.** The existing packet is read first and only the
+  changed properties are applied, so setting a rating does not delete another
+  application's keywords or namespaces. Verified by a test that rewrites a
+  packet carrying `dc:subject` and a foreign namespace and asserts both survive.
+- **An unreadable packet is refused, not overwritten.** A packet that parses to
+  zero properties returns `MalformedPacket`. Without that guard the merge starts
+  from empty and the write destroys everything the reader did not understand,
+  which is the worst possible failure mode for an asset browser.
+- `save_tags` writes the **sidecar first**, then the file, because reading
+  prioritizes the sidecar: writing the file first and failing on the sidecar
+  would leave the higher-priority layer stale and hide the user's own change.
+- The bulk tag stamp now merges onto each file and calls the same `save_tags`,
+  instead of maintaining its own sidecar-only path. A rating-only stamp on a file
+  with keywords keeps the keywords, which that unification is what makes testable.
+
+Verified against a real third-party file. A JPEG produced by **Pillow** carrying
+a valid XMP packet is read as 4 properties; after `write_embedded_xmp` sets the
+rating to 5, **Pillow reads the packet back** showing rating 5 with the original
+label, both keywords and its own `CreatorTool` intact, `x:xmptk` now
+"BridgeCraft", and the pixels still decoding. That is the only interoperability
+evidence in this project that does not rely on our own parser.
+
+The check also caught a bad fixture of mine: an RDF namespace written as
+`1999-02-22-rdf-syntax-ns#` instead of `1999/02/22-rdf-syntax-ns#` parses to zero
+properties, and the guard above correctly **refused** to write the file rather
+than replacing a packet it could not understand. The fix was the fixture, not the
+guard: a packet whose structure we cannot read must not be overwritten with a
+partial one, however the file got that way.
+
+Still open from §4: PNG in-place XMP (needs an `iTXt` writer; sidecar in the
+meantime, asserted by a test) and writing IPTC-IIM into TIFF.
 
 ### Documentation corrected against the code on `main` (no behavior changes)
 
