@@ -17,7 +17,9 @@ use bc_core::auto_process::{AutoAction, AutoProcessor, AutoRule};
 use bc_core::browser::BrowserState;
 use bc_core::export::{ExportFormat, ExportQueue, ExportRequest};
 use bc_core::favorites::Favorites;
-use bc_core::file_ops::{copy_path, delete_path, move_path, rename_path};
+use bc_core::file_ops::{
+    copy_path, delete_path, move_path, rename_path, transfer_into_folder, TransferMode,
+};
 use bc_core::fs::{SortDir, SortKey};
 use bc_core::plugins::{Capability as PluginCapability, PluginHost, PluginManager};
 use bc_core::recents::Recents;
@@ -43,6 +45,10 @@ const WATCHER_DEBOUNCE: Duration = Duration::from_millis(300);
 const LIST_ROW_HEIGHT: f32 = 28.0;
 /// Sidebar "Recent" section cap.
 const SIDEBAR_RECENTS: usize = 6;
+/// The one accent color in the shell: it marks the current selection and,
+/// during a drag, the folder a drop will land in. The two states are told
+/// apart by ring weight and offset, never by a second color.
+const ACCENT: egui::Color32 = egui::Color32::from_rgb(0, 160, 255);
 
 /// Texture cache key: a file can have several resolutions in flight (grid
 /// thumbnail, viewer preview, viewer full-resolution).
@@ -208,6 +214,8 @@ pub struct BridgeApp {
     watcher: Option<Watcher>,
     /// When a watcher event was seen; refresh fires after the debounce elapses.
     refresh_due: Option<Instant>,
+    /// Folder under the pointer last frame; OS file drops land here when set.
+    hovered_folder: Option<PathBuf>,
 
     // ------------------------------------------------------------- shell --
     /// Persistent favorite folders; `None` when the store cannot be opened.
@@ -285,11 +293,7 @@ pub struct BridgeApp {
 }
 
 impl BridgeApp {
-    pub fn new(
-        cc: &eframe::CreationContext<'_>,
-        root: Option<String>,
-        cache_path: Option<PathBuf>,
-    ) -> Self {
+    pub fn new(ctx: &egui::Context, root: Option<String>, cache_path: Option<PathBuf>) -> Self {
         let (job_tx, job_rx) = channel::<ThumbJob>();
         let (res_tx, res_rx) = channel::<ThumbResult>();
         spawn_thumb_worker(cache_path.clone(), job_rx, res_tx);
@@ -317,6 +321,7 @@ impl BridgeApp {
             viewer: ViewerState::default(),
             watcher: None,
             refresh_due: None,
+            hovered_folder: None,
             favorites,
             favorites_error,
             sidebar_tab: SidebarTab::default(),
@@ -384,7 +389,7 @@ impl BridgeApp {
             app.open_root(&cwd);
         }
 
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        ctx.set_visuals(egui::Visuals::dark());
         app
     }
 
@@ -436,6 +441,12 @@ impl BridgeApp {
                 None
             }
         };
+    }
+
+    /// Reload the listing after a drop so the results are visible immediately
+    /// rather than waiting for the debounced watcher refresh.
+    fn refresh_after_drop(&mut self) {
+        let _ = self.browser.refresh_preserving_selection();
     }
 
     /// Drain watcher events; schedule a debounced refresh when any arrive.
@@ -1556,17 +1567,29 @@ impl BridgeApp {
                         let size = entry.size;
                         let modified = entry.modified;
                         let selected = self.browser.selection.contains(idx);
-                        let response = ui
-                            .allocate_ui_with_layout(
-                                egui::vec2(cell_width, row_height),
-                                egui::Layout::top_down(egui::Align::Center),
-                                |cell_ui| {
-                                    self.cell(
-                                        cell_ui, idx, &path, is_dir, size, selected, cell_width,
-                                    )
-                                },
-                            )
-                            .inner;
+                        let cell = ui.allocate_ui_with_layout(
+                            egui::vec2(cell_width, row_height),
+                            egui::Layout::top_down(egui::Align::Center),
+                            |cell_ui| {
+                                self.cell(cell_ui, idx, &path, is_dir, size, selected, cell_width)
+                            },
+                        );
+                        // One interaction widget per cell: `cell()` allocates the
+                        // thumbnail box with click-and-drag sense, and everything
+                        // below (select, open, drag, drop) happens on it, exactly
+                        // as the list rows do. Two alternatives were tried and
+                        // rejected on evidence: the outer response from
+                        // `allocate_ui_with_layout` never reported the pointer for
+                        // the first cell of a row, so that cell could not be a drop
+                        // target, and a second overlapping surface with drag sense
+                        // took the presses away from the cell, turning a plain click
+                        // on a folder into a drop onto itself.
+                        let response = cell
+                            .inner
+                            // Every cell is draggable, so say so under the
+                            // pointer: egui sets the grabbing cursor once a drag
+                            // is in flight and this covers the press.
+                            .on_hover_cursor(egui::CursorIcon::Grab);
 
                         if response.secondary_clicked() && !self.browser.selection.contains(idx) {
                             self.browser.selection.select_only(idx);
@@ -1588,6 +1611,44 @@ impl BridgeApp {
                                 self.open_root(&path);
                             } else {
                                 self.open_viewer(&path);
+                            }
+                        }
+                        // Dragging an item inside the selection drags the whole
+                        // selection; dragging an unselected item selects and
+                        // drags just that item.
+                        if response.drag_started() {
+                            let paths = if self.browser.selection.contains(idx) {
+                                self.selected_paths(&path)
+                            } else {
+                                self.browser.selection.select_only(idx);
+                                vec![path.clone()]
+                            };
+                            response.dnd_set_drag_payload(paths);
+                        }
+                        // Drop target: folders accept the payload, and a folder
+                        // under the pointer is the landing spot for files
+                        // dropped in from the desktop. `contains_pointer` rather
+                        // than `hovered`, because egui reports no widget as
+                        // hovered while another one is being dragged.
+                        if is_dir {
+                            if response.contains_pointer() {
+                                self.hovered_folder = Some(path.clone());
+                            }
+                            if response.dnd_hover_payload::<Vec<PathBuf>>().is_some() {
+                                // Selection draws a 2px ring 3px outside this
+                                // rect; the target ring is 3px and 6px out, so
+                                // a folder that is both selected and being
+                                // dropped onto cannot be mistaken for either.
+                                ui.painter().rect_stroke(
+                                    response.rect.expand(6.0),
+                                    8.0,
+                                    egui::Stroke::new(3.0_f32, ACCENT),
+                                );
+                            }
+                            if let Some(payload) = response.dnd_release_payload::<Vec<PathBuf>>() {
+                                let mode = drop_mode(ui.input(|i| i.modifiers.alt));
+                                self.status = apply_transfer(&payload, &path, mode);
+                                self.refresh_after_drop();
                             }
                         }
                         if !is_dir && bc_thumbnails::decoder::can_thumbnail(&path) {
@@ -1684,8 +1745,10 @@ impl BridgeApp {
                 let selected = self.browser.selection.contains(idx);
                 let (rect, response) = ui.allocate_exact_size(
                     egui::vec2(ui.available_width(), LIST_ROW_HEIGHT),
-                    egui::Sense::click(),
+                    egui::Sense::click_and_drag(),
                 );
+                // Rows drag the selection too, so the pointer says so.
+                let response = response.on_hover_cursor(egui::CursorIcon::Grab);
                 if selected {
                     ui.painter()
                         .rect_filled(rect, 2.0, ui.visuals().selection.bg_fill);
@@ -1757,6 +1820,30 @@ impl BridgeApp {
                         self.open_root(&path);
                     } else {
                         self.open_viewer(&path);
+                    }
+                }
+                // Drag source and folder target, mirroring the thumbnail grid.
+                if response.drag_started() {
+                    let paths = if self.browser.selection.contains(idx) {
+                        self.selected_paths(&context_path)
+                    } else {
+                        self.browser.selection.select_only(idx);
+                        vec![context_path.clone()]
+                    };
+                    response.dnd_set_drag_payload(paths);
+                }
+                if is_dir {
+                    if response.contains_pointer() {
+                        self.hovered_folder = Some(context_path.clone());
+                    }
+                    if response.dnd_hover_payload::<Vec<PathBuf>>().is_some() {
+                        ui.painter()
+                            .rect_stroke(rect, 2.0, egui::Stroke::new(3.0_f32, ACCENT));
+                    }
+                    if let Some(payload) = response.dnd_release_payload::<Vec<PathBuf>>() {
+                        let mode = drop_mode(ui.input(|i| i.modifiers.alt));
+                        self.status = apply_transfer(&payload, &context_path, mode);
+                        self.refresh_after_drop();
                     }
                 }
             }
@@ -2920,7 +3007,7 @@ impl BridgeApp {
         ui.vertical_centered(|ui| {
             let (rect, response) = ui.allocate_exact_size(
                 egui::vec2((cell_size - 12.0).max(1.0), (cell_size - 20.0).max(1.0)),
-                egui::Sense::click(),
+                egui::Sense::click_and_drag(),
             );
 
             if is_dir {
@@ -2956,11 +3043,8 @@ impl BridgeApp {
             }
 
             if selected {
-                ui.painter().rect_stroke(
-                    rect.expand(3.0),
-                    6.0,
-                    egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(0, 160, 255)),
-                );
+                ui.painter()
+                    .rect_stroke(rect.expand(3.0), 6.0, egui::Stroke::new(2.0_f32, ACCENT));
             }
 
             ui.set_min_width((cell_size - 16.0).max(1.0));
@@ -3374,6 +3458,73 @@ impl PluginHost for UiPluginHost {
     }
 }
 
+/// Files dragged in from the desktop, split into those the platform named
+/// with a path and those it did not. Only pathed files can be copied; the rest
+/// are counted so the status line can say so rather than losing them silently.
+fn os_drop_paths(files: &[egui::DroppedFile]) -> (Vec<PathBuf>, usize) {
+    let mut paths = Vec::with_capacity(files.len());
+    let mut unnamed = 0usize;
+    for file in files {
+        match file.path.clone() {
+            Some(path) => paths.push(path),
+            None => unnamed += 1,
+        }
+    }
+    (paths, unnamed)
+}
+
+/// Transfer mode for a drop: hold Alt to copy, otherwise move.
+///
+/// Alt is the free modifier in this shell: Ctrl drives Select All, Open and
+/// the clipboard, and Shift extends the selection, so neither can double as
+/// the copy modifier without stealing an existing binding.
+fn drop_mode(alt_down: bool) -> TransferMode {
+    if alt_down {
+        TransferMode::Copy
+    } else {
+        TransferMode::Move
+    }
+}
+
+/// Where files dropped in from the desktop land: the folder under the pointer
+/// if one was hovered last frame, otherwise the open folder, otherwise nothing.
+fn os_drop_target(hovered: Option<&Path>, root: Option<&Path>) -> Option<PathBuf> {
+    hovered
+        .map(Path::to_path_buf)
+        .or_else(|| root.map(Path::to_path_buf))
+}
+
+/// Apply a drag-and-drop transfer via `bc-core` and render the outcome as a
+/// status line. Batch rejections leave the filesystem untouched and are
+/// reported as such; per-item failures are counted and the first is shown.
+fn apply_transfer(sources: &[PathBuf], destination: &Path, mode: TransferMode) -> String {
+    let verb = match mode {
+        TransferMode::Move => "Moved",
+        TransferMode::Copy => "Copied",
+    };
+    match transfer_into_folder(sources, destination, mode) {
+        Ok(report) => {
+            let mut status = format!(
+                "{verb} {} item(s) into {}",
+                report.transferred,
+                destination.display()
+            );
+            if report.skipped > 0 {
+                status += &format!(", skipped {} already in destination", report.skipped);
+            }
+            if let Some((path, error)) = report.errors.first() {
+                status += &format!(
+                    "; {} failed, first: {}: {error}",
+                    report.errors.len(),
+                    path.display()
+                );
+            }
+            status
+        }
+        Err(error) => format!("Drop rejected: {error}"),
+    }
+}
+
 fn human_size(size: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut v = size as f64;
@@ -3401,6 +3552,37 @@ impl eframe::App for BridgeApp {
         self.poll_export_jobs(ctx);
         self.poll_watcher();
         self.prune_preview_textures();
+
+        // Files dragged in from the desktop (a file manager, a terminal) are
+        // copied into the folder under the pointer, or the open folder when
+        // nothing was hovered. Copy, never move: pulling a file into a folder
+        // should not delete it from where it came from.
+        // The hover is last frame's, which is where the pointer sits while the
+        // drop event arrives; egui reports native drops without a widget.
+        let (os_drops, unnamed) = ctx.input(|i| os_drop_paths(&i.raw.dropped_files));
+        if !os_drops.is_empty() {
+            let target =
+                os_drop_target(self.hovered_folder.as_deref(), self.browser.root.as_deref());
+            match target {
+                Some(folder) => {
+                    let mut status = apply_transfer(&os_drops, &folder, TransferMode::Copy);
+                    if unnamed > 0 {
+                        status +=
+                            &format!("; {unnamed} item(s) arrived without a path and were skipped");
+                    }
+                    self.status = status;
+                    self.refresh_after_drop();
+                }
+                None => self.status = "Open a folder before dropping files.".into(),
+            }
+        } else if unnamed > 0 {
+            self.status =
+                format!("{unnamed} dropped item(s) had no readable path; nothing was copied.");
+        }
+        // A drag that no folder claimed does nothing, matching Explorer and
+        // Bridge: releasing items on the background of the folder they are
+        // already in would only report a meaningless "skipped" count.
+        self.hovered_folder = None;
 
         // Global shortcuts that must not fire while a text field has focus.
         if !ctx.wants_keyboard_input() {
@@ -3568,6 +3750,86 @@ fn format_modified(modified: Option<std::time::SystemTime>) -> String {
 mod tests {
     use super::*;
 
+    /// egui needs a wall clock to tell a double click from two single ones, so
+    /// the synthetic frames advance time the way a running window would.
+    fn next_frame_time() -> f64 {
+        use std::cell::RefCell;
+        thread_local! {
+            static FRAME_CLOCK: RefCell<f64> = const { RefCell::new(1.0) };
+        }
+        FRAME_CLOCK.with(|clock| {
+            let mut clock = clock.borrow_mut();
+            *clock += 0.05;
+            *clock
+        })
+    }
+
+    /// Press or release the primary button at `pos`.
+    fn button(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
+    /// Drive one frame of the real list view, so a test presses, drags and
+    /// releases exactly the way the window does. `alt` is the frame's modifier
+    /// state: egui reads modifiers from `RawInput`, not from the button event,
+    /// which is how the winit integration reports the desktop's modifiers.
+    fn drive_list(app: &mut BridgeApp, ctx: &egui::Context, alt: bool, events: Vec<egui::Event>) {
+        let mut raw = egui::RawInput::default();
+        raw.modifiers.alt = alt;
+        raw.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(900.0, 700.0),
+        ));
+        raw.events = events;
+        // The frame's FullOutput is not needed: these tests read the app's
+        // own state and the filesystem for their assertions.
+        let _ = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.content_list(ui, ctx, false));
+        });
+    }
+
+    /// Find a point inside the row for `folder` by asking the app which folder
+    /// the pointer is over, so the test uses the real row geometry rather than
+    /// pixels guessed from the layout.
+    fn point_over_folder(
+        app: &mut BridgeApp,
+        ctx: &egui::Context,
+        folder: &Path,
+    ) -> Option<egui::Pos2> {
+        for y in (2..700).step_by(2) {
+            let pos = egui::pos2(300.0, y as f32);
+            app.hovered_folder = None;
+            drive_list(app, ctx, false, vec![egui::Event::PointerMoved(pos)]);
+            if app.hovered_folder.as_deref() == Some(folder) {
+                return Some(pos);
+            }
+        }
+        None
+    }
+
+    /// The row after `target`, using the pitch measured from the two located
+    /// rows rather than a guessed layout constant.
+    fn point_after(from: egui::Pos2, target: egui::Pos2) -> egui::Pos2 {
+        target + egui::vec2(0.0, (target.y - from.y).abs())
+    }
+
+    /// A `BridgeApp` whose JSON stores land in `isolated` instead of the
+    /// developer's real per-user data directory. The store paths come from
+    /// environment variables read at call time, so these tests set them; no
+    /// other test in this binary reads them, which is what makes doing that
+    /// from a parallel test tolerable.
+    fn isolated_app(ctx: &egui::Context, root: &Path, isolated: &Path) -> BridgeApp {
+        std::env::set_var("HOME", isolated);
+        std::env::set_var("APPDATA", isolated);
+        std::env::set_var("XDG_DATA_HOME", isolated.join("data"));
+        BridgeApp::new(ctx, Some(root.display().to_string()), None)
+    }
+
     #[test]
     fn list_navigation_follows_filtered_order_and_clamps() {
         let mut selection = Selection::new();
@@ -3651,5 +3913,446 @@ mod tests {
             exif_image_size(&exif_fixture(&[("exif.PixelWidth", "5184")])).as_deref(),
             None
         );
+    }
+
+    #[test]
+    fn drop_mode_maps_alt_to_copy() {
+        assert_eq!(drop_mode(false), TransferMode::Move);
+        assert_eq!(drop_mode(true), TransferMode::Copy);
+    }
+
+    /// Drive one frame of the real thumbnail grid.
+    fn drive_grid(app: &mut BridgeApp, ctx: &egui::Context, alt: bool, events: Vec<egui::Event>) {
+        let mut raw = egui::RawInput::default();
+        raw.modifiers.alt = alt;
+        raw.time = Some(next_frame_time());
+        raw.predicted_dt = 0.05;
+        raw.time = Some(next_frame_time());
+        raw.predicted_dt = 0.05;
+        raw.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(900.0, 700.0),
+        ));
+        raw.events = events;
+        // The frame's FullOutput is not needed: these tests read the app's
+        // own state and the filesystem for their assertions.
+        let _ = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.content_grid(ui));
+        });
+    }
+
+    /// Find a point inside the folder's grid cell that both reports the folder
+    /// as the drop target and can start a drag. egui resolves gestures against
+    /// the previous frame's widget geometry, so the hover frame comes first.
+    fn grid_point(app: &mut BridgeApp, ctx: &egui::Context, folder: &Path) -> Option<egui::Pos2> {
+        for y in (10..700).step_by(17) {
+            for x in (10..900).step_by(17) {
+                let pos = egui::pos2(x as f32, y as f32);
+                app.hovered_folder = None;
+                drive_grid(app, ctx, false, vec![egui::Event::PointerMoved(pos)]);
+                if app.hovered_folder.as_deref() != Some(folder) {
+                    continue;
+                }
+                egui::DragAndDrop::clear_payload(ctx);
+                drive_grid(app, ctx, false, vec![button(pos, true)]);
+                drive_grid(
+                    app,
+                    ctx,
+                    false,
+                    vec![egui::Event::PointerMoved(pos + egui::vec2(0.0, 12.0))],
+                );
+                let published = egui::DragAndDrop::has_any_payload(ctx);
+                egui::DragAndDrop::clear_payload(ctx);
+                drive_grid(app, ctx, false, vec![button(pos, false)]);
+                if published {
+                    return Some(pos);
+                }
+            }
+        }
+        None
+    }
+
+    /// Find a point inside the folder's grid cell using hover alone, so no
+    /// earlier click can disturb egui's click counting in the test that
+    /// follows.
+    fn grid_hover_point(
+        app: &mut BridgeApp,
+        ctx: &egui::Context,
+        folder: &Path,
+    ) -> Option<egui::Pos2> {
+        for y in (10..700).step_by(17) {
+            for x in (10..900).step_by(17) {
+                let pos = egui::pos2(x as f32, y as f32);
+                app.hovered_folder = None;
+                drive_grid(app, ctx, false, vec![egui::Event::PointerMoved(pos)]);
+                if app.hovered_folder.as_deref() == Some(folder) {
+                    return Some(pos);
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn a_double_click_still_opens_a_grid_folder() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        let source = root.join("a_dir");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data);
+        let from = grid_hover_point(&mut app, &ctx, &source).expect("source cell located");
+
+        // One event per frame, the way the window delivers them: the second
+        // press/release pair must descend into the folder.
+        drive_grid(&mut app, &ctx, false, vec![egui::Event::PointerMoved(from)]);
+        drive_grid(&mut app, &ctx, false, vec![button(from, true)]);
+        drive_grid(&mut app, &ctx, false, vec![button(from, false)]);
+        drive_grid(&mut app, &ctx, false, vec![button(from, true)]);
+        drive_grid(&mut app, &ctx, false, vec![button(from, false)]);
+        assert_eq!(
+            app.browser.root.as_deref(),
+            Some(source.as_path()),
+            "the double click should have opened the folder: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn a_plain_grid_click_selects_and_moves_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        let source = root.join("a_dir");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data);
+        // Hover-only locating: pressing here would already open egui's
+        // double-click window before the click under test.
+        let from = grid_hover_point(&mut app, &ctx, &source).expect("source cell located");
+
+        // A press and release without moving is a click, not a drag: the cell
+        // must be selected and nothing may be moved. The new drag surface has
+        // drag sense only, so the click still belongs to the cell's own
+        // widgets.
+        drive_grid(&mut app, &ctx, false, vec![button(from, true)]);
+        drive_grid(&mut app, &ctx, false, vec![button(from, false)]);
+        let index = app
+            .browser
+            .entries
+            .iter()
+            .position(|entry| entry.path == source)
+            .expect("folder is listed");
+        assert!(
+            app.browser.selection.contains(index),
+            "a plain click should select the cell: {}",
+            app.status
+        );
+        assert!(source.exists(), "a click moved nothing");
+        assert_eq!(
+            app.browser.root.as_deref(),
+            Some(root.as_path()),
+            "a click must not navigate either"
+        );
+    }
+
+    #[test]
+    fn dragging_a_folder_cell_onto_another_folder_cell_moves_it_on_disk() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        let source = root.join("a_dir");
+        let target = root.join("z_dir");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data);
+        let from = grid_point(&mut app, &ctx, &source).expect("source cell located");
+        let to = grid_point(&mut app, &ctx, &target).expect("target cell located");
+
+        drive_grid(&mut app, &ctx, false, vec![button(from, true)]);
+        drive_grid(
+            &mut app,
+            &ctx,
+            false,
+            vec![egui::Event::PointerMoved(from + egui::vec2(0.0, 12.0))],
+        );
+        drive_grid(&mut app, &ctx, false, vec![egui::Event::PointerMoved(to)]);
+        drive_grid(&mut app, &ctx, false, vec![button(to, false)]);
+
+        assert!(
+            target.join("a_dir").is_dir(),
+            "the grid drop should have moved the folder in: {}",
+            app.status
+        );
+        assert!(!source.exists(), "the source must not be left behind");
+        assert!(app.status.starts_with("Moved 1 item(s)"), "{}", app.status);
+    }
+
+    #[test]
+    fn dragging_a_folder_row_onto_another_folder_moves_it_on_disk() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        let source = root.join("a_dir");
+        let target = root.join("z_dir");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(source.join("inner.bin"), b"payload").unwrap();
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data);
+        let from = point_over_folder(&mut app, &ctx, &source).expect("source row located");
+        let to = point_over_folder(&mut app, &ctx, &target).expect("target row located");
+
+        drive_list(&mut app, &ctx, false, vec![button(from, true)]);
+        // Move away from the press point: that is what turns the press into a
+        // drag and publishes the selection as the payload.
+        drive_list(
+            &mut app,
+            &ctx,
+            false,
+            vec![egui::Event::PointerMoved(from + egui::vec2(0.0, 8.0))],
+        );
+        drive_list(&mut app, &ctx, false, vec![egui::Event::PointerMoved(to)]);
+        drive_list(&mut app, &ctx, false, vec![button(to, false)]);
+
+        assert!(
+            target.join("a_dir").is_dir(),
+            "the drop should have moved the folder into the target: {}",
+            app.status
+        );
+        assert!(!source.exists(), "the source must not be left behind");
+        assert!(
+            target.join("a_dir").join("inner.bin").is_file(),
+            "the tree moves with it"
+        );
+        assert!(app.status.starts_with("Moved 1 item(s)"), "{}", app.status);
+    }
+
+    #[test]
+    fn alt_drag_copies_instead_of_moving() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        let source = root.join("a_dir");
+        let target = root.join("z_dir");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data);
+        let from = point_over_folder(&mut app, &ctx, &source).expect("source row located");
+        let to = point_over_folder(&mut app, &ctx, &target).expect("target row located");
+
+        drive_list(&mut app, &ctx, true, vec![button(from, true)]);
+        drive_list(
+            &mut app,
+            &ctx,
+            true,
+            vec![egui::Event::PointerMoved(from + egui::vec2(0.0, 8.0))],
+        );
+        drive_list(&mut app, &ctx, true, vec![egui::Event::PointerMoved(to)]);
+        drive_list(&mut app, &ctx, true, vec![button(to, false)]);
+
+        assert!(
+            target.join("a_dir").is_dir(),
+            "the copy landed: {}",
+            app.status
+        );
+        assert!(source.exists(), "a copy leaves the original in place");
+        assert!(app.status.starts_with("Copied 1 item(s)"), "{}", app.status);
+    }
+
+    #[test]
+    fn dropping_on_a_file_row_moves_nothing_and_dropping_on_itself_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        let source = root.join("a_dir");
+        let other_dir = root.join("z_dir");
+        let file_row = root.join("b_file.jpg");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&other_dir).unwrap();
+        std::fs::write(&file_row, b"asset").unwrap();
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data);
+        let from = point_over_folder(&mut app, &ctx, &source).expect("source row located");
+
+        // Rows are folders first, then files by name, so the row after `z_dir`
+        // is `b_file.jpg`: only folders report a hover target, so the app must
+        // not move anything onto it.
+        let sibling = point_over_folder(&mut app, &ctx, &other_dir).expect("sibling row located");
+        let onto_file = point_after(from, sibling);
+        app.hovered_folder = None;
+        drive_list(
+            &mut app,
+            &ctx,
+            false,
+            vec![egui::Event::PointerMoved(onto_file)],
+        );
+        assert_eq!(app.hovered_folder, None, "a file is not a drop target");
+
+        drive_list(&mut app, &ctx, false, vec![button(from, true)]);
+        drive_list(
+            &mut app,
+            &ctx,
+            false,
+            vec![egui::Event::PointerMoved(from + egui::vec2(0.0, 8.0))],
+        );
+        drive_list(
+            &mut app,
+            &ctx,
+            false,
+            vec![egui::Event::PointerMoved(onto_file)],
+        );
+        drive_list(&mut app, &ctx, false, vec![button(onto_file, false)]);
+        assert!(source.is_dir(), "nothing moved onto a file row");
+        assert!(
+            !other_dir.join("a_dir").exists(),
+            "and nothing moved into the sibling folder either"
+        );
+
+        // Releasing a folder onto itself is rejected by the core before any
+        // filesystem change, and says so.
+        drive_list(&mut app, &ctx, false, vec![button(from, true)]);
+        drive_list(
+            &mut app,
+            &ctx,
+            false,
+            vec![egui::Event::PointerMoved(from + egui::vec2(0.0, 8.0))],
+        );
+        drive_list(&mut app, &ctx, false, vec![button(from, false)]);
+        assert!(
+            app.status.starts_with("Drop rejected"),
+            "self-drop reported: {}",
+            app.status
+        );
+        assert!(source.is_dir(), "a rejected drop leaves the tree untouched");
+    }
+
+    #[test]
+    fn os_drops_prefer_the_hovered_folder_then_the_open_root() {
+        let hovered = Path::new("/library/keepers");
+        let root = Path::new("/library");
+        assert_eq!(
+            os_drop_target(Some(hovered), Some(root)).as_deref(),
+            Some(hovered)
+        );
+        assert_eq!(
+            os_drop_target(None, Some(root)).as_deref(),
+            Some(root),
+            "with nothing hovered the open folder takes the files"
+        );
+        assert_eq!(os_drop_target(None, None), None);
+    }
+
+    #[test]
+    fn unnamed_desktop_drops_are_counted_not_dropped_silently() {
+        let named = egui::DroppedFile {
+            path: Some(PathBuf::from("/tmp/asset.jpg")),
+            ..Default::default()
+        };
+        let anonymous = egui::DroppedFile {
+            path: None,
+            name: "clipboard-image".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(
+            os_drop_paths(&[named.clone(), anonymous.clone()]),
+            (vec![PathBuf::from("/tmp/asset.jpg")], 1)
+        );
+        // A drop of nothing but anonymous payloads must still be reported.
+        assert_eq!(os_drop_paths(&[anonymous]), (Vec::new(), 1));
+        assert_eq!(os_drop_paths(&[]), (Vec::new(), 0));
+    }
+
+    #[test]
+    fn move_drop_relocates_and_copy_drop_duplicates() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        let source = temp.path().join("asset.bin");
+        std::fs::write(&source, b"asset").unwrap();
+
+        let status = apply_transfer(std::slice::from_ref(&source), &folder, drop_mode(false));
+        assert!(status.starts_with("Moved 1 item(s)"), "{status}");
+        assert!(!source.exists(), "a move leaves the source behind");
+        assert_eq!(
+            std::fs::read(folder.join("asset.bin")).unwrap(),
+            b"asset" as &[u8]
+        );
+
+        let other = temp.path().join("other.bin");
+        std::fs::write(&other, b"copy").unwrap();
+        let status = apply_transfer(std::slice::from_ref(&other), &folder, drop_mode(true));
+        assert!(status.starts_with("Copied 1 item(s)"), "{status}");
+        assert!(other.exists(), "a copy keeps the source");
+        assert_eq!(
+            std::fs::read(folder.join("other.bin")).unwrap(),
+            b"copy" as &[u8]
+        );
+    }
+
+    #[test]
+    fn move_drop_into_same_folder_skips() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("asset.bin");
+        std::fs::write(&file, b"asset").unwrap();
+        let status = apply_transfer(std::slice::from_ref(&file), temp.path(), drop_mode(false));
+        assert!(status.contains("skipped 1"), "{status}");
+        assert!(file.exists());
+    }
+
+    #[test]
+    fn folder_drop_into_itself_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("parent");
+        let child = parent.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(child.join("asset.bin"), b"asset").unwrap();
+
+        let status = apply_transfer(std::slice::from_ref(&parent), &child, drop_mode(false));
+        assert!(status.starts_with("Drop rejected"), "{status}");
+        assert!(
+            child.join("asset.bin").exists(),
+            "a rejection touches nothing"
+        );
+    }
+
+    #[test]
+    fn collision_reports_the_first_failure_and_keeps_the_rest() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("taken.bin"), b"existing").unwrap();
+        let taken = temp.path().join("taken.bin");
+        std::fs::write(&taken, b"new").unwrap();
+        let fresh = temp.path().join("fresh.bin");
+        std::fs::write(&fresh, b"fresh").unwrap();
+
+        let status = apply_transfer(&[taken, fresh], &folder, drop_mode(true));
+        assert!(status.contains("1 failed"), "{status}");
+        assert!(
+            status.contains("already exists") || status.contains("PathAlreadyExists"),
+            "{status}"
+        );
+        assert_eq!(
+            std::fs::read(folder.join("taken.bin")).unwrap(),
+            b"existing" as &[u8],
+            "a collision never overwrites the existing file"
+        );
+        assert!(folder.join("fresh.bin").exists(), "the batch continues");
     }
 }

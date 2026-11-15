@@ -73,7 +73,7 @@ fn main() -> anyhow::Result<()> {
     eframe::run_native(
         "BridgeCraft",
         options,
-        Box::new(|cc| Box::new(app::BridgeApp::new(cc, root, cache_path))),
+        Box::new(|cc| Box::new(app::BridgeApp::new(&cc.egui_ctx, root, cache_path))),
     )
     .map_err(|e| anyhow::anyhow!("eframe exited with an error: {e}"))?;
     Ok(())
