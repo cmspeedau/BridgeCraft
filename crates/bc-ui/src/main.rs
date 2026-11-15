@@ -3,6 +3,7 @@
 mod app;
 mod batch_rename_ui;
 mod metadata_edit;
+mod tag_widgets;
 mod viewer;
 
 use std::path::{Path, PathBuf};

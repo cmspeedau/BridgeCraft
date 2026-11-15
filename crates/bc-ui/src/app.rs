@@ -32,6 +32,7 @@ use eframe::egui;
 
 use crate::batch_rename_ui;
 use crate::metadata_edit::{self, BulkReport, MetadataForm};
+use crate::tag_widgets;
 use crate::viewer::{self, ViewerState, ZoomMode, FULL_EDGE, PREVIEW_EDGE};
 
 /// Default grid cell width; the status-bar zoom slider ranges from this.
@@ -262,11 +263,26 @@ pub struct BridgeApp {
     metadata_form_path: Option<PathBuf>,
     metadata_form_mtime: i64,
     metadata_status: Option<String>,
+    /// Rating, label, flag and keywords for the same selection as above.
+    tags_form: metadata_edit::TagsForm,
+    /// Text in the keyword add field.
+    keyword_draft: String,
     /// Multi-selection bulk editor buffers.
     bulk_description: String,
     bulk_artist: String,
     bulk_copyright: String,
     bulk_report: Option<BulkReport>,
+    /// Bulk tag stamping: each property is applied only when its own box is
+    /// checked, so "set the copyright and leave the ratings alone" is one
+    /// explicit statement rather than a guess from which fields are empty.
+    bulk_tags: metadata_edit::TagStamp,
+    /// Keyword typed into the bulk add field.
+    bulk_keyword: String,
+    /// Keyword typed into the bulk remove field.
+    bulk_keyword_remove: String,
+    bulk_rating_enabled: bool,
+    bulk_label_enabled: bool,
+    bulk_flag_enabled: bool,
 
     // ------------------------------------------------------------- export --
     /// Session-lifetime export job queue (all logic lives in `bc-core`).
@@ -352,10 +368,18 @@ impl BridgeApp {
             metadata_form_path: None,
             metadata_form_mtime: 0,
             metadata_status: None,
+            tags_form: metadata_edit::TagsForm::default(),
+            keyword_draft: String::new(),
             bulk_description: String::new(),
             bulk_artist: String::new(),
             bulk_copyright: String::new(),
             bulk_report: None,
+            bulk_tags: metadata_edit::TagStamp::default(),
+            bulk_keyword: String::new(),
+            bulk_keyword_remove: String::new(),
+            bulk_rating_enabled: false,
+            bulk_label_enabled: false,
+            bulk_flag_enabled: false,
             export_queue: ExportQueue::new(bc_core::export::default_worker_count()),
             export_dialog: None,
             jobs_window: false,
@@ -818,6 +842,15 @@ impl BridgeApp {
         Some(meta)
     }
 
+    /// The four tag properties for a file, read through the same cache as the
+    /// panel (which already folds the sidecar's mtime into its key). Cell and
+    /// row overlays call this only for what is on screen.
+    fn tags_for(&mut self, path: &Path, mtime: i64) -> metadata_edit::TagState {
+        self.exif_for(path, mtime)
+            .map(|meta| metadata_edit::TagState::from_metadata(&meta))
+            .unwrap_or_default()
+    }
+
     fn prop_row(ui: &mut egui::Ui, label: &str, value: String) {
         ui.horizontal(|ui| {
             ui.add_sized(
@@ -1018,6 +1051,99 @@ impl BridgeApp {
         }
     }
 
+    /// Rating, color label, flag and keywords for the current selection.
+    ///
+    /// These four go to the XMP sidecar rather than into the image, because
+    /// they have no EXIF equivalent and embedded XMP writing is still Phase 3
+    /// work. The section says where they land, so nobody has to guess why the
+    /// JPEG itself did not change.
+    fn tags_ui(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.add(
+            egui::Label::new(egui::RichText::new("Rating & labels").strong().small())
+                .selectable(false),
+        );
+
+        if let Some(stars) = tag_widgets::rating_row(ui, self.tags_form.current().stars) {
+            self.tags_form.set_stars(stars);
+        }
+        if let Some(label) = tag_widgets::label_chips(ui, &self.tags_form.current().label) {
+            self.tags_form.set_label(&label);
+        }
+        if let Some(flag) = tag_widgets::flag_row(ui, self.tags_form.current().flag) {
+            self.tags_form.set_flag(flag);
+        }
+
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new("Keywords (stored in the XMP sidecar; click one to remove)")
+                    .weak()
+                    .small(),
+            )
+            .selectable(false),
+        );
+        if let Some(removed) = tag_widgets::keyword_chips(ui, &self.tags_form.current().keywords) {
+            self.tags_form.remove_keyword(&removed);
+        }
+
+        let mut request_add = false;
+        ui.horizontal(|ui| {
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut self.keyword_draft)
+                    .hint_text("new keyword")
+                    .font(egui::TextStyle::Small)
+                    .desired_width(ui.available_width() - 42.0),
+            );
+            if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                request_add = true;
+            }
+            if ui.small_button("Add").clicked() {
+                request_add = true;
+            }
+        });
+
+        // Completions come from the hierarchy this file already carries, so
+        // typing a parent offers its children instead of inventing a global
+        // keyword pool that nothing fills yet.
+        let prefix = self.keyword_draft.trim().to_string();
+        let suggestions: Vec<String> = if prefix.is_empty() {
+            Vec::new()
+        } else {
+            bc_metadata::keywords::suggest(&self.tags_form.current().keywords, &prefix)
+        };
+        let mut chosen: Option<String> = None;
+        if !suggestions.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.add(
+                    egui::Label::new(egui::RichText::new("Complete:").weak().small())
+                        .selectable(false),
+                );
+                for suggestion in &suggestions {
+                    if ui
+                        .small_button(egui::RichText::new(suggestion.as_str()).small())
+                        .clicked()
+                    {
+                        chosen = Some(suggestion.clone());
+                    }
+                }
+            });
+        }
+        if let Some(suggestion) = chosen {
+            self.keyword_draft = suggestion;
+            request_add = true;
+        }
+
+        if request_add {
+            let text = std::mem::take(&mut self.keyword_draft);
+            let trimmed = text.trim().to_string();
+            if trimmed.is_empty() {
+                self.metadata_status = Some("A keyword needs some text.".to_string());
+            } else if !self.tags_form.add_keyword(&trimmed) {
+                self.metadata_status = Some(format!("\"{trimmed}\" is already on this file."));
+            }
+        }
+    }
+
     /// Editable metadata form for the single selection: dirty rows are
     /// tinted, Save writes through the #5 policy and Revert restores the
     /// values loaded from disk.
@@ -1027,12 +1153,15 @@ impl BridgeApp {
         if needs_load {
             let meta = self.exif_for(path, mtime).unwrap_or_default();
             self.metadata_form.load(&meta);
+            self.tags_form.load(&meta);
+            self.keyword_draft.clear();
             self.metadata_form_path = Some(path.to_path_buf());
             self.metadata_form_mtime = mtime;
             self.metadata_status = None;
         }
 
         ui.add(egui::Label::new(egui::RichText::new("Metadata").weak().small()).selectable(false));
+        self.tags_ui(ui);
         for value in self.metadata_form.values_mut() {
             let dirty = value.is_dirty();
             let label = if dirty {
@@ -1067,27 +1196,47 @@ impl BridgeApp {
             }
         }
 
-        let dirty_count = self.metadata_form.dirty_count();
+        let text_dirty = self.metadata_form.is_dirty();
+        let tags_dirty = self.tags_form.is_dirty();
+        let dirty = text_dirty || tags_dirty;
+        let text_count = self.metadata_form.dirty_count();
+        // The count says what is unsaved rather than implying only fields:
+        // saving is enabled for tags too, and "0 unsaved" next to a live Save
+        // button would read as a bug.
+        let summary = match (text_count, tags_dirty) {
+            (0, false) => None,
+            (0, true) => Some("tags unsaved".to_string()),
+            (n, false) => Some(format!("{n} unsaved")),
+            (n, true) => Some(format!("{n} fields + tags unsaved")),
+        };
         ui.horizontal(|ui| {
-            let dirty = self.metadata_form.is_dirty();
             if ui
                 .add_enabled(dirty, egui::Button::new("Save").small())
                 .clicked()
             {
-                let changes = self.metadata_form.dirty_changes();
-                let report = metadata_edit::apply_changes(
-                    std::slice::from_ref(&path.to_path_buf()),
-                    &changes,
-                    bc_metadata::WritePolicy::Auto,
-                );
-                match report.failures.first() {
-                    Some(failure) => {
-                        self.metadata_status = Some(format!("Save failed: {}", failure.error));
+                let mut problems: Vec<String> = Vec::new();
+                if text_dirty {
+                    let changes = self.metadata_form.dirty_changes();
+                    let report = metadata_edit::apply_changes(
+                        std::slice::from_ref(&path.to_path_buf()),
+                        &changes,
+                        bc_metadata::WritePolicy::Auto,
+                    );
+                    problems.extend(report.failures.into_iter().map(|f| f.error));
+                }
+                if tags_dirty {
+                    let tags = self.tags_form.current().clone();
+                    if let Err(error) = metadata_edit::save_tags(path, &tags) {
+                        problems.push(error);
                     }
+                }
+                match problems.first() {
+                    Some(error) => self.metadata_status = Some(format!("Save failed: {error}")),
                     None => {
                         self.exif_cache.remove(path);
                         let saved = metadata_edit::read_panel_metadata(path);
                         self.metadata_form.load(&saved);
+                        self.tags_form.load(&saved);
                         self.metadata_form_mtime =
                             mtime_ns(std::fs::metadata(path).and_then(|m| m.modified()).ok());
                         self.metadata_status = Some("Saved.".to_string());
@@ -1100,12 +1249,14 @@ impl BridgeApp {
                 .clicked()
             {
                 self.metadata_form.revert();
+                self.tags_form.revert();
+                self.keyword_draft.clear();
                 self.metadata_status = None;
             }
-            if dirty_count > 0 {
+            if let Some(summary) = summary {
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new(format!("{dirty_count} unsaved"))
+                        egui::RichText::new(summary)
                             .small()
                             .color(ui.visuals().warn_fg_color),
                     )
@@ -1173,9 +1324,66 @@ impl BridgeApp {
                 }
             }
 
+            ui.separator();
+            ui.add(
+                egui::Label::new(egui::RichText::new("Rating & labels").strong().small())
+                    .selectable(false),
+            );
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.bulk_rating_enabled, "Set rating");
+                if self.bulk_rating_enabled {
+                    if let Some(stars) =
+                        tag_widgets::rating_row(ui, self.bulk_tags.stars.unwrap_or(0))
+                    {
+                        self.bulk_tags.stars = Some(stars);
+                    }
+                } else {
+                    self.bulk_tags.stars = None;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.bulk_label_enabled, "Set label");
+                if self.bulk_label_enabled {
+                    if let Some(label) =
+                        tag_widgets::label_chips(ui, self.bulk_tags.label.as_deref().unwrap_or(""))
+                    {
+                        self.bulk_tags.label = if label.is_empty() { None } else { Some(label) };
+                    }
+                } else {
+                    self.bulk_tags.label = None;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.bulk_flag_enabled, "Set flag");
+                if self.bulk_flag_enabled {
+                    if let Some(flag) =
+                        tag_widgets::flag_row(ui, self.bulk_tags.flag.unwrap_or_default())
+                    {
+                        self.bulk_tags.flag = Some(flag);
+                    }
+                } else {
+                    self.bulk_tags.flag = None;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Add keyword:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.bulk_keyword)
+                        .font(egui::TextStyle::Small)
+                        .desired_width(110.0),
+                );
+                ui.label("Remove:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.bulk_keyword_remove)
+                        .font(egui::TextStyle::Small)
+                        .desired_width(110.0),
+                );
+            });
+
             let has_value = !self.bulk_description.trim().is_empty()
                 || !self.bulk_artist.trim().is_empty()
-                || !self.bulk_copyright.trim().is_empty();
+                || !self.bulk_copyright.trim().is_empty()
+                || !self.bulk_tags.is_empty();
             ui.horizontal(|ui| {
                 if ui
                     .add_enabled(has_value, egui::Button::new("Apply to selection").small())
@@ -1197,24 +1405,66 @@ impl BridgeApp {
                             });
                         }
                     }
+                    let mut stamp = self.bulk_tags.clone();
+                    let add = self.bulk_keyword.trim().to_string();
+                    let remove = self.bulk_keyword_remove.trim().to_string();
+                    if !add.is_empty() {
+                        stamp.add_keywords = vec![add];
+                    }
+                    if !remove.is_empty() {
+                        stamp.remove_keywords = vec![remove];
+                    }
+                    let stamp_is_empty = stamp.is_empty();
+                    let tags = metadata_edit::apply_stamp_to_many(&paths, &stamp);
                     let report = metadata_edit::apply_changes(
                         &paths,
                         &changes,
                         bc_metadata::WritePolicy::Auto,
                     );
-                    self.status = format!(
-                        "Bulk metadata: {} saved, {} failed",
-                        report.succeeded,
-                        report.failures.len()
+                    // One failure list for both writes: a file whose tags
+                    // failed is as real to the user as one whose fields did.
+                    let mut failures: Vec<(PathBuf, String)> = report
+                        .failures
+                        .iter()
+                        .map(|failure| (failure.path.clone(), failure.error.clone()))
+                        .collect();
+                    failures.extend(tags.failures.clone());
+                    let mut parts = Vec::new();
+                    if !changes.is_empty() {
+                        parts.push(format!("{} files with fields written", report.succeeded));
+                    }
+                    if !stamp_is_empty {
+                        parts.push(format!("{} files with tags written", tags.succeeded));
+                    }
+                    let mut combined = report;
+                    combined.failures.extend(
+                        tags.failures
+                            .into_iter()
+                            .map(|(path, error)| metadata_edit::BulkFailure { path, error }),
                     );
+                    self.status = if parts.is_empty() {
+                        "Bulk edit: nothing to write.".to_string()
+                    } else {
+                        format!(
+                            "Bulk edit: {}; {} file(s) failed",
+                            parts.join(", "),
+                            failures.len()
+                        )
+                    };
                     self.exif_cache.clear();
                     self.metadata_form_path = None;
-                    self.bulk_report = Some(report);
+                    self.bulk_report = Some(combined);
                 }
                 if ui.add(egui::Button::new("Clear").small()).clicked() {
                     self.bulk_description.clear();
                     self.bulk_artist.clear();
                     self.bulk_copyright.clear();
+                    self.bulk_tags = metadata_edit::TagStamp::default();
+                    self.bulk_keyword.clear();
+                    self.bulk_keyword_remove.clear();
+                    self.bulk_rating_enabled = false;
+                    self.bulk_label_enabled = false;
+                    self.bulk_flag_enabled = false;
                     self.bulk_report = None;
                 }
             });
@@ -1567,11 +1817,21 @@ impl BridgeApp {
                         let size = entry.size;
                         let modified = entry.modified;
                         let selected = self.browser.selection.contains(idx);
+                        // Tags are read for the cells on screen only, through
+                        // the panel's cache, so a rating set in the panel shows
+                        // up in the grid on the next frame.
+                        let tags = if is_dir {
+                            metadata_edit::TagState::default()
+                        } else {
+                            self.tags_for(&path, mtime_ns(modified))
+                        };
                         let cell = ui.allocate_ui_with_layout(
                             egui::vec2(cell_width, row_height),
                             egui::Layout::top_down(egui::Align::Center),
                             |cell_ui| {
-                                self.cell(cell_ui, idx, &path, is_dir, size, selected, cell_width)
+                                self.cell(
+                                    cell_ui, idx, &path, is_dir, size, selected, cell_width, &tags,
+                                )
                             },
                         );
                         // One interaction widget per cell: `cell()` allocates the
@@ -1668,14 +1928,24 @@ impl BridgeApp {
     fn content_list(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, details: bool) {
         let visible = self.display_indices();
         if details {
+            // The header shares `details_column_x` with the rows, so a column
+            // title cannot drift away from its values.
             ui.horizontal(|ui| {
-                ui.strong("Name");
-                ui.add_space(ui.available_width() * 0.48);
-                ui.strong("Type");
-                ui.add_space(48.0);
-                ui.strong("Size");
-                ui.add_space(42.0);
-                ui.strong("Modified");
+                let left = ui.cursor().left();
+                // Rows are laid out inside the scroll area, which reserves the
+                // scrollbar's width; measure the header the same way.
+                let width = ui.available_width() - ui.spacing().scroll.bar_width;
+                let y = ui.cursor().center().y;
+                for (column, (title, _)) in details_columns().iter().enumerate() {
+                    ui.painter().text(
+                        egui::pos2(details_column_x(left, width, column), y),
+                        egui::Align2::LEFT_CENTER,
+                        *title,
+                        egui::FontId::proportional(14.0),
+                        ui.visuals().strong_text_color(),
+                    );
+                }
+                ui.add_space(width);
             });
             ui.separator();
         }
@@ -1731,6 +2001,10 @@ impl BridgeApp {
                 let name = entry.name().to_string_lossy().into_owned();
                 let is_dir = entry.is_dir;
                 let size = entry.size;
+                // Cloned up front: the tag read below needs `&mut self` for its
+                // cache, and `entry` borrows the browser.
+                let entry_path = entry.path.clone();
+                let entry_modified = entry.modified;
                 let modified = format_modified(entry.modified);
                 let file_type = if is_dir {
                     "Folder".to_owned()
@@ -1762,12 +2036,14 @@ impl BridgeApp {
                     ui.visuals().text_color()
                 };
                 if details {
-                    let widths = [
-                        rect.width() * 0.52,
-                        rect.width() * 0.18,
-                        rect.width() * 0.14,
-                        rect.width() * 0.16,
-                    ];
+                    let tags = if is_dir {
+                        metadata_edit::TagState::default()
+                    } else {
+                        self.tags_for(&entry_path, mtime_ns(entry_modified))
+                    };
+                    // Six columns, ordered by what decides a photographer's
+                    // next move: what it is, how big, when, then the two
+                    // judgements the user made about it.
                     let values = [
                         format!("{}  {name}", if is_dir { "📁" } else { "·" }),
                         file_type,
@@ -1777,19 +2053,49 @@ impl BridgeApp {
                             human_size(size)
                         },
                         modified,
+                        if tags.stars > 0 {
+                            format!("{}", tags.stars)
+                        } else {
+                            String::new()
+                        },
+                        tags.label.clone(),
                     ];
-                    let mut x = rect.left() + 8.0;
-                    for (value, width) in values.iter().zip(widths) {
+                    for (column, value) in values.iter().enumerate() {
+                        let column_x = details_column_x(rect.left(), rect.width(), column);
+                        if column == 5 && !value.is_empty() {
+                            // The label column carries its chip color, so the
+                            // name is not the only thing telling you which
+                            // label is on the file.
+                            ui.painter().circle_filled(
+                                egui::pos2(column_x + 4.0, rect.center().y),
+                                3.6,
+                                metadata_edit::label_color(value),
+                            );
+                        }
                         ui.painter().text(
-                            egui::pos2(x, rect.center().y),
+                            egui::pos2(
+                                if column == 5 {
+                                    column_x + 11.0
+                                } else {
+                                    column_x
+                                },
+                                rect.center().y,
+                            ),
                             egui::Align2::LEFT_CENTER,
                             value,
                             egui::FontId::proportional(13.0),
                             color,
                         );
-                        x += width;
                     }
                 } else {
+                    // Plain list: no room for columns, so the label rides on
+                    // the right edge as its chip color and the rating is left
+                    // to the details view rather than competing with the name.
+                    let tags = if is_dir {
+                        metadata_edit::TagState::default()
+                    } else {
+                        self.tags_for(&entry_path, mtime_ns(entry_modified))
+                    };
                     ui.painter().text(
                         egui::pos2(rect.left() + 8.0, rect.center().y),
                         egui::Align2::LEFT_CENTER,
@@ -1797,6 +2103,19 @@ impl BridgeApp {
                         egui::FontId::proportional(14.0),
                         color,
                     );
+                    if !tags.label.is_empty() {
+                        let center = egui::pos2(rect.right() - 12.0, rect.center().y);
+                        ui.painter().circle_filled(
+                            center,
+                            4.6,
+                            egui::Color32::from_black_alpha(190),
+                        );
+                        ui.painter().circle_filled(
+                            center,
+                            3.6,
+                            metadata_edit::label_color(&tags.label),
+                        );
+                    }
                 }
                 if response.secondary_clicked() && !self.browser.selection.contains(idx) {
                     self.browser.selection.select_only(idx);
@@ -2997,6 +3316,7 @@ impl BridgeApp {
         size: u64,
         selected: bool,
         cell_size: f32,
+        tags: &metadata_edit::TagState,
     ) -> egui::Response {
         let _ = idx;
         let name = path
@@ -3045,6 +3365,27 @@ impl BridgeApp {
             if selected {
                 ui.painter()
                     .rect_stroke(rect.expand(3.0), 6.0, egui::Stroke::new(2.0_f32, ACCENT));
+            }
+
+            // Tag overlays, in the corners that never fight the filename: the
+            // label dot sits on the thumbnail, the rating under it. The flag
+            // stays out of the grid, because a third mark on a cell this small
+            // is decoration rather than information; it reads in the panel and
+            // in the details column. A dark ring keeps the dot legible on a
+            // bright thumbnail as well as on the dark placeholder.
+            if !tags.label.is_empty() {
+                let center = egui::pos2(rect.left() + 10.0, rect.top() + 10.0);
+                ui.painter()
+                    .circle_filled(center, 5.6, egui::Color32::from_black_alpha(190));
+                ui.painter()
+                    .circle_filled(center, 4.0, metadata_edit::label_color(&tags.label));
+            }
+            if tags.stars > 0 {
+                tag_widgets::rating_inline(
+                    ui,
+                    egui::pos2(rect.left(), rect.bottom() + 2.0),
+                    tags.stars,
+                );
             }
 
             ui.set_min_width((cell_size - 16.0).max(1.0));
@@ -3718,6 +4059,30 @@ fn navigation_target(visible: &[usize], selection: &Selection, delta: i32) -> Op
     Some(visible[next])
 }
 
+/// Details-view columns, in panel order, with each one's share of the row
+/// width. The Name column gets the largest share because the filename is what
+/// the eye goes to; Rating and Label are the narrow tails.
+pub fn details_columns() -> [(&'static str, f32); 6] {
+    [
+        ("Name", 0.38),
+        ("Type", 0.12),
+        ("Size", 0.10),
+        ("Modified", 0.16),
+        ("Rating", 0.08),
+        ("Label", 0.16),
+    ]
+}
+
+/// Left text edge of a details column, so the header and the rows agree.
+pub fn details_column_x(left: f32, width: f32, column: usize) -> f32 {
+    let columns = details_columns();
+    let offset: f32 = columns[..column.min(columns.len())]
+        .iter()
+        .map(|(_, share)| share)
+        .sum();
+    left + 8.0 + width * offset
+}
+
 fn format_modified(modified: Option<std::time::SystemTime>) -> String {
     use std::time::UNIX_EPOCH;
     let Some(seconds) = modified
@@ -3837,6 +4202,29 @@ mod tests {
         std::env::set_var("APPDATA", isolated);
         std::env::set_var("XDG_DATA_HOME", isolated.join("data"));
         BridgeApp::new(ctx, Some(root.display().to_string()), None)
+    }
+
+    #[test]
+    fn details_columns_line_up_without_overlapping_or_running_off_the_row() {
+        let (left, width) = (100.0_f32, 800.0_f32);
+        let columns = details_columns();
+        let mut previous = details_column_x(left, width, 0);
+        assert_eq!(previous, left + 8.0, "the first column keeps a left margin");
+        for index in 1..columns.len() {
+            let x = details_column_x(left, width, index);
+            assert!(x > previous, "column {index} must sit right of the last");
+            previous = x;
+        }
+        let last = details_column_x(left, width, columns.len() - 1);
+        assert!(
+            last < left + width,
+            "the last column must stay inside the row: {last} of {}",
+            left + width
+        );
+        // A narrow panel must not push columns past the row either: the shares
+        // are fractions, so they shrink with the width.
+        let narrow = details_column_x(0.0, 240.0, columns.len() - 1);
+        assert!(narrow < 240.0, "narrow panel overflow: {narrow}");
     }
 
     #[test]
@@ -4271,6 +4659,110 @@ mod tests {
             "with nothing hovered the open folder takes the files"
         );
         assert_eq!(os_drop_target(None, None), None);
+    }
+
+    /// Send one key press to the real metadata form and report what the panel
+    /// did. Tab traversal is how the editor is verified: it needs no pixel
+    /// guesses, and it is the same path a keyboard user takes.
+    fn press_key_in_form(
+        app: &mut BridgeApp,
+        ctx: &egui::Context,
+        path: &Path,
+        mtime: i64,
+        key: egui::Key,
+        repeats: usize,
+    ) {
+        let target = path.to_path_buf();
+        for _ in 0..repeats {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(420.0, 900.0),
+                )),
+                time: Some(next_frame_time()),
+                events: vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::default(),
+                }],
+                ..Default::default()
+            };
+            // The frame's FullOutput is not needed: this test reads the app's
+            // own state and the sidecar on disk. The form is drawn inside a
+            // scroll area because that is how the panel builds it, and egui
+            // walks the focus chain in the order widgets register it.
+            let _ = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .show(ui, |ui| app.metadata_form_ui(ui, &target, mtime));
+                });
+            });
+        }
+    }
+
+    #[test]
+    fn the_tag_editor_is_reachable_and_usable_from_the_keyboard() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("photo.jpg");
+        std::fs::write(&file, b"original image bytes").unwrap();
+        let mtime = 1_700_000_000_000_000_000;
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data);
+        let sidecar = bc_metadata::xmp::sidecar_path(&file);
+
+        // Tab to the first star and press Enter: a rating must appear.
+        let mut rated = false;
+        for _ in 0..12 {
+            press_key_in_form(&mut app, &ctx, &file, mtime, egui::Key::Tab, 1);
+            press_key_in_form(&mut app, &ctx, &file, mtime, egui::Key::Enter, 1);
+            if app.tags_form.current().stars > 0 {
+                rated = true;
+                break;
+            }
+        }
+        assert!(
+            rated,
+            "Tab plus Enter should set a rating; the panel is not keyboard reachable"
+        );
+        assert!(
+            !sidecar.exists(),
+            "editing alone must not write; Save is the write"
+        );
+
+        // Walk to Save and activate it. Space rather than Enter: egui's
+        // TextEdit ends editing on Enter and drops focus, which would send the
+        // walk back to the first widget every time it reached a text field.
+        // Space is the other key egui activates a focused button with, and it
+        // leaves focus where it is.
+        let mut wrote = false;
+        for _ in 0..60 {
+            press_key_in_form(&mut app, &ctx, &file, mtime, egui::Key::Tab, 1);
+            press_key_in_form(&mut app, &ctx, &file, mtime, egui::Key::Space, 1);
+            if sidecar.exists() {
+                wrote = true;
+                break;
+            }
+        }
+        assert!(wrote, "Save should be reachable from the keyboard");
+        let saved =
+            metadata_edit::TagState::from_metadata(&metadata_edit::read_panel_metadata(&file));
+        assert_eq!(
+            saved.stars,
+            app.tags_form.current().stars,
+            "what the form showed is what the sidecar holds"
+        );
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            b"original image bytes",
+            "tags never touch the image bytes"
+        );
     }
 
     #[test]
