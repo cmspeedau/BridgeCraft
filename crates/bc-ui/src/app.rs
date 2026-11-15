@@ -3749,6 +3749,7 @@ fn format_modified(modified: Option<std::time::SystemTime>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     /// egui needs a wall clock to tell a double click from two single ones, so
     /// the synthetic frames advance time the way a running window would.
@@ -3763,6 +3764,14 @@ mod tests {
             *clock
         })
     }
+
+    /// Store paths come from environment variables read at call time, so
+    /// `isolated_app` sets them. Environment mutation is process-global, so the
+    /// tests that build a `BridgeApp` take this lock and hold it for their
+    /// whole body: otherwise one test can move `HOME` while another is opening
+    /// its recents store, and the loser writes into a directory that the other
+    /// test has already deleted.
+    static STORE_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Press or release the primary button at `pos`.
     fn button(pos: egui::Pos2, pressed: bool) -> egui::Event {
@@ -3995,6 +4004,7 @@ mod tests {
 
     #[test]
     fn a_double_click_still_opens_a_grid_folder() {
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempfile::tempdir().unwrap();
         let data = temp.path().join("data");
         let root = temp.path().join("library");
@@ -4023,6 +4033,7 @@ mod tests {
 
     #[test]
     fn a_plain_grid_click_selects_and_moves_nothing() {
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempfile::tempdir().unwrap();
         let data = temp.path().join("data");
         let root = temp.path().join("library");
@@ -4063,6 +4074,7 @@ mod tests {
 
     #[test]
     fn dragging_a_folder_cell_onto_another_folder_cell_moves_it_on_disk() {
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempfile::tempdir().unwrap();
         let data = temp.path().join("data");
         let root = temp.path().join("library");
@@ -4098,6 +4110,7 @@ mod tests {
 
     #[test]
     fn dragging_a_folder_row_onto_another_folder_moves_it_on_disk() {
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempfile::tempdir().unwrap();
         let data = temp.path().join("data");
         let root = temp.path().join("library");
@@ -4140,6 +4153,7 @@ mod tests {
 
     #[test]
     fn alt_drag_copies_instead_of_moving() {
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempfile::tempdir().unwrap();
         let data = temp.path().join("data");
         let root = temp.path().join("library");
@@ -4175,6 +4189,7 @@ mod tests {
 
     #[test]
     fn dropping_on_a_file_row_moves_nothing_and_dropping_on_itself_is_rejected() {
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempfile::tempdir().unwrap();
         let data = temp.path().join("data");
         let root = temp.path().join("library");
