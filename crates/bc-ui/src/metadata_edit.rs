@@ -7,7 +7,11 @@
 
 use std::path::{Path, PathBuf};
 
-use bc_metadata::{Metadata, Value, WritePolicy, NS_EXIF};
+use bc_metadata::{
+    ratings::{ColorLabel, Flag, Rating},
+    Metadata, Value, WritePolicy, NS_EXIF,
+};
+use egui::Color32;
 
 /// EXIF namespace URI used by the XMP writer for aliased EXIF properties.
 const XMP_EXIF_URI: &str = "http://ns.adobe.com/exif/1.0/";
@@ -189,6 +193,250 @@ pub struct FieldChange {
     pub value: String,
 }
 
+// ---------------------------------------------------------------------------
+// Rating, color label, flag and keywords (issue #10's missing UI)
+// ---------------------------------------------------------------------------
+
+/// The label chips, in panel order. The name is what gets stored in
+/// `photoshop:Label`. Red, yellow, green, blue and purple are the names Adobe's
+/// published Photoshop namespace documents; orange and grey are label names
+/// BridgeCraft defines for its own chips (the property is free text, so other
+/// tools read them as custom labels rather than losing them).
+///
+/// These colors are data encoding, not decoration, which is why they sit
+/// outside the app's single-accent chrome palette.
+pub const LABEL_CHOICES: &[(&str, Color32)] = &[
+    ("", NO_LABEL),
+    ("Red", RED),
+    ("Orange", ORANGE),
+    ("Yellow", YELLOW),
+    ("Green", GREEN),
+    ("Blue", BLUE),
+    ("Purple", PURPLE),
+    ("Grey", GREY_LABEL),
+];
+
+// Each color is picked to clear WCAG's 3:1 non-text contrast against this app's
+// dark panel, which `label_colors_clear_non_text_contrast` checks. They are
+// pinned values rather than theme colors because one label must look the same
+// in the grid, the rows, the panel and the bulk editor.
+const RED: Color32 = Color32::from_rgb(226, 88, 79);
+const ORANGE: Color32 = Color32::from_rgb(230, 138, 58);
+const YELLOW: Color32 = Color32::from_rgb(216, 194, 74);
+const GREEN: Color32 = Color32::from_rgb(96, 190, 108);
+const BLUE: Color32 = Color32::from_rgb(86, 149, 226);
+const PURPLE: Color32 = Color32::from_rgb(170, 116, 222);
+const GREY_LABEL: Color32 = Color32::from_rgb(158, 164, 170);
+/// "No label": drawn as a hollow chip so the control stays visible and clickable.
+const NO_LABEL: Color32 = Color32::from_rgb(120, 126, 132);
+
+/// The chip color for a stored label name. Unknown names (from another tool)
+/// keep their own chip but are shown by name, so nothing is silently recolored.
+pub fn label_color(name: &str) -> Color32 {
+    LABEL_CHOICES
+        .iter()
+        .find(|(known, _)| *known == name)
+        .map(|(_, color)| *color)
+        .unwrap_or(GREY_LABEL)
+}
+
+/// Whether a label name is one of BridgeCraft's documented chips.
+pub fn is_known_label(name: &str) -> bool {
+    LABEL_CHOICES.iter().any(|(known, _)| *known == name)
+}
+
+/// The four tag properties as edited in the panel.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TagState {
+    pub stars: u8,
+    pub label: String,
+    pub flag: Flag,
+    pub keywords: Vec<String>,
+}
+
+impl TagState {
+    pub fn from_metadata(meta: &Metadata) -> Self {
+        Self {
+            stars: meta.rating().stars(),
+            label: meta
+                .color_label()
+                .as_label_str()
+                .unwrap_or_default()
+                .to_string(),
+            flag: meta.flag(),
+            keywords: bc_metadata::keywords::subjects(meta),
+        }
+    }
+
+    /// Write this state's four properties into `meta`.
+    pub fn apply_to(&self, meta: &mut Metadata) {
+        meta.set_rating(Rating::new(self.stars));
+        meta.set_color_label(ColorLabel::from_label_str(&self.label));
+        meta.set_flag(self.flag);
+        bc_metadata::keywords::set_subjects(meta, self.keywords.clone());
+    }
+}
+
+/// The tag editor for the current selection, with dirty tracking.
+#[derive(Debug, Clone, Default)]
+pub struct TagsForm {
+    original: TagState,
+    current: TagState,
+}
+
+impl TagsForm {
+    pub fn load(&mut self, meta: &Metadata) {
+        self.original = TagState::from_metadata(meta);
+        self.current = self.original.clone();
+    }
+
+    pub fn current(&self) -> &TagState {
+        &self.current
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.original != self.current
+    }
+
+    pub fn revert(&mut self) {
+        self.current = self.original.clone();
+    }
+
+    /// Set the rating. Clicking the current rating again clears it, which is
+    /// how the row stays five controls instead of six with a separate "clear"
+    /// button competing for attention.
+    pub fn set_stars(&mut self, stars: u8) {
+        self.current.stars = if self.current.stars == stars && stars > 0 {
+            0
+        } else {
+            stars.min(5)
+        };
+    }
+
+    pub fn set_label(&mut self, label: &str) {
+        self.current.label = label.to_string();
+    }
+
+    pub fn set_flag(&mut self, flag: Flag) {
+        self.current.flag = flag;
+    }
+
+    /// Add a keyword. Empty, whitespace-only and duplicate entries are
+    /// rejected by returning false, so the UI can say so instead of writing a
+    /// blank tag.
+    pub fn add_keyword(&mut self, keyword: &str) -> bool {
+        let trimmed = keyword.trim();
+        if trimmed.is_empty() || self.current.keywords.iter().any(|k| k == trimmed) {
+            return false;
+        }
+        self.current.keywords.push(trimmed.to_string());
+        true
+    }
+
+    pub fn remove_keyword(&mut self, keyword: &str) {
+        self.current.keywords.retain(|k| k != keyword);
+    }
+}
+
+/// Where a tag write lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagTarget {
+    /// An `.xmp` sidecar next to the original.
+    Sidecar,
+}
+
+/// Save the tags for one file.
+///
+/// Rating, label, flag and keywords have no EXIF equivalent, so they always go
+/// into the XMP sidecar and the original file is never touched. Embedded XMP
+/// packets (roadmap Phase 3, remaining work) will let JPEG and TIFF carry the
+/// same properties in place; until then one honest location beats a split that
+/// quietly drops tags on export.
+pub fn save_tags(path: &Path, tags: &TagState) -> std::result::Result<TagTarget, String> {
+    let sidecar = bc_metadata::xmp::sidecar_path(path);
+    let mut meta = if sidecar.exists() {
+        bc_metadata::xmp::read_xmp_file(&sidecar).map_err(|e| e.to_string())?
+    } else {
+        Metadata::new()
+    };
+    tags.apply_to(&mut meta);
+    bc_metadata::xmp::write_xmp_file(&sidecar, &meta).map_err(|e| e.to_string())?;
+    Ok(TagTarget::Sidecar)
+}
+
+/// Per-file tag write counts, continuing past individual failures like the bulk
+/// text editor does.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TagBulkReport {
+    pub succeeded: usize,
+    pub failures: Vec<(PathBuf, String)>,
+}
+
+/// Stamp only the tag properties the user actually changed, leaving the rest of
+/// each file's tags alone. A field set to `None` is left as it was on disk.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TagStamp {
+    pub stars: Option<u8>,
+    pub label: Option<String>,
+    pub flag: Option<Flag>,
+    /// Keywords to add to every file rather than replace.
+    pub add_keywords: Vec<String>,
+    pub remove_keywords: Vec<String>,
+}
+
+impl TagStamp {
+    pub fn is_empty(&self) -> bool {
+        self.stars.is_none()
+            && self.label.is_none()
+            && self.flag.is_none()
+            && self.add_keywords.is_empty()
+            && self.remove_keywords.is_empty()
+    }
+
+    /// Merge the stamp into one file's existing tags.
+    pub fn apply(&self, meta: &mut Metadata) {
+        if let Some(stars) = self.stars {
+            meta.set_rating(Rating::new(stars));
+        }
+        if let Some(label) = &self.label {
+            meta.set_color_label(ColorLabel::from_label_str(label));
+        }
+        if let Some(flag) = self.flag {
+            meta.set_flag(flag);
+        }
+        for keyword in &self.remove_keywords {
+            bc_metadata::keywords::remove_keyword(meta, keyword);
+        }
+        for keyword in &self.add_keywords {
+            bc_metadata::keywords::add_keyword(meta, keyword);
+        }
+    }
+}
+
+pub fn apply_stamp_to_many(paths: &[PathBuf], stamp: &TagStamp) -> TagBulkReport {
+    let mut report = TagBulkReport::default();
+    if stamp.is_empty() {
+        return report;
+    }
+    for path in paths {
+        let sidecar = bc_metadata::xmp::sidecar_path(path);
+        let outcome = (|| -> std::result::Result<(), String> {
+            let mut meta = if sidecar.exists() {
+                bc_metadata::xmp::read_xmp_file(&sidecar).map_err(|e| e.to_string())?
+            } else {
+                Metadata::new()
+            };
+            stamp.apply(&mut meta);
+            bc_metadata::xmp::write_xmp_file(&sidecar, &meta).map_err(|e| e.to_string())
+        })();
+        match outcome {
+            Ok(()) => report.succeeded += 1,
+            Err(error) => report.failures.push((path.clone(), error)),
+        }
+    }
+    report
+}
+
 impl FieldChange {
     pub fn apply(&self, meta: &mut Metadata) {
         if self.value.is_empty() {
@@ -324,18 +572,24 @@ pub fn read_panel_metadata(path: &Path) -> Metadata {
     meta
 }
 
-/// Project sidecar EXIF/TIFF properties onto the short EXIF namespace so the
-/// panel shows the same field names regardless of where the value came from.
+/// Project sidecar properties onto the panel's view of a file.
+///
+/// The sidecar wins property by property, which is the read precedence in
+/// `docs/design/0005-structured-metadata-model.md` §3, and it is not filtered
+/// down to EXIF any more: rating (`xmp:Rating`), color label
+/// (`photoshop:Label`), flag and keywords (`dc:subject`) only exist in the
+/// sidecar, so filtering it to EXIF made the tag editor write values the panel
+/// could never read back.
 pub fn merge_sidecar(meta: &mut Metadata, sidecar: &Metadata) {
     for (name, value) in sidecar.properties() {
-        if name.namespace != XMP_EXIF_URI && name.namespace != XMP_TIFF_URI {
-            continue;
-        }
-        match value {
-            Value::Text(text) => meta.set_text(NS_EXIF, name.name.clone(), text.clone()),
-            Value::Integer(number) => meta.set_text(NS_EXIF, name.name.clone(), number.to_string()),
-            Value::Real(number) => meta.set_text(NS_EXIF, name.name.clone(), number.to_string()),
-            _ => {}
+        meta.set(name.namespace.clone(), name.name.clone(), value.clone());
+        // EXIF and TIFF properties are additionally projected onto the short
+        // EXIF namespace so the text fields show the same names regardless of
+        // which container the value came from.
+        if name.namespace == XMP_EXIF_URI || name.namespace == XMP_TIFF_URI {
+            if let Value::Text(text) = value {
+                meta.set_text(NS_EXIF, name.name.clone(), text.clone());
+            }
         }
     }
 }
@@ -481,14 +735,166 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_merge_ignores_unrelated_namespaces() {
+    fn sidecar_wins_and_exif_namespaces_also_project_onto_the_form() {
         let mut base = Metadata::new();
         base.set_text(NS_EXIF, "Make", "Embedded");
         let mut side = Metadata::new();
         side.set_text(XMP_EXIF_URI, "Make", "Sidecar");
-        side.set_text("http://purl.org/dc/elements/1.1/", "title", "Ignored");
+        side.set_text(bc_metadata::NS_DC, "title", "From the sidecar");
+        side.set_text(bc_metadata::NS_XMP, "Rating", "4");
+        side.set_text(bc_metadata::NS_PHOTOSHOP, "Label", "Orange");
         merge_sidecar(&mut base, &side);
         assert_eq!(base.text(NS_EXIF, "Make"), Some("Sidecar"));
-        assert!(base.text(NS_EXIF, "title").is_none());
+        assert_eq!(
+            base.text(bc_metadata::NS_DC, "title"),
+            Some("From the sidecar")
+        );
+        // The tag properties stay in their own namespaces, which is where
+        // `TagState::from_metadata` reads them.
+        let tags = TagState::from_metadata(&base);
+        assert_eq!(tags.stars, 4);
+        assert_eq!(tags.label, "Orange");
+    }
+
+    #[test]
+    fn tag_round_trip_survives_the_sidecar_and_the_panel_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("asset.jpg");
+        std::fs::write(&image, b"not really a jpeg, but the sidecar does not care").unwrap();
+        let tags = TagState {
+            stars: 3,
+            label: "Teal".to_string(),
+            flag: Flag::Approved,
+            keywords: vec!["Clients|ACME".to_string(), "Keep".to_string()],
+        };
+        assert_eq!(
+            save_tags(&image, &tags),
+            Ok(TagTarget::Sidecar),
+            "tags always land in the sidecar"
+        );
+        let sidecar_path = bc_metadata::xmp::sidecar_path(&image);
+        assert!(
+            sidecar_path.exists(),
+            "the sidecar should sit next to the original"
+        );
+        // Interoperability check on the bytes themselves, not just our own
+        // reader: a sidecar is only honest as a storage place if it is a real
+        // XMP packet carrying the standard property names.
+        let bytes = std::fs::read(&sidecar_path).unwrap();
+        let text = String::from_utf8(bytes).expect("sidecar must be UTF-8 XML");
+        for needle in [
+            "x:xmpmeta",
+            "xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\"",
+            "xmp:Rating",
+            "photoshop:Label",
+            "dc:subject",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
+        }
+        let read = TagState::from_metadata(&read_panel_metadata(&image));
+        assert_eq!(read, tags, "what the panel wrote is what the panel reads");
+    }
+
+    #[test]
+    fn stamp_changes_only_what_it_was_asked_to_and_adds_to_each_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("a.jpg");
+        let second = dir.path().join("b.jpg");
+        for (path, label) in [(&first, "Red"), (&second, "Blue")] {
+            std::fs::write(path, b"x").unwrap();
+            let existing = TagState {
+                stars: 2,
+                label: label.to_string(),
+                flag: Flag::None,
+                keywords: vec!["Old".to_string()],
+            };
+            save_tags(path, &existing).unwrap();
+        }
+
+        let stamp = TagStamp {
+            stars: Some(5),
+            label: None,
+            flag: Some(Flag::Rejected),
+            add_keywords: vec!["New".to_string()],
+            remove_keywords: vec!["Old".to_string()],
+        };
+        let report = apply_stamp_to_many(&[first.clone(), second.clone()], &stamp);
+        assert_eq!((report.succeeded, report.failures.len()), (2, 0));
+
+        let a = TagState::from_metadata(&read_panel_metadata(&first));
+        let b = TagState::from_metadata(&read_panel_metadata(&second));
+        assert_eq!((a.stars, b.stars), (5, 5), "the stamp set the rating");
+        assert_eq!((a.flag, b.flag), (Flag::Rejected, Flag::Rejected));
+        assert_eq!(
+            (a.label.as_str(), b.label.as_str()),
+            ("Red", "Blue"),
+            "the label was left alone because the stamp did not ask for it"
+        );
+        assert_eq!(a.keywords, vec!["New".to_string()], "Old was removed");
+    }
+
+    #[test]
+    fn tag_form_tracks_edits_and_clears_on_repeat_click() {
+        let mut form = TagsForm::default();
+        form.load(&Metadata::new());
+        assert!(!form.is_dirty());
+
+        form.set_stars(3);
+        assert_eq!(form.current().stars, 3);
+        // Clicking the same star again clears the rating, Bridge-style.
+        form.set_stars(3);
+        assert_eq!(form.current().stars, 0);
+        form.set_stars(9);
+        assert_eq!(form.current().stars, 5, "the row has five stars");
+
+        assert!(form.add_keyword("Redwood"));
+        assert!(!form.add_keyword("  "), "blank keywords are refused");
+        assert!(!form.add_keyword("Redwood"), "and duplicates are refused");
+        form.remove_keyword("Redwood");
+        assert!(form.current().keywords.is_empty());
+
+        form.set_stars(4);
+        assert!(form.is_dirty());
+        form.revert();
+        assert!(!form.is_dirty());
+    }
+
+    #[test]
+    fn label_colors_clear_non_text_contrast_against_the_dark_panel() {
+        // WCAG 1.4.11 wants 3:1 for meaningful graphics. The panel is egui's
+        // dark default, whose central surface is rgb(27, 27, 27).
+        let panel = (27u8, 27u8, 27u8);
+        for (name, color) in LABEL_CHOICES {
+            let ratio = contrast(*color, panel);
+            assert!(
+                ratio >= 3.0,
+                "label {name:?} at {:?} only reaches {ratio:.2}:1 on the panel",
+                color
+            );
+        }
+    }
+
+    fn contrast(foreground: egui::Color32, background: (u8, u8, u8)) -> f64 {
+        let channel = |value: u8| {
+            let s = f64::from(value) / 255.0;
+            if s <= 0.03928 {
+                s / 12.92
+            } else {
+                ((s + 0.055) / 1.055).powi(24 / 10)
+            }
+        };
+        let luminance = |(r, g, b): (f64, f64, f64)| 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        let l1 = luminance((
+            channel(foreground.r()),
+            channel(foreground.g()),
+            channel(foreground.b()),
+        ));
+        let l2 = luminance((
+            channel(background.0),
+            channel(background.1),
+            channel(background.2),
+        ));
+        let (hi, lo) = if l1 > l2 { (l1, l2) } else { (l2, l1) };
+        (hi + 0.05) / (lo + 0.05)
     }
 }
