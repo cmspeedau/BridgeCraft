@@ -12,6 +12,7 @@ pub mod exif;
 pub mod exif_write;
 pub mod iptc;
 pub mod keywords;
+pub mod layers;
 pub mod ratings;
 pub mod search;
 pub mod templates;
