@@ -338,30 +338,130 @@ impl TagsForm {
     }
 }
 
-/// Where a tag write lands.
+/// Where a tag save landed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TagTarget {
-    /// An `.xmp` sidecar next to the original.
+    /// An `.xmp` sidecar next to the original, and nothing else.
     Sidecar,
+    /// The sidecar plus the packet embedded in the file itself.
+    SidecarAndEmbedded,
+    /// The packet embedded in the file; no sidecar existed to keep in sync.
+    Embedded,
+}
+
+impl TagTarget {
+    /// A short, honest description for the status line.
+    pub fn describe(self) -> &'static str {
+        match self {
+            TagTarget::Sidecar => "XMP sidecar",
+            TagTarget::Embedded => "embedded XMP packet",
+            TagTarget::SidecarAndEmbedded => "embedded XMP packet and sidecar",
+        }
+    }
+}
+
+/// Whether this file can carry an embedded XMP packet, judged from its magic
+/// bytes rather than its extension, because a file named `.jpg` that is really
+/// something else must not be spliced.
+fn takes_embedded_xmp(path: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    // RAW is excluded on purpose: design/0005 §4 keeps camera files read-only
+    // and sends their metadata to a sidecar, even though DNG is TIFF-based.
+    if bc_metadata::embedded::is_jpeg(&bytes) {
+        return true;
+    }
+    bc_metadata::embedded::is_tiff(&bytes) && !is_raw_extension(path)
+}
+
+fn is_raw_extension(path: &Path) -> bool {
+    let extension = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    RAW_EXTENSIONS.contains(&extension.as_str())
 }
 
 /// Save the tags for one file.
 ///
-/// Rating, label, flag and keywords have no EXIF equivalent, so they always go
-/// into the XMP sidecar and the original file is never touched. Embedded XMP
-/// packets (roadmap Phase 3, remaining work) will let JPEG and TIFF carry the
-/// same properties in place; until then one honest location beats a split that
-/// quietly drops tags on export.
+/// Storage policy (design/0005 §4, as settled 2026-11-15): for JPEG and TIFF
+/// the properties are written **into the file** and, when a sidecar already
+/// exists, the sidecar is updated too, because reading prioritizes the sidecar
+/// above the embedded packet and a stale sidecar would hide the change.
+/// Camera RAW and every format that cannot hold a packet go to the sidecar,
+/// which is created when missing. A sidecar is never *created* for a file that
+/// can carry the packet itself: that would contradict §4's "no auto-sidecar".
+///
+/// Order matters and is not arbitrary. The sidecar is written **first**. If the
+/// in-place write then fails, the higher-priority layer already carries the
+/// truth, so the panel keeps showing what the user asked for instead of
+/// silently reverting to the old values.
 pub fn save_tags(path: &Path, tags: &TagState) -> std::result::Result<TagTarget, String> {
     let sidecar = bc_metadata::xmp::sidecar_path(path);
-    let mut meta = if sidecar.exists() {
-        bc_metadata::xmp::read_xmp_file(&sidecar).map_err(|e| e.to_string())?
+    let had_sidecar = sidecar.exists();
+    let embedded_ok = takes_embedded_xmp(path);
+
+    // 1. Sidecar first, when it exists or when it is the only option.
+    let wrote_sidecar = if had_sidecar || !embedded_ok {
+        let mut meta = if had_sidecar {
+            bc_metadata::xmp::read_xmp_file(&sidecar).map_err(|e| e.to_string())?
+        } else {
+            Metadata::new()
+        };
+        tags.apply_to(&mut meta);
+        bc_metadata::xmp::write_xmp_file(&sidecar, &meta).map_err(|e| e.to_string())?;
+        true
     } else {
-        Metadata::new()
+        false
     };
+
+    if !embedded_ok {
+        return Ok(TagTarget::Sidecar);
+    }
+
+    // 2. Then in place. A failure here is reported, not swallowed: the user
+    // needs to know the file itself was not updated even though the sidecar was.
+    let mut meta = Metadata::new();
     tags.apply_to(&mut meta);
-    bc_metadata::xmp::write_xmp_file(&sidecar, &meta).map_err(|e| e.to_string())?;
-    Ok(TagTarget::Sidecar)
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let written = bc_metadata::xmp::write_embedded_xmp(&bytes, &meta).map_err(|error| {
+        if wrote_sidecar {
+            format!("{error} (the sidecar was updated, the file was not)")
+        } else {
+            error.to_string()
+        }
+    })?;
+    if written != bytes {
+        write_bytes_atomically(path, &written).map_err(|error| {
+            if wrote_sidecar {
+                format!("{error} (the sidecar was updated, the file was not)")
+            } else {
+                error
+            }
+        })?;
+    }
+
+    Ok(if wrote_sidecar {
+        TagTarget::SidecarAndEmbedded
+    } else {
+        TagTarget::Embedded
+    })
+}
+
+/// Replace a file's bytes without ever leaving a half-written original.
+fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> std::result::Result<(), String> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let tmp = dir.join(format!(
+        ".{}.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    std::fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let _ = std::fs::set_permissions(&tmp, meta.permissions());
+    }
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
 }
 
 /// Per-file tag write counts, continuing past individual failures like the bulk
@@ -413,23 +513,26 @@ impl TagStamp {
     }
 }
 
+/// Stamp one file's tags onto the file, following the same storage policy as
+/// a panel edit.
+fn apply_stamp_to_one(path: &Path, stamp: &TagStamp) -> std::result::Result<(), String> {
+    // The stamp is merged onto what the file already carries, per property, and
+    // then written through the *same* `save_tags` path a panel edit uses. Two
+    // storage policies (one for the panel, one for bulk) is how a file ends up
+    // with an embedded packet that disagrees with its sidecar.
+    let mut merged = read_panel_metadata(path);
+    stamp.apply(&mut merged);
+    let tags = TagState::from_metadata(&merged);
+    save_tags(path, &tags).map(|_| ())
+}
+
 pub fn apply_stamp_to_many(paths: &[PathBuf], stamp: &TagStamp) -> TagBulkReport {
     let mut report = TagBulkReport::default();
     if stamp.is_empty() {
         return report;
     }
     for path in paths {
-        let sidecar = bc_metadata::xmp::sidecar_path(path);
-        let outcome = (|| -> std::result::Result<(), String> {
-            let mut meta = if sidecar.exists() {
-                bc_metadata::xmp::read_xmp_file(&sidecar).map_err(|e| e.to_string())?
-            } else {
-                Metadata::new()
-            };
-            stamp.apply(&mut meta);
-            bc_metadata::xmp::write_xmp_file(&sidecar, &meta).map_err(|e| e.to_string())
-        })();
-        match outcome {
+        match apply_stamp_to_one(path, stamp) {
             Ok(()) => report.succeeded += 1,
             Err(error) => report.failures.push((path.clone(), error)),
         }
@@ -724,6 +827,249 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_packet_leaves_the_sidecar_updated_and_reports_it() {
+        // The tech-debt entry claims that when the in-place write is refused,
+        // the sidecar has already been written, so the two layers disagree.
+        // That must be a tested fact, not a guess.
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("odd.jpg");
+
+        // A packet whose RDF namespace is wrong, so it parses to nothing.
+        let broken = concat!(
+            "<?xpacket begin=''?><x:xmpmeta xmlns:x='adobe:ns:meta/'>",
+            "<rdf:RDF xmlns:rdf='http://example.com/not-rdf'>",
+            "<rdf:Description><xmp:Rating>2</xmp:Rating></rdf:Description>",
+            "</rdf:RDF></x:xmpmeta><?xpacket end='w'?>"
+        );
+        let mut body = b"Exif\0\0".to_vec();
+        body.extend_from_slice(b"\0\0\0\0");
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE1];
+        jpeg.extend_from_slice(&((body.len() + 2) as u16).to_be_bytes());
+        jpeg.extend_from_slice(&body);
+        jpeg.extend_from_slice(&[0xFF, 0xE1]);
+        let xmp_body = {
+            let mut v = b"http://ns.adobe.com/xap/1.0/\0".to_vec();
+            v.extend_from_slice(broken.as_bytes());
+            v
+        };
+        jpeg.extend_from_slice(&((xmp_body.len() + 2) as u16).to_be_bytes());
+        jpeg.extend_from_slice(&xmp_body);
+        jpeg.extend_from_slice(&[0xFF, 0xDA, 0x04, 0x00, 0x01]);
+        jpeg.extend_from_slice(&[0xFF, 0xD9]);
+        std::fs::write(&image, &jpeg).unwrap();
+
+        // An existing sidecar means it is written first.
+        let sidecar = bc_metadata::xmp::sidecar_path(&image);
+        let mut seed = Metadata::new();
+        seed.set_rating(bc_metadata::ratings::Rating::new(1));
+        bc_metadata::xmp::write_xmp_file(&sidecar, &seed).unwrap();
+
+        let tags = TagState {
+            stars: 5,
+            label: String::new(),
+            flag: Flag::None,
+            keywords: vec![],
+        };
+        let error = save_tags(&image, &tags).unwrap_err();
+        assert!(
+            error.contains("the sidecar was updated, the file was not"),
+            "the failure must say which layer landed: {error}"
+        );
+
+        // Exactly as the tech-debt entry claims: sidecar has the new value, the
+        // file still carries the packet we refused to touch.
+        assert_eq!(
+            bc_metadata::xmp::read_xmp_file(&sidecar)
+                .unwrap()
+                .rating()
+                .stars(),
+            5,
+            "the sidecar was written before the refusal"
+        );
+        assert_eq!(
+            std::fs::read(&image).unwrap(),
+            jpeg,
+            "the refused file must be byte-for-byte unchanged"
+        );
+
+        // And because reading prioritizes the sidecar, the panel still shows
+        // what the user asked for, which is the reason the order is what it is.
+        assert_eq!(
+            TagState::from_metadata(&read_panel_metadata(&image)).stars,
+            5
+        );
+    }
+
+    #[test]
+    fn a_refused_packet_with_no_sidecar_fails_the_save_and_changes_nothing() {
+        // The other half of the tech-debt claim: without a sidecar to carry the
+        // value, the refusal means the user's edit lands nowhere at all.
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("lonely.jpg");
+        let broken = concat!(
+            "<?xpacket begin=''?><x:xmpmeta xmlns:x='adobe:ns:meta/'>",
+            "<rdf:RDF xmlns:rdf='http://example.com/not-rdf'>",
+            "<rdf:Description><xmp:Rating>2</xmp:Rating></rdf:Description>",
+            "</rdf:RDF></x:xmpmeta><?xpacket end='w'?>"
+        );
+        let mut xmp_body = b"http://ns.adobe.com/xap/1.0/\0".to_vec();
+        xmp_body.extend_from_slice(broken.as_bytes());
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE1];
+        jpeg.extend_from_slice(&((xmp_body.len() + 2) as u16).to_be_bytes());
+        jpeg.extend_from_slice(&xmp_body);
+        jpeg.extend_from_slice(&[0xFF, 0xDA, 0x04, 0x00, 0x01]);
+        jpeg.extend_from_slice(&[0xFF, 0xD9]);
+        std::fs::write(&image, &jpeg).unwrap();
+
+        let tags = TagState {
+            stars: 5,
+            label: String::new(),
+            flag: Flag::None,
+            keywords: vec![],
+        };
+        let error = save_tags(&image, &tags).unwrap_err();
+        assert!(
+            !error.contains("the sidecar was updated"),
+            "no sidecar was written here, so it must not be claimed: {error}"
+        );
+        assert!(!bc_metadata::xmp::sidecar_path(&image).exists());
+        assert_eq!(std::fs::read(&image).unwrap(), jpeg, "file unchanged");
+        assert_eq!(
+            TagState::from_metadata(&read_panel_metadata(&image)).stars,
+            0,
+            "the packet is unreadable to us, so the panel shows no rating at all, \
+             not the value the file actually carries"
+        );
+        // An undeclared prefix is a hard XML error, so the reader reports it
+        // rather than inventing an empty result.
+        let error = bc_metadata::xmp::read_embedded_xmp(&jpeg).unwrap_err();
+        assert!(
+            matches!(error, bc_metadata::MetadataError::MalformedPacket(_)),
+            "expected a malformed-packet error, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_wellformed_packet_with_nothing_we_understand_is_parsed_empty_and_refused() {
+        // The other half of the guard: valid XML, every prefix declared, but the
+        // RDF description is not in the RDF namespace, so parsing succeeds and
+        // yields *nothing*. This is the case `existing_packet` must refuse,
+        // because merging into empty and writing back would erase the file.
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("alien.jpg");
+        let broken = concat!(
+            "<?xpacket begin=''?><x:xmpmeta xmlns:x='adobe:ns:meta/'>",
+            "<x:group xmlns:x='adobe:ns:meta/' xmlns:thing='urn:thing'>",
+            "<thing:Rating>2</thing:Rating></x:group></x:xmpmeta><?xpacket end='w'?>"
+        );
+        let mut xmp_body = b"http://ns.adobe.com/xap/1.0/\0".to_vec();
+        xmp_body.extend_from_slice(broken.as_bytes());
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE1];
+        jpeg.extend_from_slice(&((xmp_body.len() + 2) as u16).to_be_bytes());
+        jpeg.extend_from_slice(&xmp_body);
+        jpeg.extend_from_slice(&[0xFF, 0xDA, 0x04, 0x00, 0x01]);
+        jpeg.extend_from_slice(&[0xFF, 0xD9]);
+        std::fs::write(&image, &jpeg).unwrap();
+
+        // Readable, and readable as nothing.
+        let located = bc_metadata::xmp::read_embedded_xmp(&jpeg)
+            .unwrap()
+            .expect("the packet is located");
+        assert!(
+            located.is_empty(),
+            "this fixture must exercise the parsed-to-empty path, not an error"
+        );
+
+        let tags = TagState {
+            stars: 5,
+            label: String::new(),
+            flag: Flag::None,
+            keywords: vec![],
+        };
+        let error = save_tags(&image, &tags).unwrap_err();
+        assert!(
+            error.contains("no properties could be read"),
+            "the refusal must name the real reason: {error}"
+        );
+        assert!(!bc_metadata::xmp::sidecar_path(&image).exists());
+        assert_eq!(std::fs::read(&image).unwrap(), jpeg, "file unchanged");
+        assert_eq!(
+            TagState::from_metadata(&read_panel_metadata(&image)).stars,
+            0,
+            "the panel shows no rating: we cannot read what is there"
+        );
+    }
+
+    #[test]
+    fn a_rating_only_stamp_leaves_the_keywords_a_file_already_has() {
+        // The risk introduced by unifying the bulk path with `save_tags`: a
+        // stamp writes a whole `TagState`, so merging wrongly would replace the
+        // file's tags with the stamp's defaults instead of adding to them.
+        let dir = tempfile::tempdir().unwrap();
+        let jpeg = dir.path().join("keeper.jpg");
+        std::fs::write(&jpeg, real_jpeg()).unwrap();
+        let before = TagState {
+            stars: 1,
+            label: "Red".to_string(),
+            flag: Flag::Approved,
+            keywords: vec!["Clients|ACME".to_string(), "DoNotLose".to_string()],
+        };
+        save_tags(&jpeg, &before).unwrap();
+
+        let report = apply_stamp_to_many(
+            std::slice::from_ref(&jpeg),
+            &TagStamp {
+                stars: Some(5),
+                ..Default::default()
+            },
+        );
+        assert_eq!(report.succeeded, 1);
+
+        let after = TagState::from_metadata(&read_panel_metadata(&jpeg));
+        assert_eq!(after.stars, 5, "the stamped property changed");
+        assert_eq!(after.label, "Red", "the label was left alone");
+        assert_eq!(after.flag, Flag::Approved, "the flag was left alone");
+        assert_eq!(
+            after.keywords, before.keywords,
+            "a stamp that says nothing about keywords must not clear them"
+        );
+    }
+
+    #[test]
+    fn bulk_stamping_follows_the_same_storage_policy_as_a_panel_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let jpeg = dir.path().join("real.jpg");
+        let raw = dir.path().join("shot.nef");
+        std::fs::write(&jpeg, real_jpeg()).unwrap();
+        let mut raw_bytes = Vec::new();
+        raw_bytes.extend_from_slice(b"II");
+        raw_bytes.extend_from_slice(&42u16.to_le_bytes());
+        raw_bytes.extend_from_slice(&8u32.to_le_bytes());
+        raw_bytes.extend_from_slice(&0u16.to_le_bytes());
+        raw_bytes.extend_from_slice(&0u32.to_le_bytes());
+        std::fs::write(&raw, &raw_bytes).unwrap();
+
+        let stamp = TagStamp {
+            stars: Some(5),
+            ..Default::default()
+        };
+        let report = apply_stamp_to_many(&[jpeg.clone(), raw.clone()], &stamp);
+        assert_eq!((report.succeeded, report.failures.len()), (2, 0));
+
+        // The JPEG carries the stamp in itself and grew no sidecar.
+        assert!(!bc_metadata::xmp::sidecar_path(&jpeg).exists());
+        let embedded = bc_metadata::xmp::read_embedded_xmp(&std::fs::read(&jpeg).unwrap())
+            .unwrap()
+            .expect("packet written into the JPEG by the bulk path");
+        assert_eq!(embedded.rating().stars(), 5);
+
+        // The RAW keeps it beside the file and its bytes are untouched.
+        assert_eq!(std::fs::read(&raw).unwrap(), raw_bytes);
+        assert!(bc_metadata::xmp::sidecar_path(&raw).exists());
+        assert_eq!(TagState::from_metadata(&read_panel_metadata(&raw)).stars, 5);
+    }
+
+    #[test]
     fn panel_layers_resolve_in_the_documented_precedence_order() {
         let temp = tempfile::tempdir().unwrap();
         let file = temp.path().join("layers.jpg");
@@ -909,7 +1255,7 @@ mod tests {
         assert_eq!(
             save_tags(&image, &tags),
             Ok(TagTarget::Sidecar),
-            "tags always land in the sidecar"
+            "bytes that are not a real JPEG or TIFF cannot take a packet"
         );
         let sidecar_path = bc_metadata::xmp::sidecar_path(&image);
         assert!(
@@ -932,6 +1278,181 @@ mod tests {
         }
         let read = TagState::from_metadata(&read_panel_metadata(&image));
         assert_eq!(read, tags, "what the panel wrote is what the panel reads");
+    }
+
+    /// A real JPEG skeleton: SOI, APP0/JFIF, a tiny scan segment and EOI.
+    fn real_jpeg() -> Vec<u8> {
+        let app0: &[u8] = b"\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00";
+        let mut out = vec![0xFF, 0xD8];
+        out.extend_from_slice(&[0xFF, 0xE0]);
+        out.extend_from_slice(&((app0.len() + 2) as u16).to_be_bytes());
+        out.extend_from_slice(app0);
+        out.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x04, 0x01, 0x11, 0x00]);
+        out.extend_from_slice(&[0x00, 0x7F]);
+        out.extend_from_slice(&[0xFF, 0xD9]);
+        out
+    }
+
+    #[test]
+    fn png_falls_back_to_the_sidecar_because_no_packet_writer_exists_for_it() {
+        // Recorded in docs/design/0005 section 4 as "not done". If someone adds
+        // an iTXt writer, this test should flip to the embedded answer rather
+        // than being deleted.
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("flat.png");
+        let mut png = Vec::new();
+        png.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+        png.extend_from_slice(&[0x00, 0x00, 0x00, 0x0D, b'I', b'H', b'D', b'R']);
+        png.extend_from_slice(&[0u8; 24]);
+        std::fs::write(&image, &png).unwrap();
+
+        let tags = TagState {
+            stars: 2,
+            label: "Purple".to_string(),
+            flag: Flag::None,
+            keywords: vec![],
+        };
+        assert_eq!(save_tags(&image, &tags), Ok(TagTarget::Sidecar));
+        assert!(bc_metadata::xmp::sidecar_path(&image).exists());
+        assert_eq!(
+            std::fs::read(&image).unwrap(),
+            png,
+            "PNG bytes must be untouched while there is no in-place writer"
+        );
+    }
+
+    #[test]
+    fn a_jpeg_keeps_tags_in_the_file_and_does_not_grow_a_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("asset.jpg");
+        std::fs::write(&image, real_jpeg()).unwrap();
+
+        let tags = TagState {
+            stars: 4,
+            label: "Blue".to_string(),
+            flag: Flag::Rejected,
+            keywords: vec!["Keep".to_string()],
+        };
+        assert_eq!(
+            save_tags(&image, &tags),
+            Ok(TagTarget::Embedded),
+            "a JPEG with no sidecar must not acquire one"
+        );
+        assert!(
+            !bc_metadata::xmp::sidecar_path(&image).exists(),
+            "design/0005 section 4: no auto-sidecar for a file that carries its own metadata"
+        );
+
+        // The tags are in the file itself, and the panel reads them back.
+        let bytes = std::fs::read(&image).unwrap();
+        let packet = bc_metadata::xmp::read_embedded_xmp(&bytes)
+            .unwrap()
+            .expect("the packet must be embedded");
+        assert_eq!(packet.rating().stars(), 4);
+        assert_eq!(TagState::from_metadata(&packet), tags);
+
+        // The image data survived the splice: still SOI...EOI, no growth by accident.
+        let after = std::fs::read(&image).unwrap();
+        assert!(after.starts_with(&[0xFF, 0xD8]) && after.ends_with(&[0xFF, 0xD9]));
+        assert!(after.windows(7).any(|w| w == b"JFIF\x00\x01\x01"));
+    }
+
+    #[test]
+    fn an_existing_sidecar_is_updated_so_it_cannot_hide_the_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("asset.jpg");
+        std::fs::write(&image, real_jpeg()).unwrap();
+
+        // A sidecar that already carries an older rating.
+        let sidecar = bc_metadata::xmp::sidecar_path(&image);
+        let mut stale = Metadata::new();
+        stale.set_rating(bc_metadata::ratings::Rating::new(1));
+        bc_metadata::xmp::write_xmp_file(&sidecar, &stale).unwrap();
+
+        let tags = TagState {
+            stars: 5,
+            label: String::new(),
+            flag: Flag::None,
+            keywords: vec![],
+        };
+        assert_eq!(
+            save_tags(&image, &tags),
+            Ok(TagTarget::SidecarAndEmbedded),
+            "both layers are written when a sidecar exists"
+        );
+
+        // The reading priority is sidecar above embedded, so the sidecar must
+        // agree, otherwise the user's change would be invisible.
+        let from_sidecar = bc_metadata::xmp::read_xmp_file(&sidecar).unwrap();
+        assert_eq!(from_sidecar.rating().stars(), 5, "the sidecar was synced");
+        let from_file = bc_metadata::xmp::read_embedded_xmp(&std::fs::read(&image).unwrap())
+            .unwrap()
+            .expect("packet present");
+        assert_eq!(from_file.rating().stars(), 5, "the file was updated too");
+        assert_eq!(
+            TagState::from_metadata(&read_panel_metadata(&image)).stars,
+            5,
+            "and the panel shows what the user asked for"
+        );
+    }
+
+    #[test]
+    fn camera_raw_still_goes_to_the_sidecar_only() {
+        let dir = tempfile::tempdir().unwrap();
+        // A TIFF-based RAW: valid TIFF magic, `.nef` extension.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"II");
+        raw.extend_from_slice(&42u16.to_le_bytes());
+        raw.extend_from_slice(&8u32.to_le_bytes());
+        raw.extend_from_slice(&0u16.to_le_bytes());
+        raw.extend_from_slice(&0u32.to_le_bytes());
+        let image = dir.path().join("shot.nef");
+        std::fs::write(&image, &raw).unwrap();
+
+        let tags = TagState {
+            stars: 3,
+            label: "Green".to_string(),
+            flag: Flag::Approved,
+            keywords: vec!["RAW".to_string()],
+        };
+        assert_eq!(
+            save_tags(&image, &tags),
+            Ok(TagTarget::Sidecar),
+            "camera RAW stays read-only"
+        );
+        assert_eq!(
+            std::fs::read(&image).unwrap(),
+            raw,
+            "the RAW bytes must not change at all"
+        );
+        assert_eq!(TagState::from_metadata(&read_panel_metadata(&image)), tags);
+    }
+
+    #[test]
+    fn a_tiff_keeps_tags_in_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"MM");
+        tiff.extend_from_slice(&42u16.to_be_bytes());
+        tiff.extend_from_slice(&8u32.to_be_bytes());
+        tiff.extend_from_slice(&0u16.to_be_bytes());
+        tiff.extend_from_slice(&0u32.to_be_bytes());
+        let image = dir.path().join("page.tif");
+        std::fs::write(&image, &tiff).unwrap();
+
+        let tags = TagState {
+            stars: 2,
+            label: "Orange".to_string(),
+            flag: Flag::None,
+            keywords: vec!["TiffTag".to_string()],
+        };
+        assert_eq!(save_tags(&image, &tags), Ok(TagTarget::Embedded));
+        let bytes = std::fs::read(&image).unwrap();
+        assert_ne!(bytes, tiff, "the packet went into the TIFF");
+        let packet = bc_metadata::xmp::read_embedded_xmp(&bytes)
+            .unwrap()
+            .expect("tag 700 readable");
+        assert_eq!(TagState::from_metadata(&packet), tags);
     }
 
     #[test]

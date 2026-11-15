@@ -1224,10 +1224,12 @@ impl BridgeApp {
                     );
                     problems.extend(report.failures.into_iter().map(|f| f.error));
                 }
+                let mut wrote_to: Option<&'static str> = None;
                 if tags_dirty {
                     let tags = self.tags_form.current().clone();
-                    if let Err(error) = metadata_edit::save_tags(path, &tags) {
-                        problems.push(error);
+                    match metadata_edit::save_tags(path, &tags) {
+                        Ok(target) => wrote_to = Some(target.describe()),
+                        Err(error) => problems.push(error),
                     }
                 }
                 match problems.first() {
@@ -1239,7 +1241,13 @@ impl BridgeApp {
                         self.tags_form.load(&saved);
                         self.metadata_form_mtime =
                             mtime_ns(std::fs::metadata(path).and_then(|m| m.modified()).ok());
-                        self.metadata_status = Some("Saved.".to_string());
+                        self.metadata_status = Some(match wrote_to {
+                            // Saying where tags landed is the point: "Saved."
+                            // alone hides that a JPEG keeps them in the file
+                            // while a RAW keeps them beside it.
+                            Some(location) => format!("Saved: {location}."),
+                            None => "Saved.".to_string(),
+                        });
                         self.status = format!("Saved metadata for {}", path.display());
                     }
                 }
