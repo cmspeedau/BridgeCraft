@@ -16,7 +16,7 @@ A clean-room, from-scratch asset browser inspired by the workflows of classic di
 
 ![BridgeCraft workspace: favorites sidebar, thumbnail grid, and EXIF metadata panel](docs/screenshots/workspace.png)
 
-> **Status:** pre-1.0, under active development. Foundations (Phase 0) and thumbnails & previews (Phase 2) are **complete**; the browsing core (Phase 1) is done with hardening in progress, now on a new Bridge-style workspace shell. There are no installers yet — build from source (below). Phase 3 (metadata) and Phase 4 (batch operations) are open for contributors: see the [issue backlog](https://github.com/cmspeedau/BridgeCraft/issues/19).
+> **Status:** pre-1.0, under active development. Foundations (Phase 0) and thumbnails & previews (Phase 2) are **complete**; the browsing core (Phase 1) is done apart from drag & drop and hardening, on the Bridge-style workspace shell. Also shipped: the EXIF metadata panel and bulk editor, batch rename, batch export with a jobs list, watched-folder automation, and the WASM plugin layer with its manager dialog. There are no installers yet; build from source (below). Several engines are ahead of their UI (ratings and keyword editing, contact sheets, publish presets, smart collections, version stacks: working code in `bc-core`/`bc-metadata`, nothing to click yet), and those are the best contributor targets: see the [issue backlog](https://github.com/cmspeedau/BridgeCraft/issues/19) and the honest per-item state in [ROADMAP.md](ROADMAP.md).
 
 ## Everything in the box
 
@@ -24,7 +24,7 @@ A clean-room, from-scratch asset browser inspired by the workflows of classic di
 |---|---|
 | **Browse** | Folder navigation with breadcrumb chips, favorites sidebar (persistent), folders tree, recent folders, filter-as-you-type, sort by name/size/date |
 | **Views** | Thumbnail grid with zoom slider, list, and details table; "thumbnails only" mode |
-| **Select** | Click / ctrl-toggle / shift-range / select-all; right-click menu with copy, move, single-file rename, token-based batch rename with preview/apply and undo, trash & restore, permanent-delete confirm |
+| **Select** | Click / ctrl-toggle / shift-range / select-all; drag the selection onto a folder to move it (hold Alt to copy); drop files from the desktop to copy them into the folder under the pointer; right-click menu with copy, move, single-file rename, token-based batch rename with preview/apply and undo, trash & restore, permanent-delete confirm |
 | **Previews** | Instant 256 px thumbnails; click any file for a live 2048 px preview in the side panel; double-click for the full zoom viewer (100% = on-demand native decode) |
 | **Metadata** | Metadata panel for the selected file — editable description, artist, copyright, make, model, software and date taken (saved in place for JPEG/TIFF, XMP sidecar for RAW), plus read-only camera/exposure/GPS fields (JPEG, TIFF/DNG, both byte orders) |
 | **Formats** | PNG, JPEG, TIFF, GIF, WebP, BMP, PSD (embedded previews), PDF-compatible AI — always; video, PDF, camera RAW when a local decoder is present (see below) |
@@ -95,6 +95,10 @@ cd BridgeCraft
 cargo run --release -p bc-ui -- /path/to/your/photos
 ```
 
+The build toolchain is pinned in `rust-toolchain.toml`; rustup installs it (with `rustfmt` and
+`clippy`) on first command. No minimum supported Rust version is claimed yet: the pinned toolchain
+is what we build and test with, not a verified lower bound.
+
 Thumbnails cache into `.bridgecraft-thumbs.db` in the working directory. Optional runtimes unlock more formats:
 
 | Enable by installing | Gets you |
@@ -113,11 +117,11 @@ cargo run --release -p bc-ui -- --rebuild-cache /path/to/library
 
 ## Roadmap
 
-The long-term goal is a complete clean-room replacement for classic digital-asset workflows. Phase 3 (metadata engine: EXIF/IPTC/XMP, ratings & labels, collections, search) and Phase 4 (batch rename/export, contact sheets, watched-folder automation) are tracked as [milestone issues #5–#20](https://github.com/cmspeedau/BridgeCraft/issues/20). Full plan: [ROADMAP.md](ROADMAP.md).
+The long-term goal is a complete clean-room replacement for classic digital-asset workflows. Issues #5–#19 (Phase 3 metadata engine, Phase 4 batch and automation) are closed, but several were closed on **engine completion**: the code exists in `bc-core`/`bc-metadata` and has no UI yet. ROADMAP.md now marks those items `[~]` and names the missing caller for each, so the remaining work is visible: ratings/labels/keyword editing, contact-sheet and publish-preset actions, smart-collection browsing, metadata templates, version stacks, and the scripting window. Phase 4 tracking continues in [#20](https://github.com/cmspeedau/BridgeCraft/issues/20). Full plan: [ROADMAP.md](ROADMAP.md).
 
 ## Contributing
 
-Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) first: every contributor signs a one-time clean-room attestation, and `cargo build/test/clippy/fmt` on the workspace must pass. Good starting points: [#9 sidecars](https://github.com/cmspeedau/BridgeCraft/issues/9), [#10 ratings & labels](https://github.com/cmspeedau/BridgeCraft/issues/10), [#14 batch rename](https://github.com/cmspeedau/BridgeCraft/issues/14).
+Contributions are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md) first, every contributor signs a one-time clean-room attestation, and `cargo build/test/clippy/fmt` on the workspace must pass. Good starting points are the unwired engines listed above, in rough order of size: metadata templates (`bc-metadata::templates`, persistence and tests done, no caller), contact sheets (`bc-core::contact_sheet`), publish presets (`bc-core::publish`), the ratings/label/keyword editor in the metadata panel, and drag & drop in the browser (`bc_core::file_ops::transfer_into_folder` plus the `origin/feat/drag-and-drop-ui` branch).
 
 ## Releases & packaging
 

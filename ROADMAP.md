@@ -27,10 +27,12 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [x] **Watcher-driven live refresh**: watcher attached on folder open, events drained per frame, bursts coalesced via 300 ms debounce into `refresh_preserving_selection()`
 - [x] Virtualized thumbnail grid rendering (visible rows only; egui `ScrollArea` + manual row math; thumbnail requests limited to visible cells)
 - [x] **Bridge-style workspace shell**: left sidebar (Favorites tab backed by a persistent store `bc-core::favorites`, collapsible Folders tree, Recent dock, Trash window), clickable breadcrumb path bar, right Preview/Metadata panel (live preview from the cached 2048 tier + properties incl. header-read dimensions), bottom status bar (view modes, thumbnail zoom slider, "Thumbnails only" filter, items/selected/size summary), toolbar with F5 / Ctrl+A / Ctrl+O — layout target is the public Adobe Bridge Essentials screenshot (visual target only; clean-room per CLEANROOM.md)
-- [~] Virtual folder tree with favorites, recent folders, shared collections — favorites & recents shipped with the shell above; shared collections remain pending
+- [~] Virtual folder tree with favorites, recent folders, shared collections: favorites & recents shipped as flat JSON stores (`bc-core::favorites`, `bc-core::recents`) and shown in the sidebar; the `bc-core::virtual_folders` registry has no provider wired into the UI; shared/named collections are not built
 - [x] List & details view modes (Bridge parity: Thumbnails / List / Details; Filmstrip remains future work)
 - [x] Copy / move / rename / delete (with recents/bin) — core operations implemented; persistent recents are bounded, managed trash supports move/list/restore, and permanent delete is separate; browser/UI integration complete (file operations, recents, and trash/restore)
-- [ ] Drag & drop (internal reordering + OS interop)
+- [~] Drag & drop (internal reordering + OS interop): shipped. Press and drag from any grid cell or list/details row, release on a folder to move the selection there (hold Alt to copy); files dragged in from the desktop are copied into the folder under the pointer, or into the open folder. Transfers go through `bc_core::file_ops::transfer_into_folder`, which validates the whole batch before touching the filesystem, skips items that already live in the destination, rejects a folder dropped into itself or its own descendant, and reports per-item failures in the status line. Remaining: the sidebar Folders tree and Favorites as drop targets, and outbound drag to the OS (eframe 0.27 has no outgoing file-drag API).
+- [ ] Grid cell states: a decode that permanently failed renders the same `…` placeholder as one still pending (`failed` is tracked in `BridgeApp` only to suppress retries, never read by `cell()`), so a broken file looks like a slow file
+- [ ] Folder-open failures are reported as a transient status-bar string that the next refresh overwrites; the content panel then looks like an empty folder
 - [x] **Phase 1 fix-up:** list/details views
 
 ## Phase 2 — Thumbnails & Previews (Weeks 9–20) — ✅ COMPLETE
@@ -54,48 +56,50 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [~] Embedded metadata read/write: EXIF read (issue #5 model) and EXIF write for JPEG/TIFF (issue #7) landed; IPTC-IIM read/write for JPEG APP13 (issue #8); XMP sidecar read/write (issue #9); TIFF IPTC container and embedded XMP still pending
 - [x] XMP sidecar read/write (`.xmp` files) — `bc-metadata::xmp` (parse/serialize + atomic file I/O)
 - [x] Metadata panel with editable fields — grouped list, dirty tracking, Save/Revert via the #5 write policy (`bc-ui::metadata_edit`), multi-selection bulk editor with per-file failure reporting
-- [ ] Custom metadata templates
-- [x] Keyword hierarchy management & tagging (`bc-metadata::keywords`: dc:subject `Parent|Child` convention, tree/type-ahead/tag-count logic; UI panel deferred to #11)
-- [x] Star ratings, color labels, approve/reject flags (typed API in `bc-metadata::ratings`; UI editor deferred to #11)
-- [x] Metadata-driven search & smart collections (query builder)
+- [~] Custom metadata templates: `bc-metadata::templates` has the model (Replace/Merge/Append), JSON persistence (`<data>/BridgeCraft/metadata_templates`) and tests, but nothing calls it: no save/apply UI and no path that writes a template onto a file
+- [~] Keyword hierarchy management & tagging (`bc-metadata::keywords`: dc:subject `Parent|Child` convention, tree/type-ahead/tag-count logic, tested). Not reachable as an editor: the panel has no keyword widget, and keywords only reach the app read-only, as `{keyword#N}` rename tokens
+- [~] Star ratings, color labels, approve/reject flags (typed API in `bc-metadata::ratings`, written through XMP, tested). **No UI editor**: the deferred "#11" editor was never built, the metadata panel writes text fields only, and the grid has no rating or label column
+- [~] Metadata-driven search & smart collections: the query builder and SQLite index exist (`bc-core::metadata_index`, `bc-metadata::search`) and one auto-processing action writes to the index, but there is no search field, no saved-query UI, and no way to browse a smart collection. Two parallel search/projection implementations exist (see "Tech debt").
 
 ## Phase 4 — Batch Operations & Automation (Weeks 24–34)
 - [x] Batch rename (token-based patterns) — `bc-core::batch_rename` parser/planner/journaled apply/undo plus `bc-ui` preview/apply dialog, pattern validation, and undo action
 - [x] Batch resize/convert/export (issue #15: queued `bc-core` export pipeline + jobs UI; JPEG/PNG/WebP, orientation applied, metadata copy deferred to the Phase 3 writers)
-- [x] Contact sheet / PDF contact sheet output
-- [x] Watched-folder auto-processing — persisted rules, settle gate, bounded worker queue, preferences/history UI and docs landed; metadata-index action now available via the search index
-- [x] Scripting/automation API (WASM): local manifest-based scripts use the shared `wasmi` sandbox, fuel/memory limits, default-deny persisted capability and filesystem grants, and permissioned selection/current-folder/metadata/thumbnail/file-operation host imports; per-script failures are isolated
+- [~] Contact sheet / PDF contact sheet output: `bc-core::contact_sheet` renders RGBA and paginated PDF sheets and is tested, but no UI or export path calls it. Remaining: a "Contact Sheet…" action plus layout picker
+- [~] Watched-folder auto-processing: persisted rules, settle gate, bounded worker queue, preferences/history UI and docs landed. The `IndexIntoMetadataIndex` action exists in core but is not selectable in the rules UI (Thumbnail / Rename / Export PNG / Dated folder only)
+- [~] Scripting/automation API (WASM): local manifest-based scripts use the shared `wasmi` sandbox, fuel/memory limits, default-deny persisted capability and filesystem grants, and permissioned selection/current-folder/metadata/thumbnail/file-operation host imports; per-script failures are isolated. **Runtime is done, the surface is not**: `bc-core::scripting::ScriptHost` has no UI (no scripts window), so scripts can only be discovered from the scripts directory; the plugin path below is what users can actually drive today
 
 ## Phase 5 — Integrations & Plugin Ecosystem (clean-room equivalents) (Weeks 30–40)
-- [ ] Export/publish pipelines (replaces CC Libraries)
-- [x] Version control / version stacks for assets
+- [~] Export/publish pipelines (replaces CC Libraries): the **export** half is shipped and wired (queued `bc-core` export pipeline, JPEG/PNG/WebP, jobs UI, per-file progress, cancellation). The **publish** half (`bc-core::publish`) has presets, validation and atomic output but no preset persistence and no UI, so nothing can reach it; CC-Library-style shared library sync is not designed yet
+- [~] Version control / version stacks for assets: `bc-core::version_stacks` (create/list/remove/promote, JSON persistence) is implemented and tested, but no UI or command creates a stack; the only would-be consumer (`photocraft::register_export`) is itself unwired
 - [ ] Migration importer (reads existing Bridge caches read-only where formats are documented)
 - [~] **Plugin system for BridgeCraft** (successor to the Phase 4 scripting API; Bridges-style extension model)
   - [x] Plugin manifest + loader: local plugins discovered from a plugins directory; manifest declares name, version, entry points, and capabilities (menu items, panel, context-menu hooks)
   - [x] Plugin API surface (Rust trait + WASM host boundary): selection/current-folder access and permissioned metadata, thumbnail, rename, copy and move operations are implemented
   - [x] Sandboxing: WASM plugins run in wasmi without WASI/ambient imports, with fuel and memory limits; explicit grants are default-deny and network calls are not provided
-  - [~] UI extension points: toolbar/menu actions, context-menu actions and panel placeholders are wired; batch-processing hook execution and actual plugin panel rendering remain
+  - [~] UI extension points: toolbar/menu actions, context-menu actions and batch hooks (selection of 2+ files) are wired and runnable; declared plugin panels are still a text placeholder ("Plugin panel rendering is not available in v1") and batch hooks are not invoked by the export or watched-folder pipelines, only by a right-click
   - [x] Plugin manager dialog: list, enable/disable, requested capability/path review, and persisted grants
   - *Relationship to Phase 4: the Phase 4 WASM scripting API is the automation surface; this is the packaged, distributable plugin layer built on top of the same runtime and permissioned host boundary.*
-- [~] **ArtCraft bridge integration** (first-party integration targeting [storytold/artcraft](https://github.com/storytold/artcraft))
-  - [x] ArtCraft is a Rust, MIT/Apache-2.0 dual-licensed "IDE for artists" (AI image/video generation with 2D/3D compositing); the permissive license allows direct integration, subject to respecting upstream notices
-  - [~] Round-trip workflow: a native "Edit in ArtCraft" context-menu action launches the app and prepares a hand-off; automatic file-open/save-back is pending a confirmed public ArtCraft file-open interface (the inspected desktop entry point currently declares no CLI arguments)
-  - [~] Asset hand-off: BridgeCraft creates a portable per-asset bundle containing original files, adjacent XMP sidecars, and a JSON manifest; ArtCraft project/layer ingestion is pending an upstream interface. Export-to-version-stack registration helper is implemented; UI workflow wiring remains
-  - [~] Discovery: `ARTCRAFT_PATH` override (file or install directory), app-adjacent, platform install locations, then `PATH`; an API for selecting an install is available, but no preferences UI yet
-  - [ ] Implement as the first consumer of the plugin system above to prove the API surface; current native bridge is not yet a WASM plugin because launching host applications is intentionally not exposed to sandboxed plugins
+- [ ] **ArtCraft bridge integration** (planned first-party integration targeting [storytold/artcraft](https://github.com/storytold/artcraft))
+  - [x] Licensing and shape verified: ArtCraft is a Rust, MIT/Apache-2.0 dual-licensed "IDE for artists" (AI image/video generation with 2D/3D compositing); the permissive license allows direct integration, subject to respecting upstream notices
+  - [ ] Not implemented. There is no ArtCraft code in the workspace: no discovery (`ARTCRAFT_PATH`), no "Edit in ArtCraft" action, no hand-off bundle, no version-stack registration helper. Earlier roadmap entries described this work as in progress; that was wrong and they have been reset (truth pass, 2026-11-15). PhotoCraft and LightCraft below are the shipped precedents to copy
+  - [ ] Upstream blocker to confirm first: the inspected ArtCraft desktop entry point declares no CLI arguments, so automatic file-open needs an upstream interface before a round trip is possible
+  - [ ] Implement as the first consumer of the plugin system above to prove the API surface. Launching host applications is intentionally not exposed to sandboxed plugins, so the bridge starts as a native action and moves behind the plugin API only when a host-launch capability is designed
 - [~] **PhotoCraft desktop integration** (separate from the ArtCraft roadmap item; targets the installed [storytold/photocraft](https://github.com/storytold/photocraft) app)
   - [x] Discover PhotoCraft using `PHOTOCRAFT_PATH`, standard install locations, PATH, and Linux desktop-entry AppImage locations
   - [x] Add an "Edit in PhotoCraft" context-menu action that opens selected files using PhotoCraft's documented desktop CLI
-  - [~] Core helpers create XMP-aware hand-off bundles and register exported files as version-stack entries; automatic export tracking and settings persistence remain future work
+  - [~] Hand-off and stack helpers exist in core and are tested (`prepare_handoff` builds an XMP-aware bundle with a JSON manifest; `register_export` adds exports to a version stack), and `send_selection` combines both. The shipped context-menu action calls only `edit`, which opens the original files: no UI path produces a hand-off bundle or registers an export yet
+  - [ ] Settings persistence: the executable chosen in the PhotoCraft settings window lives for the session only; a manual pick is not written to the config directory and re-discovery runs at next launch
 - [~] **LightCraft desktop integration** (first-party integration targeting [storytold/lightcraft](https://github.com/storytold/lightcraft); this is distinct from a sandboxed WASM plugin)
   - [x] LightCraft is a permissively licensed, pure-Rust non-destructive photo library and RAW developer, available on macOS, Windows, Linux, and WASM
   - [x] Native "Edit in LightCraft" context-menu action passes selected files to LightCraft's documented desktop CLI, which imports them into its library
   - [~] Discovery supports `LIGHTCRAFT_PATH`, standard install locations, PATH, Linux desktop-entry AppImages, and a settings window for manual configuration
   - [ ] Round-trip export tracking, automatic registration of exports as version-stack entries, and transfer of develop settings/ratings/labels
+  - [ ] Settings persistence: a manually configured LightCraft executable is session-only, like PhotoCraft
   - [ ] Evaluate reuse of LightCraft's Rust RAW decoding through a documented, compatible library boundary; current BridgeCraft decoding remains unchanged
 
 ## Phase 6 — Polish, Packaging & 1:1 Parity (Weeks 36–52)
-- [ ] Keyboard shortcut parity + custom shortcut editor
+- [ ] Move the thumbnail cache and per-app state out of the current working directory: `main.rs` opens `.bridgecraft-thumbs.db` beside the CWD, which is not writable for a bundled `.app`, a per-user Windows install, or an AppImage run from a read-only location. Fold this into a single `bc-core::paths` data/config/cache helper (favorites, recents, trash, plugins, stacks, auto-rules, metadata index and the thumbnail cache each derive their own path today, including two divergent copies of the platform env-var logic)
+- [ ] Keyboard shortcut parity + custom shortcut editor. Current coverage is the viewer and grid basics only: Ctrl/Cmd+A, F5, Ctrl/Cmd+O, Enter (path field / open preview from list rows), Esc, ←/→, +, -, 0, 1 and Shift+arrows. Missing: Delete/Backspace, F2 or Enter to rename, arrow navigation and Enter-to-open in the thumbnail grid, Tab focus traversal, Ctrl+F to focus the filter, Home/End, Ctrl+Z
 - [ ] Workspaces (customizable panel layouts)
 - [ ] Preferences dialog parity audit
 - [ ] Localization framework (i18n)
@@ -112,15 +116,47 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 ## Milestones
 | Milestone | Target | Definition of Done | Status |
 |---|---|---|---|
-| M1 — Browser MVP | Q1 2027 | Browse, sort, filter, live refresh, thumbnails, basic file ops | ◐ GUI + core done; recents/trash primitives done; remaining: file-operation UI, drag & drop |
+| M1 — Browser MVP | Q1 2027 | Browse, sort, filter, live refresh, thumbnails, basic file ops | ◐ shipped including internal drag & drop; remaining: grid failure states, folder-open error surfacing, outbound OS drag |
 | M2 — Preview Engine | Q2 2027 | RAW/PSD/PDF/video previews with caching | ✅ PNG/JPEG/GIF/WebP/TIFF/BMP + video/PDF/camera RAW (runtime libs) + PSD/AI + SQLite cache + preview/1:1 zoom viewer |
-| M3 — Metadata Complete | Q3 2027 | XMP/EXIF/IPTC read-write, smart collections | not started |
-| M4 — Automation | Q4 2027 | Batch ops, scripting API | not started |
-| M5 — Integrations | 2028 | Plugin system, ArtCraft bridge plugin, PhotoCraft and LightCraft desktop integrations | not started |
+| M3 — Metadata Complete | Q3 2027 | XMP/EXIF/IPTC read-write, smart collections | ◐ engines ahead of the UI: EXIF read/write, IPTC-IIM (JPEG APP13) and XMP sidecars done, editable panel + bulk editor shipped; embedded XMP/IPTC-in-TIFF, ratings/labels/keywords UI and smart-collection UI remain |
+| M4 — Automation | Q4 2027 | Batch ops, scripting API | ◐ batch rename, export pipeline + jobs UI, contact-sheet core, watched-folder automation and the WASM sandbox done; scripting and contact-sheet UI remain |
+| M5 — Integrations | 2028 | Plugin system, ArtCraft bridge plugin, PhotoCraft and LightCraft desktop integrations | ◐ plugin system, plugin manager and PhotoCraft/LightCraft launch actions shipped; ArtCraft not started, plugin panels and hand-off wiring remain |
 | M6 — 1:1 Parity Audit & Release | 2028 | Feature checklist parity vs. Bridge 2026 user guide; universal macOS build, Windows portable+MSI, AppImage+.zsync published (unsigned) | not started |
 
 ## Critical Path
-With ADR-0001 resolved (egui/eframe), filter + live refresh shipped, and virtualized grid rendering complete, the remaining critical path is: **file-operation UI → drag & drop**. Recents and managed-trash primitives are implemented in `bc-core`; the browser/UI integration remains. Metadata engine (Phase 3) can proceed in parallel.
+With ADR-0001 resolved (egui/eframe), the Phase 1 shell shipped (filter, live refresh, virtualized grid, list/details views, file operations, recents and trash all wired into the UI) and internal drag & drop landed on top of `transfer_into_folder`, M1's remaining work is the two surfacing defects above plus outbound OS drag. The next critical path is M3, which is now purely UI work on engines that already exist: **ratings, color labels and the keyword editor** in the metadata panel, then **smart-collection browsing** on the index that already works. Phase 6 packaging should start with the data-path cleanup, because bundle layouts break the current CWD-based thumbnail cache.
+
+## Tech debt
+
+- **Two metadata search/index implementations.** `bc-metadata::search` projects a `Metadata` into a flat searchable record, while `bc-core::metadata_index` owns a SQLite index with its own query builder and smart-collection table. `bc-core::metadata_index` is the one auto-processing writes to. Pick one home for the query model before the smart-collection UI lands.
+- **Duplicate query spellings kept on purpose.** `bc-core::metadata_index` still accepts several field and operator spellings (`Field::Make`/`Field::CameraMake`, `Operator::Eq`/`Operator::Equals`, and `Query`'s `predicates`/`conditions`/`clauses`/`and` fields), normalized by `canonical_predicate`. They are kept because they are serialized into stored smart-collection rows; collapse them in the same change that designs the collection UI, with a migration for anything already on disk.
+- **Synonym API removed 2026-11-15.** Duplicate public aliases (`bc_core::search`/`index`/`metadata_search`/`versions` module re-exports, `bc_metadata::extract`/`projection`/`searchable`, `PublishPipeline`/`PublishJob`/`run`/`run_pipeline`, `ScriptEngine`/`AutomationHost`/`ScriptRunner`, the contact-sheet `generate_*`/`create_*`/`build_*` set, and the metadata-index `add`/`insert`/`upsert_file`/`put`/`scan*`/`lookup`/`cleanup` family) were deleted: they had no callers, no behavior, and inflated the apparent API surface of modules that are in fact unwired.
+- **Four spellings of the index action.** `bc-core::auto_process::AutoAction` has `ExtractMetadata`, `IndexMetadata`, `UpdateSearchIndex` and `IndexIntoMetadataIndex`, all handled by one arm that calls `MetadataIndex::index_path`. They are serialized into users' `auto-rules.json`, so collapse them with a read-side alias for old files, not a silent rename.
+- **Emoji as UI glyphs.** The folder marker in the grid is a literal `📁` drawn with the proportional font (`bc-ui::app::cell`), which renders inconsistently across platforms and cannot be themed or recolored. Replace with a drawn shape or a real icon asset when the icon set is decided.
+
+## Truth pass log (2026-11-15)
+
+### Drag & drop (slice 1, shipped same day)
+
+Internal drag and inbound desktop drops landed on grid cells and list/details rows, on top of
+`bc-core::file_ops::transfer_into_folder`. Two defects were found while wiring it, both caught by
+tests that drive the real widgets with synthetic egui pointer events and then check the filesystem:
+
+- A drag-only interaction layer over each cell made egui treat **every press as a drag start**, so a
+  plain click on a folder also arrived as a drop onto that same folder. The cell now owns one
+  click-and-drag response, so egui decides click-versus-drag only after the pointer actually moves.
+- Using `Ui::allocate_ui_with_layout`'s outer response as the drop target silently missed the first
+  cell of every row: it never reported the pointer inside it, so that folder could not be dropped
+  onto. Fixed by keying the drop target to the cell's own response.
+
+### Documentation corrected against the code on `main` (no behavior changes)
+
+- ArtCraft integration was described as partly shipped (`[~]`, "helpers implemented"). It is not started; no `artcraft` symbol exists in any source file. Reset to `[ ]`.
+- `[x]` marks that described **core-only** work (contact sheets, version stacks, search/smart collections, keywords/ratings UI, scripting UI, publish presets) now say `[~]` and name the missing UI or caller.
+- Phase 1 drag & drop now records the orphaned `transfer_into_folder` primitive and the stale `origin/feat/drag-and-drop-ui` branch, so the work is ported rather than rewritten.
+- Plugin extension points were under-described: batch hooks are runnable today; panel rendering is the remaining placeholder.
+- Milestone table (M1, M3, M4, M5) and the Critical Path no longer contradict the phase checklists above them.
+- `docs/PHASE0_CHECKLIST.md`, `docs/PHASE1.md` and the stale claim in `docs/auto-processing.md` ("the search index API is not implemented") updated to match the code. The Phase 0 toolchain item is now closed as a **toolchain pin** (`rust-toolchain.toml`, mirrored in CI); no MSRV is claimed, because none has been verified.
 
 ## Under consideration
 

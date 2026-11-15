@@ -17,10 +17,10 @@ BridgeCraft is a clean-room, cross-platform digital asset browser and file manag
 
 | Crate | Purpose |
 |---|---|
-| `bc-core` | Filesystem scanning, watchers, selection model, app state |
-| `bc-metadata` | EXIF / IPTC / XMP / sidecar read & write |
+| `bc-core` | Filesystem scanning, watchers, selection model, browser state, file operations, trash/recents/favorites, batch rename, export & publish pipelines, watched-folder automation, WASM plugins/scripting, version stacks |
+| `bc-metadata` | EXIF / IPTC / XMP / sidecar read & write, keywords, ratings & labels, metadata templates, search projection |
 | `bc-thumbnails` | Thumbnail cache (SQLite), decoders (JPEG/PNG/RAW/PSD/PDF/video) |
-| `bc-ui` | Frontend shell (GUI framework TBD — see Phase 0 spike in ROADMAP) |
+| `bc-ui` | Frontend shell in egui/eframe (ADR-0001): workspace panels, grid/list/details views, viewer, dialogs |
 
 Keep crate boundaries clean: `bc-ui` depends on the others; the others never depend on `bc-ui`.
 
@@ -71,3 +71,5 @@ Final-stage targets (Phase 6): macOS universal 2 build, Windows portable ZIP + M
 
 - Update README/ROADMAP/docs for any user-visible behavior, new API, or configuration change.
 - Keep documentation consistent with what is actually implemented — never document unverified behavior.
+- **`[x]` means a user can reach it.** Logic that exists but has no caller is `[~]`, and the line must name the missing caller (for example "core renderer done, no UI action calls it yet"). Do not close a tracking issue on engine completion while its UI is still unbuilt.
+- Verify a claim against the code (or by running it) before writing it down; `grep` for the symbol and check that it has a caller outside its own module.

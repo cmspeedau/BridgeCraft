@@ -60,5 +60,9 @@ stopping other queued files.
 
 The **Auto** status-bar window lets users add, pause/re-enable, and remove
 rules, adjust the global settle delay, and inspect recent per-file outcomes.
-Metadata-index extraction is not available yet because the search index API is
-not implemented; it will be added when that API lands.
+
+Metadata indexing runs in the engine but is not selectable in the window yet:
+`AutoAction::IndexIntoMetadataIndex` writes into the SQLite index that
+`bc-core::metadata_index` opens, while the rule editor only offers thumbnail,
+rename, export-PNG and dated-move actions. Adding that checkbox is tracked in
+ROADMAP.md Phase 4.

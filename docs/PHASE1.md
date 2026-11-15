@@ -1,6 +1,7 @@
 # Phase 1 — File Browsing Core
 
-Status: implemented in `crates/bc-core` + textual shell in `crates/bc-ui`.
+Status: core logic and the workspace shell are shipped; hardening items remain (see ROADMAP.md
+Phase 1).
 
 ## Checklist
 
@@ -11,8 +12,14 @@ Status: implemented in `crates/bc-core` + textual shell in `crates/bc-ui`.
 - [x] Multi-select model: click, ctrl-click toggle, shift-range, select-all (`bc_core::selection::Selection`)
 - [x] Browser state: open root, refresh, re-sort, selection-aware (`bc_core::browser::BrowserState`)
 - [x] Unit tests for all of the above
-- [ ] Virtualized 100k-item grid rendering — blocked on GUI framework spike (ADR-0001)
-- [ ] Drag & drop — same dependency on ADR-0001
+- [x] Virtualized grid rendering: `bc-ui` paints visible rows only and requests thumbnails only for
+  visible cells. The 100k-item case is not measured in CI; the perf targets live in ROADMAP.md
+  Phase 6 ("cold start < 2s, folder open < 500ms for 10k items") and are still unverified.
+- [x] Filter box, watcher-driven debounced refresh, list/details views, favorites/recents/trash
+  panels, breadcrumb path bar, status bar, zoom slider ("thumbnails only" mode)
+- [x] File operations wired into the browser: copy, move, single rename, batch rename, trash and
+  restore, permanent delete
+- [~] Drag & drop: internal drag shipped (drag the selection from a grid cell or list/details row onto a folder to move it, Alt to copy; desktop files dropped in are copied). Still open: outbound drag to the OS (not possible on eframe 0.27), sidebar and Favorites as targets
 
 ## Notes
 
