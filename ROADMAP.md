@@ -16,7 +16,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 
 *Note: tokio/event-bus remains intentionally deferred — the immediate-mode UI + mpsc worker pattern covers current needs (watcher is drained per-frame on the UI thread with debounced refresh). Trigger to revisit: a second concurrent background service (indexer) landing, expected Phase 3.*
 
-## Phase 1 — File Browsing Core (Weeks 5–12) — ◐ core logic + basic UI DONE; hardening below
+## Phase 1 — File Browsing Core (Weeks 5–12) — ◐ shell, file operations and internal drag & drop DONE; surfacing defects and OS outbound drag remain
 - [x] Non-recursive directory listing + recursive `scan()` for future flat-view modes (`bc-core::fs`)
 - [x] Sorting: name / size / modified, dirs-first, asc/desc (`bc-core::fs::sort_entries`)
 - [x] Directory watcher (notify) with buffered events the UI can drain (`bc-core::watcher`)
@@ -50,7 +50,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 
 *Note: the phase is closed with that one item intentionally deferred — the metadata reader (Phase 3, #5/#6) is a hard dependency, and camera RAW already fast-paths the camera's embedded preview internally. It will be picked up as part of the metadata work in `#5–#19`.*
 
-## Phase 3 — Metadata Engine (Weeks 15–26) — ◐ started: EXIF read + metadata panel shipped (issue #6)
+## Phase 3 — Metadata Engine (Weeks 15–26) — ◐ read and write complete for XMP/EXIF/IPTC layers; template and smart-collection UI remain
 - [x] EXIF reading in `bc-metadata`: pure-Rust TIFF/EXIF parser (JPEG `APP1` + TIFF/DNG containers), both byte orders, IFD0 + Exif + GPS sub-IFDs + thumbnail-IFD reference; IFD loops and absurd counts are `Malformed`, malformed input never panics; hand-built fixture tests plus a real-camera check gated behind `RAW_SAMPLE` (issue #6)
 - [x] Metadata panel: Camera Data (EXIF) section for the selected file — camera, taken, exposure, aperture, ISO, focal length, orientation, color space, software, EXIF size, GPS — above File Properties; cached per path + modified time
 - [~] Embedded metadata read/write: EXIF read (issue #5 model) and EXIF write for JPEG/TIFF (issue #7) landed; IPTC-IIM read/write for JPEG APP13 (issue #8); XMP sidecar read/write (issue #9). **Reading is complete** (`bc-metadata::embedded`): the XMP packet in JPEG `APP1` and TIFF tag 700, the Photoshop resource block in TIFF tag 34377, and a raw IIM dataset in TIFF tag 33723. **Writing**: the XMP packet now goes into JPEG and TIFF in place, with an existing sidecar updated in the same save and written first (design/0005 §4, signed off). Still open: PNG (needs an `iTXt` writer, sidecar in the meantime) and writing IPTC-IIM back into TIFF containers
@@ -65,14 +65,14 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [x] Rating and label display: label dot on the grid thumbnail, dot on list rows, and Rating plus Label columns in the details view, with the header sharing the row column math
 - [~] Metadata-driven search & smart collections: the query builder and SQLite index exist (`bc-core::metadata_index`, `bc-metadata::search`) and one auto-processing action writes to the index, but there is no search field, no saved-query UI, and no way to browse a smart collection. Two parallel search/projection implementations exist (see "Tech debt").
 
-## Phase 4 — Batch Operations & Automation (Weeks 24–34)
+## Phase 4 — Batch Operations & Automation (Weeks 24–34) — ◐ rename, export and watched folders shipped with UI; contact sheets and the scripting surface are core-only
 - [x] Batch rename (token-based patterns) — `bc-core::batch_rename` parser/planner/journaled apply/undo plus `bc-ui` preview/apply dialog, pattern validation, and undo action
-- [x] Batch resize/convert/export (issue #15: queued `bc-core` export pipeline + jobs UI; JPEG/PNG/WebP, orientation applied, metadata copy deferred to the Phase 3 writers)
+- [x] Batch resize/convert/export (issue #15: queued `bc-core` export pipeline + jobs UI; JPEG/PNG/WebP, orientation applied). Metadata is not copied into exports yet; that is now an export-side wiring gap, since the writers it needed have landed
 - [~] Contact sheet / PDF contact sheet output: `bc-core::contact_sheet` renders RGBA and paginated PDF sheets and is tested, but no UI or export path calls it. Remaining: a "Contact Sheet…" action plus layout picker
 - [~] Watched-folder auto-processing: persisted rules, settle gate, bounded worker queue, preferences/history UI and docs landed. The `IndexIntoMetadataIndex` action exists in core but is not selectable in the rules UI (Thumbnail / Rename / Export PNG / Dated folder only)
 - [~] Scripting/automation API (WASM): local manifest-based scripts use the shared `wasmi` sandbox, fuel/memory limits, default-deny persisted capability and filesystem grants, and permissioned selection/current-folder/metadata/thumbnail/file-operation host imports; per-script failures are isolated. **Runtime is done, the surface is not**: `bc-core::scripting::ScriptHost` has no UI (no scripts window), so scripts can only be discovered from the scripts directory; the plugin path below is what users can actually drive today
 
-## Phase 5 — Integrations & Plugin Ecosystem (clean-room equivalents) (Weeks 30–40)
+## Phase 5 — Integrations & Plugin Ecosystem (clean-room equivalents) (Weeks 30–40) — ◐ plugin layer, manager and desktop launches shipped; panels, publish, stacks and ArtCraft are not wired
 - [~] Export/publish pipelines (replaces CC Libraries): the **export** half is shipped and wired (queued `bc-core` export pipeline, JPEG/PNG/WebP, jobs UI, per-file progress, cancellation). The **publish** half (`bc-core::publish`) has presets, validation and atomic output but no preset persistence and no UI, so nothing can reach it; CC-Library-style shared library sync is not designed yet
 - [~] Version control / version stacks for assets: `bc-core::version_stacks` (create/list/remove/promote, JSON persistence) is implemented and tested, but no UI or command creates a stack; the only would-be consumer (`photocraft::register_export`) is itself unwired
 - [ ] Migration importer (reads existing Bridge caches read-only where formats are documented)
@@ -128,7 +128,17 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 | M6 — 1:1 Parity Audit & Release | 2028 | Feature checklist parity vs. Bridge 2026 user guide; universal macOS build, Windows portable+MSI, AppImage+.zsync published (unsigned) | not started |
 
 ## Critical Path
-With ADR-0001 resolved (egui/eframe), the Phase 1 shell shipped (filter, live refresh, virtualized grid, list/details views, file operations, recents, trash and internal drag & drop), and M3's editor half is done: rating, label, flag and keyword editing with sidecar storage, bulk stamping and column display. M1's remaining work is the two surfacing defects above plus outbound OS drag. The next critical path is **embedded metadata**: the XMP packet in JPEG APP1 and TIFF tag 700, the TIFF IPTC container, then the sidecar > embedded XMP > IPTC > EXIF precedence from `docs/design/0005`, which is what unblocks **metadata copy on export** (`export.rs` refuses it until the writers land). In parallel: **a search field and smart-collection browsing** over the index that already exists, then **contact sheets, publish presets, metadata templates and version stacks** wired into the UI. Phase 6 packaging should start with the data-path cleanup, because bundle layouts break the current CWD-based thumbnail cache.
+With ADR-0001 resolved (egui/eframe), the Phase 1 shell shipped (filter, live refresh, virtualized grid, list/details views, file operations, recents, trash and internal drag & drop), and M3's metadata work is largely done: rating, label, flag and keyword editing with bulk stamping and column display, embedded XMP and IPTC reading across JPEG and TIFF, the documented read precedence, and in-place tag writing with sidecar sync.
+
+What is left on the critical path, in the order that unblocks the most:
+
+1. **Metadata copy on export.** The writers exist and the readers understand every layer, so `export.rs` copying packets, ratings, labels and flags is now wiring, not a blocked dependency.
+2. **Index-backed tags.** The grid and details overlays stat and parse a sidecar plus a packet for every visible row each frame; that belongs in `bc-core::metadata_index`, which is the same work needed to sort or filter by rating and label.
+3. **A search field and smart-collection browsing** over that index, and one search implementation instead of two.
+4. **Contact sheets, publish presets, metadata templates and version stacks** wired into the UI: all implemented, tested and unreachable.
+5. **The data-path cleanup** before Phase 6 packaging, because bundle layouts break the current CWD-based thumbnail cache.
+
+M1's remaining items are the two surfacing defects (failed-versus-pending thumbnails, folder-open errors only in the status bar) plus outbound OS drag, which needs an eframe upgrade.
 
 ## Tech debt
 

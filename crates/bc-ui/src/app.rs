@@ -2655,9 +2655,9 @@ impl BridgeApp {
                 }
                 ui.separator();
                 ui.weak(
-                    "Metadata policy: no XMP packet, rating, label or flag is copied yet — the \
-                     Phase 3 writers decide how that happens. EXIF orientation is applied to the \
-                     exported pixels.",
+                    "Metadata policy: no XMP packet, rating, label or flag is copied yet. \
+                     The writers exist, so this is a wiring gap in the export path, not a \
+                     missing capability. EXIF orientation is applied to the exported pixels.",
                 );
                 ui.horizontal(|ui| {
                     if ui.button("Start job").clicked() {

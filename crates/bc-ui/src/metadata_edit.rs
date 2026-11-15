@@ -1001,6 +1001,43 @@ mod tests {
     }
 
     #[test]
+    fn browsing_a_folder_writes_nothing_to_any_file() {
+        // The read chain now touches every layer of every visible file, so it
+        // must be provably side-effect free: no sidecars, no byte changes. A
+        // browser that "helpfully" creates files while you look at a folder is
+        // the kind of surprise that makes people stop trusting it.
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        let mut before = Vec::new();
+        for index in 0..6 {
+            let path = lib.join(format!("p{index:02}.jpg"));
+            std::fs::write(&path, real_jpeg()).unwrap();
+            before.push((path.clone(), std::fs::read(&path).unwrap()));
+        }
+
+        for (path, _) in &before {
+            let meta = read_panel_metadata(path);
+            let _ = TagState::from_metadata(&meta);
+        }
+
+        let after: Vec<_> = before
+            .iter()
+            .map(|(path, _)| (path, std::fs::read(path).unwrap()))
+            .collect();
+        for ((path, original), (_, now)) in before.iter().zip(after) {
+            assert_eq!(original, &now, "reading changed {}", path.display());
+        }
+        let strays: Vec<_> = std::fs::read_dir(&lib)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".xmp") || name.starts_with('.'))
+            .collect();
+        assert!(strays.is_empty(), "reading created sidecars: {strays:?}");
+    }
+
+    #[test]
     fn a_rating_only_stamp_leaves_the_keywords_a_file_already_has() {
         // The risk introduced by unifying the bulk path with `save_tags`: a
         // stamp writes a whole `TagState`, so merging wrongly would replace the

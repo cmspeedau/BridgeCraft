@@ -66,8 +66,9 @@ Guarantees and current trade-offs:
   file plus rename, so a cancelled or failed export can never leave a
   truncated file behind.
 - **EXIF orientation is applied to the exported pixels**, not copied as a
-  tag. No other metadata is copied yet — XMP packets, ratings, labels and
-  flags move once the Phase 3 writers land, and the dialog says so.
+  tag. No other metadata is copied yet: the XMP writers now exist for JPEG and
+  TIFF, so exporting packets, ratings, labels and flags is a wiring gap in the
+  export path rather than a missing capability, and the dialog says so.
 - Camera RAW, PDF, video and Illustrator/PSD sources go through the same
   decode path as thumbnails, so they **export at thumbnail quality** for
   now; plain raster formats export at full resolution up to your chosen

@@ -10,11 +10,13 @@
 //! path is shared), which is a documented limitation until full-tier
 //! decoders land. Formats out: JPEG (quality knob), PNG and WebP.
 //!
-//! Metadata policy: no XMP packet, rating, label or flag is copied — the
-//! Phase 3 write side has not landed, and the UI must say so. The one piece
-//! of metadata that *is* honoured is EXIF orientation: it is applied to the
-//! pixel data rather than copied as a tag, so exports look right even
-//! though they carry no EXIF.
+//! Metadata policy: no XMP packet, rating, label or flag is copied yet. The
+//! writers landed (`bc_metadata::xmp::write_embedded_xmp` for JPEG and TIFF,
+//! sidecar for the rest), so this is now a wiring gap in the export path rather
+//! than a missing capability, and the UI has to say so plainly.
+//! The one piece of metadata that *is* honoured is EXIF orientation: it is
+//! applied to the pixel data rather than copied as a tag, so exports look right
+//! even though they carry no EXIF.
 
 use std::path::{Path, PathBuf};
 
