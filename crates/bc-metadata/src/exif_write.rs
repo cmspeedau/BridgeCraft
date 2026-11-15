@@ -107,9 +107,10 @@ pub fn write_exif_file(path: &Path, metadata: &Metadata) -> Result<(), MetadataE
 }
 
 fn is_tiff(data: &[u8]) -> bool {
-    data.len() >= 8
-        && (data.starts_with(b"II") || data.starts_with(b"MM"))
-        && read_u16(data, 2, data.starts_with(b"II")) == Some(42)
+    // One definition of "classic TIFF" for the crate: the embedded-packet
+    // locator has to agree with the writer about what counts, or a file could
+    // be written as TIFF and read as something else.
+    crate::embedded::is_tiff(data)
 }
 
 // ---------------------------------------------------------------------------

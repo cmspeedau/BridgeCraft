@@ -64,6 +64,25 @@ pub fn read_xmp_file(path: &Path) -> Result<Metadata, MetadataError> {
     parse_xmp(&bytes)
 }
 
+/// Read an XMP packet embedded in the file itself: a JPEG `APP1` carrying the
+/// `http://ns.adobe.com/xap/1.0/` signature, or TIFF/DNG tag 700.
+///
+/// `Ok(None)` means the file simply has no packet, which is the normal case and
+/// never an error: a sidecar-only workflow must keep working when nothing is
+/// embedded, and nothing embedded must not look like corrupt metadata.
+pub fn read_embedded_xmp(data: &[u8]) -> Result<Option<Metadata>, MetadataError> {
+    match crate::embedded::find_xmp_packet(data)? {
+        Some(packet) => parse_xmp(&packet).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Read an embedded packet from a file on disk.
+pub fn read_embedded_xmp_file(path: &Path) -> Result<Option<Metadata>, MetadataError> {
+    let bytes = std::fs::read(path)?;
+    read_embedded_xmp(&bytes)
+}
+
 pub fn write_xmp_file(path: &Path, metadata: &Metadata) -> Result<(), MetadataError> {
     let xml = write_xmp(metadata);
     let dir = path.parent().unwrap_or_else(|| Path::new("."));

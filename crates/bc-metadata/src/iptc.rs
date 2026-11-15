@@ -6,8 +6,11 @@
 //! and maps them onto the shared [`Metadata`] model. Writing rebuilds only the
 //! `0x021C` resource, preserving every other 8BIM resource verbatim.
 //!
-//! JPEG (APP13 Photoshop 3.0) containers are supported. TIFF containers are
-//! deferred (see roadmap).
+//! Containers: reading covers JPEG `APP13`, TIFF tag 34377 (the same Photoshop
+//! resource block) and TIFF tag 33723 (a raw IIM dataset, no 8BIM framing), all
+//! located by `crate::embedded`. Writing is still JPEG `APP13` only; putting the
+//! block back into a TIFF is open with the embedded-XMP write decision, because
+//! both are storage-policy changes to files in place.
 //!
 //! Clean-room: IPTC IIM4 specification + publicly documented Photoshop resource
 //! framing.
@@ -185,7 +188,41 @@ pub fn read_iptc_jpeg(data: &[u8]) -> Result<Metadata, MetadataError> {
     let Some((_s, _e, res_bytes)) = find_photoshop_resources(data) else {
         return Ok(Metadata::new());
     };
-    let resources = parse_resources(&res_bytes)?;
+    iptc_from_resources(&res_bytes)
+}
+
+/// Read IPTC-IIM from any container this crate can look inside: a JPEG `APP13`
+/// Photoshop block, TIFF tag 34377 (the same block reached another way), or
+/// TIFF tag 33723, which carries a raw IIM dataset with no 8BIM framing at all.
+///
+/// This is the entry point readers should use. `read_iptc_jpeg` stays because
+/// the writer needs JPEG segment bounds and some callers only ever have JPEG
+/// bytes.
+pub fn read_iptc(data: &[u8]) -> Result<Metadata, MetadataError> {
+    // The Photoshop block wins where both forms are present: it is the block
+    // imaging applications maintain, and a bare tag 33723 alongside it is
+    // usually a stale copy.
+    if let Some(resources) = crate::embedded::find_photoshop_resources(data)? {
+        let meta = iptc_from_resources(&resources)?;
+        if !meta.is_empty() {
+            return Ok(meta);
+        }
+    }
+    if let Some(dataset) = crate::embedded::find_iptc_dataset(data)? {
+        return parse_iim(&dataset);
+    }
+    Ok(Metadata::new())
+}
+
+/// Read IPTC-IIM from a file on disk, whatever container it is.
+pub fn read_iptc_file(path: &Path) -> Result<Metadata, MetadataError> {
+    let bytes = std::fs::read(path)?;
+    read_iptc(&bytes)
+}
+
+/// Pull the `0x021C` IIM resource out of an image-resource block.
+fn iptc_from_resources(res_bytes: &[u8]) -> Result<Metadata, MetadataError> {
+    let resources = parse_resources(res_bytes)?;
     let mut iptc_data = None;
     for r in &resources {
         if r.id == IPTC_RESOURCE_ID {
@@ -508,12 +545,6 @@ fn write_dataset(out: &mut Vec<u8>, record: u8, dataset: u8, payload: &[u8]) {
 }
 
 // File helpers
-pub fn read_iptc_file(path: &Path) -> Result<Metadata, MetadataError> {
-    let bytes = std::fs::read(path)?;
-    // Assume JPEG; otherwise unsupported.
-    read_iptc_jpeg(&bytes)
-}
-
 pub fn write_iptc_file(path: &Path, metadata: &Metadata) -> Result<(), MetadataError> {
     let bytes = std::fs::read(path)?;
     let out = write_iptc_jpeg(&bytes, metadata)?;
@@ -633,5 +664,72 @@ mod tests {
         let resources = parse_resources(&res).unwrap();
         assert!(resources.iter().any(|r| r.id == 0x03E8));
         assert!(resources.iter().any(|r| r.id == IPTC_RESOURCE_ID));
+    }
+    /// A one-entry little-endian TIFF whose single tag value lives at an offset.
+    fn tiff_with_tag(tag: u16, value: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"II");
+        out.extend_from_slice(&42u16.to_le_bytes());
+        out.extend_from_slice(&8u32.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&tag.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes()); // type BYTE
+        out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        let value_offset = (8 + 2 + 12 + 4) as u32;
+        out.extend_from_slice(&value_offset.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(value);
+        out
+    }
+
+    fn resource_block(iim: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"8BIM");
+        out.extend_from_slice(&IPTC_RESOURCE_ID.to_be_bytes());
+        out.push(0x00); // empty name, padded to even
+        out.push(0x00);
+        out.extend_from_slice(&(iim.len() as u32).to_be_bytes());
+        out.extend_from_slice(iim);
+        if iim.len() % 2 == 1 {
+            out.push(0x00);
+        }
+        out
+    }
+
+    #[test]
+    fn iptc_is_read_from_a_tiff_photoshop_resource_block() {
+        let iim = build_iim();
+        let mut block = b"Photoshop 3.0\0".to_vec();
+        block.extend_from_slice(&resource_block(&iim));
+        let file = tiff_with_tag(crate::embedded::TAG_PHOTOSHOP, &block);
+
+        let meta = read_iptc(&file).unwrap();
+        assert_eq!(meta.text(IPTC_NS, "ObjectName"), Some("Obj"));
+        assert_eq!(meta.text(IPTC_NS, "Caption"), Some("A caption"));
+    }
+
+    #[test]
+    fn iptc_is_read_from_a_raw_tiff_iim_dataset() {
+        let iim = build_iim();
+        let file = tiff_with_tag(crate::embedded::TAG_IPTC_NAA, &iim);
+        let meta = read_iptc(&file).unwrap();
+        assert_eq!(meta.text(IPTC_NS, "Caption"), Some("A caption"));
+        // The keywords ride into dc:subject, which is what the panel's keyword
+        // editor reads, so an IPTC-only file is taggable without losing its
+        // existing keywords.
+        assert!(meta
+            .get(crate::NS_DC, "subject")
+            .is_some_and(|v| matches!(v, Value::Array(_, items) if items.len() == 2)));
+    }
+
+    #[test]
+    fn reading_iptc_from_a_file_without_any_iptc_is_empty_not_an_error() {
+        // A TIFF with an unrelated tag, and plain non-container bytes.
+        let file = tiff_with_tag(
+            crate::embedded::TAG_XMP,
+            b"<?xpacket begin=''?><x:xmpmeta/>",
+        );
+        assert!(read_iptc(&file).unwrap().is_empty());
+        assert!(read_iptc(b"not a container at all").unwrap().is_empty());
     }
 }
