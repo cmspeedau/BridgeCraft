@@ -4702,6 +4702,120 @@ mod tests {
         }
     }
 
+    /// Walk the real panel with Tab and activate each candidate with Enter,
+    /// stopping when `predicate` holds. Returns the number of steps it took,
+    /// which is how the test says which control answered.
+    fn walk_until(
+        app: &mut BridgeApp,
+        ctx: &egui::Context,
+        file: &Path,
+        mtime: i64,
+        limit: usize,
+        predicate: impl Fn(&BridgeApp) -> bool,
+    ) -> Option<usize> {
+        for step in 1..=limit {
+            press_key_in_form(app, ctx, file, mtime, egui::Key::Tab, 1);
+            press_key_in_form(app, ctx, file, mtime, egui::Key::Enter, 1);
+            if predicate(app) {
+                return Some(step);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn every_tag_control_in_the_panel_does_something_when_activated() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("photo.jpg");
+        std::fs::write(&file, b"bytes").unwrap();
+        let mtime = 1_700_000_000_000_000_000;
+
+        // Colour label: walk until a label name appears on the form.
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data);
+        let label_step = walk_until(&mut app, &ctx, &file, mtime, 30, |app| {
+            !app.tags_form.current().label.is_empty()
+        });
+        assert!(
+            label_step.is_some(),
+            "no label chip responded to activation in 30 steps"
+        );
+
+        // Flag: continue walking until Approve or Reject is set.
+        let flag_step = walk_until(&mut app, &ctx, &file, mtime, 12, |app| {
+            app.tags_form.current().flag != bc_metadata::ratings::Flag::None
+        });
+        assert!(
+            flag_step.is_some(),
+            "no flag button responded to activation after the label chips"
+        );
+
+        // Keywords: type into the field, then walk to the Add button.
+        app.keyword_draft = "Clients|ACME".to_string();
+        let keyword_step = walk_until(&mut app, &ctx, &file, mtime, 14, |app| {
+            !app.tags_form.current().keywords.is_empty()
+        });
+        assert!(
+            keyword_step.is_some(),
+            "the keyword Add control did not take the typed keyword"
+        );
+        assert_eq!(
+            app.tags_form.current().keywords,
+            vec!["Clients|ACME".to_string()],
+            "the hierarchy separator survives typing"
+        );
+
+        // Removing a keyword is a click on its chip: the chip is before the
+        // field and Add in the walk, so reach it by wrapping with Shift+Tab.
+        let mut removed = false;
+        for _ in 0..16 {
+            let mut raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(420.0, 900.0),
+                )),
+                time: Some(next_frame_time()),
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Tab,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers {
+                        shift: true,
+                        ..Default::default()
+                    },
+                }],
+                ..Default::default()
+            };
+            raw.events.push(egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            });
+            let target = file.to_path_buf();
+            let _ = ctx.run(raw.clone(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .show(ui, |ui| app.metadata_form_ui(ui, &target, mtime));
+                });
+            });
+            if app.tags_form.current().keywords.is_empty() {
+                removed = true;
+                break;
+            }
+        }
+        assert!(
+            removed,
+            "Shift+Tab back onto the keyword chip should remove it"
+        );
+    }
+
     #[test]
     fn the_tag_editor_is_reachable_and_usable_from_the_keyboard() {
         let temp = tempfile::tempdir().unwrap();
