@@ -3767,12 +3767,13 @@ impl PluginHost for UiPluginHost {
     }
 
     fn read_metadata(&self, path: &Path) -> bc_core::Result<String> {
-        let metadata = bc_metadata::exif::read_exif_file(path)
-            .or_else(|_| bc_metadata::iptc::read_iptc_file(path))
-            .or_else(|_| bc_metadata::xmp::read_xmp_file(path))
-            .map_err(|error| {
-                bc_core::CoreError::InvalidOperation(format!("metadata read failed: {error}"))
-            })?;
+        // Same layer chain the panel uses, rather than "whichever reader happens
+        // to answer first". The old `or_else` chain only fell through when the
+        // previous reader *errored*, so a JPEG with EXIF in it hid the tags the
+        // sidecar carried: a plugin saw different metadata than the user did.
+        std::fs::metadata(path)
+            .map_err(|error| bc_core::CoreError::InvalidOperation(error.to_string()))?;
+        let metadata = metadata_edit::read_panel_metadata(path);
         serde_json::to_string(&metadata).map_err(|error| {
             bc_core::CoreError::InvalidOperation(format!("metadata encode failed: {error}"))
         })
@@ -4225,6 +4226,47 @@ mod tests {
         // are fractions, so they shrink with the width.
         let narrow = details_column_x(0.0, 240.0, columns.len() - 1);
         assert!(narrow < 240.0, "narrow panel overflow: {narrow}");
+    }
+
+    #[test]
+    fn a_plugin_sees_the_same_tags_the_panel_shows() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("photo.jpg");
+        // EXIF-bearing JPEG (the stub parses as JPEG with no EXIF properties)
+        // plus tags that live only in the sidecar.
+        std::fs::write(&file, [0xFFu8, 0xD8, 0xFF, 0xD9]).unwrap();
+        let sidecar = bc_metadata::xmp::sidecar_path(&file);
+        let mut side = bc_metadata::Metadata::new();
+        side.set_rating(bc_metadata::ratings::Rating::new(5));
+        side.set_color_label(bc_metadata::ratings::ColorLabel::Blue);
+        bc_metadata::xmp::write_xmp_file(&sidecar, &side).unwrap();
+
+        let panel =
+            metadata_edit::TagState::from_metadata(&metadata_edit::read_panel_metadata(&file));
+        let host = UiPluginHost {
+            selected: vec![file.clone()],
+            folder: Some(temp.path().to_path_buf()),
+        };
+        let json = bc_core::plugins::PluginHost::read_metadata(&host, &file)
+            .expect("the plugin host must read the file");
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        // The plugin host serializes the same model the panel reads, so the two
+        // agree by construction; assert the properties the old chain hid.
+        let text = value.to_string();
+        assert!(
+            text.contains("Rating"),
+            "rating missing for plugins: {text}"
+        );
+        assert!(text.contains("Blue"), "label missing for plugins: {text}");
+        assert_eq!(panel.stars, 5);
+        assert_eq!(panel.label, "Blue");
+
+        // An unreadable path is still an error to a plugin, not empty JSON.
+        assert!(
+            bc_core::plugins::PluginHost::read_metadata(&host, &temp.path().join("nope.jpg"))
+                .is_err()
+        );
     }
 
     #[test]

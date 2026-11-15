@@ -560,28 +560,49 @@ pub fn apply_changes(
     report
 }
 
-/// Read the panel's metadata: embedded EXIF plus an XMP sidecar when present.
+/// Build the panel's view of a file from every metadata layer it has.
+///
+/// Layers are merged lowest to highest priority, so a higher layer wins
+/// property by property, which is the read precedence
+/// `docs/design/0005-structured-metadata-model.md` §3 specifies: EXIF, then
+/// IPTC-IIM, then an XMP packet embedded in the file, then the `.xmp` sidecar.
+///
+/// The file is read once and every layer parses those bytes: `exif::read_exif_file`
+/// used to do its own read, so a RAW file was pulled off disk twice per panel
+/// refresh for the same information.
 pub fn read_panel_metadata(path: &Path) -> Metadata {
-    let mut meta = bc_metadata::exif::read_exif_file(path).unwrap_or_default();
+    let Ok(bytes) = std::fs::read(path) else {
+        return Metadata::new();
+    };
+    let mut meta = bc_metadata::exif::read_exif(&bytes).unwrap_or_default();
+
+    if let Ok(iptc) = bc_metadata::iptc::read_iptc(&bytes) {
+        for (name, value) in iptc.properties() {
+            meta.set(name.namespace.clone(), name.name.clone(), value.clone());
+        }
+    }
+
+    if let Ok(Some(embedded)) = bc_metadata::xmp::read_embedded_xmp(&bytes) {
+        merge_xmp(&mut meta, &embedded);
+    }
+
     let sidecar = bc_metadata::xmp::sidecar_path(path);
     if sidecar.exists() {
         if let Ok(side) = bc_metadata::xmp::read_xmp_file(&sidecar) {
-            merge_sidecar(&mut meta, &side);
+            merge_xmp(&mut meta, &side);
         }
     }
     meta
 }
 
-/// Project sidecar properties onto the panel's view of a file.
+/// Project an XMP packet (embedded or sidecar) onto the panel's view.
 ///
-/// The sidecar wins property by property, which is the read precedence in
-/// `docs/design/0005-structured-metadata-model.md` §3, and it is not filtered
-/// down to EXIF any more: rating (`xmp:Rating`), color label
-/// (`photoshop:Label`), flag and keywords (`dc:subject`) only exist in the
-/// sidecar, so filtering it to EXIF made the tag editor write values the panel
-/// could never read back.
-pub fn merge_sidecar(meta: &mut Metadata, sidecar: &Metadata) {
-    for (name, value) in sidecar.properties() {
+/// The packet wins property by property, and it is not filtered down to EXIF
+/// any more: rating (`xmp:Rating`), color label (`photoshop:Label`), flag and
+/// keywords (`dc:subject`) exist only in XMP, so filtering to EXIF made the tag
+/// editor write values the panel could never read back.
+pub fn merge_xmp(meta: &mut Metadata, packet: &Metadata) {
+    for (name, value) in packet.properties() {
         meta.set(name.namespace.clone(), name.name.clone(), value.clone());
         // EXIF and TIFF properties are additionally projected onto the short
         // EXIF namespace so the text fields show the same names regardless of
@@ -673,6 +694,124 @@ mod tests {
         vec![0xFF, 0xD8, 0xFF, 0xD9]
     }
 
+    /// A JPEG carrying one marker segment before EOI, so the panel's layer
+    /// chain has something real to find.
+    fn jpeg_with_segment(marker: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![0xFF, 0xD8];
+        out.push(0xFF);
+        out.push(marker);
+        out.extend_from_slice(&((body.len() + 2) as u16).to_be_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(&[0xFF, 0xD9]);
+        out
+    }
+
+    /// An XMP packet with the given rating, as embedded writers store it.
+    fn xmp_packet(rating: &str) -> Vec<u8> {
+        format!(
+            r#"<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmlns:exif="http://ns.adobe.com/exif/1.0/">
+   <xmp:Rating>{rating}</xmp:Rating>
+   <exif:Make>From The Packet</exif:Make>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>"#
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn panel_layers_resolve_in_the_documented_precedence_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("layers.jpg");
+
+        // Layer 3 of 4: an XMP packet embedded in the file itself, rating 3.
+        let mut body = bc_metadata::embedded::XMP_JPEG_SIGNATURE.to_vec();
+        body.extend_from_slice(&xmp_packet("3"));
+        std::fs::write(&file, jpeg_with_segment(0xE1, &body)).unwrap();
+
+        let meta = read_panel_metadata(&file);
+        assert_eq!(
+            meta.rating().stars(),
+            3,
+            "the embedded packet is read at all"
+        );
+        assert_eq!(
+            meta.text(NS_EXIF, "Make"),
+            Some("From The Packet"),
+            "exif:Make inside XMP projects onto the panel's EXIF fields"
+        );
+
+        // Layer 4: the sidecar claims rating 5 and must win, property by
+        // property, without erasing the Make only the packet carries.
+        let sidecar = bc_metadata::xmp::sidecar_path(&file);
+        let mut side = Metadata::new();
+        side.set_rating(bc_metadata::ratings::Rating::new(5));
+        side.set_text(NS_EXIF, "Model", "From The Sidecar");
+        bc_metadata::xmp::write_xmp_file(&sidecar, &side).unwrap();
+
+        let meta = read_panel_metadata(&file);
+        assert_eq!(
+            meta.rating().stars(),
+            5,
+            "the sidecar outranks embedded XMP"
+        );
+        assert_eq!(
+            meta.text(NS_EXIF, "Make"),
+            Some("From The Packet"),
+            "a property the sidecar does not carry keeps the embedded value"
+        );
+        assert_eq!(meta.text(NS_EXIF, "Model"), Some("From The Sidecar"));
+
+        // No file: the panel shows an empty form rather than inventing one.
+        assert!(read_panel_metadata(&temp.path().join("absent.jpg")).is_empty());
+    }
+
+    #[test]
+    fn a_file_with_no_metadata_layers_reads_empty_instead_of_failing() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("bare.jpg");
+        std::fs::write(&file, jpeg_stub()).unwrap();
+        let meta = read_panel_metadata(&file);
+        assert!(meta.is_empty());
+        let tags = TagState::from_metadata(&meta);
+        assert_eq!(
+            (tags.stars, tags.label.clone(), tags.keywords.len()),
+            (0, String::new(), 0)
+        );
+    }
+
+    /// The same real-world gate as `bc-metadata`'s `XMP_SAMPLE` check, one
+    /// layer up: it proves the panel shows what another application wrote, not
+    /// just that a locator found the bytes.
+    #[test]
+    fn the_panel_shows_tags_written_by_another_application() {
+        let Some(sample) = std::env::var_os("XMP_SAMPLE") else {
+            eprintln!("XMP_SAMPLE not set; skipping third-party panel check");
+            return;
+        };
+        let meta = read_panel_metadata(Path::new(&sample));
+        let tags = TagState::from_metadata(&meta);
+        assert!(
+            tags.stars > 0 || !tags.label.is_empty() || !tags.keywords.is_empty(),
+            "the panel read no tags from {}: {tags:?}",
+            Path::new(&sample).display()
+        );
+        // Report what was found so the run says something concrete, the way
+        // the RAW_SAMPLE check does.
+        eprintln!(
+            "panel read {} : stars={} label={:?} keywords={:?} properties={}",
+            Path::new(&sample).display(),
+            tags.stars,
+            tags.label,
+            tags.keywords,
+            meta.properties().len()
+        );
+    }
+
     #[test]
     fn bulk_queue_continues_after_failures() {
         let temp = tempfile::tempdir().unwrap();
@@ -743,7 +882,7 @@ mod tests {
         side.set_text(bc_metadata::NS_DC, "title", "From the sidecar");
         side.set_text(bc_metadata::NS_XMP, "Rating", "4");
         side.set_text(bc_metadata::NS_PHOTOSHOP, "Label", "Orange");
-        merge_sidecar(&mut base, &side);
+        merge_xmp(&mut base, &side);
         assert_eq!(base.text(NS_EXIF, "Make"), Some("Sidecar"));
         assert_eq!(
             base.text(bc_metadata::NS_DC, "title"),
