@@ -16,7 +16,12 @@ use serde::{Deserialize, Serialize};
 use bc_metadata::{self, Metadata};
 
 const SCHEMA_VERSION: i64 = 1;
-const EXTRACTOR_VERSION: i64 = 1;
+/// Rows written before the indexer learned to read embedded XMP packets are
+/// wrong in a specific, common way: every JPEG or TIFF whose rating, label,
+/// flag or keywords live inside the file indexed as unrated. Bumping this
+/// makes `is_current` report those rows as stale, so the next pass over a
+/// folder rewrites them instead of serving tags that were never read.
+const EXTRACTOR_VERSION: i64 = 2;
 
 // ---------------------------------------------------------------------------
 // Errors (re-exported as crate::Result friendly)
@@ -728,48 +733,17 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+/// Read every metadata layer of a file, for indexing.
+///
+/// This used to be a fourth hand-written copy of the layer order (EXIF, then
+/// IPTC, then the sidecar) with the comment "embedded XMP not extracted here;
+/// sidecar covers the common case". That assumption stopped being true when
+/// tag writes moved into JPEG and TIFF files, so the index reported every
+/// tagged photo as unrated and anything built on it, sorting, filtering and
+/// smart collections, was wrong about the common case. `bc_metadata::layers`
+/// is now the single definition of the order, shared with the panel and export.
 fn read_metadata_for_path(path: &Path) -> Metadata {
-    let mut meta = Metadata::new();
-    // EXIF (lower priority).
-    if let Ok(m) = bc_metadata::exif::read_exif_file(path) {
-        merge_lower(&mut meta, &m);
-    }
-    // IPTC.
-    if let Ok(m) = bc_metadata::iptc::read_iptc_file(path) {
-        merge_lower(&mut meta, &m);
-    }
-    // Sidecar XMP (higher priority: overwrite).
-    let sidecar = path.with_extension("xmp");
-    if sidecar.exists() {
-        if let Ok(m) = bc_metadata::xmp::read_xmp_file(&sidecar) {
-            for (k, v) in m.properties {
-                meta.properties.insert(k, v);
-            }
-            for nb in m.native {
-                meta.add_native(nb);
-            }
-        }
-    }
-    // Embedded XMP not extracted here; sidecar covers the common case.
-    meta
-}
-
-fn merge_lower(target: &mut Metadata, source: &Metadata) {
-    for (k, v) in &source.properties {
-        target
-            .properties
-            .entry(k.clone())
-            .or_insert_with(|| v.clone());
-    }
-    for nb in &source.native {
-        if !target
-            .native
-            .iter()
-            .any(|b| b.label == nb.label && b.data == nb.data)
-        {
-            target.add_native(nb.clone());
-        }
-    }
+    bc_metadata::layers::read_file(path).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -1060,5 +1034,81 @@ mod tests {
         assert_eq!(cols[0].name, "high");
         // evaluate on empty index returns empty
         assert!(idx.evaluate_smart_collection("high").unwrap().is_empty());
+    }
+    #[test]
+    fn an_in_place_tag_edit_makes_the_indexed_row_stale() {
+        // The version bump above only helps if staleness is actually detected.
+        // Slice 4 writes tags into the file itself, so an edit must change the
+        // file fingerprint; if it did not, the index would keep serving the
+        // old rating forever and sorting or filtering would lie.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("edit.jpg");
+        crate::export::fixtures::write_oriented_jpeg(&file, 20, 16, 1);
+
+        let index = MetadataIndex::open_in_memory().unwrap();
+        let mut first = bc_metadata::Metadata::new();
+        first.set_rating(bc_metadata::ratings::Rating::new(2));
+        bc_metadata::xmp::write_embedded_xmp_file(&file, &first).unwrap();
+
+        index.index_path(&file).unwrap();
+        assert!(index.is_current(&file), "a fresh row is current");
+        assert_eq!(index.get(&file).unwrap().unwrap().rating, 2);
+
+        // Rewrite the tag in place, exactly as the panel's Save does.
+        let mut second = bc_metadata::Metadata::new();
+        second.set_rating(bc_metadata::ratings::Rating::new(5));
+        bc_metadata::xmp::write_embedded_xmp_file(&file, &second).unwrap();
+
+        assert!(
+            !index.is_current(&file),
+            "an in-place tag edit must invalidate the row, or the index serves a stale rating"
+        );
+
+        // Re-indexing picks the new value up.
+        index.index_path(&file).unwrap();
+        assert!(index.is_current(&file));
+        assert_eq!(index.get(&file).unwrap().unwrap().rating, 5);
+    }
+
+    #[test]
+    fn the_index_sees_tags_that_live_inside_the_file() {
+        // Slice 4 moved tag writes for JPEG and TIFF *into* the file. If the
+        // indexer only reads EXIF, IPTC and the sidecar, every tagged JPEG and
+        // TIFF on disk indexes as unrated, and sorting, filtering and
+        // smart collections are wrong for the common case. This test is the
+        // check that the index and the panel agree about a file.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("tagged.jpg");
+        crate::export::fixtures::write_oriented_jpeg(&file, 24, 18, 1);
+
+        let mut tags = bc_metadata::Metadata::new();
+        tags.set_rating(bc_metadata::ratings::Rating::new(4));
+        tags.set_color_label(bc_metadata::ratings::ColorLabel::Purple);
+        tags.set_flag(bc_metadata::ratings::Flag::Approved);
+        bc_metadata::keywords::add_keyword(&mut tags, "InFile");
+        bc_metadata::xmp::write_embedded_xmp_file(&file, &tags).unwrap();
+
+        // The panel and export both read this fine; the index must too.
+        let layers = bc_metadata::layers::read_file(&file).unwrap();
+        assert_eq!(layers.rating().stars(), 4, "the chain sees it");
+
+        let index = MetadataIndex::open_in_memory().unwrap();
+        index.index_path(&file).unwrap();
+        let row = index.get(&file).unwrap().expect("the file is indexed");
+        assert_eq!(
+            row.rating, 4,
+            "the index must see tags that live inside the file"
+        );
+        assert_eq!(
+            row.color_label.as_deref(),
+            Some("Purple"),
+            "colour label lost between the file and the index"
+        );
+        assert_eq!(row.flag.as_deref(), Some("Approved"));
+        assert!(
+            row.keywords.iter().any(|k| k == "InFile"),
+            "keywords lost between the file and the index: {:?}",
+            row.keywords
+        );
     }
 }

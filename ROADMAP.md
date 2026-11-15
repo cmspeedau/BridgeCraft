@@ -142,6 +142,7 @@ M1's remaining items are the two surfacing defects (failed-versus-pending thumbn
 
 ## Tech debt
 
+- **Nothing reads the index.** `bc-core::metadata_index` is fully implemented and tested, but its only writer is the watched-folder ingest action and no code path queries it: no search field, no smart-collection browsing, no tag display. So the index-backed work is not a wiring change on top of the panel, it is the missing indexer itself, and until something populates and reads it the grid and details overlays keep reading each file's layers directly. Bumping `EXTRACTOR_VERSION` makes the rows the ingest action already wrote correct on the next pass, which matters only once there is a pass.
 - **Two metadata search/index implementations.** `bc-metadata::search` projects a `Metadata` into a flat searchable record, while `bc-core::metadata_index` owns a SQLite index with its own query builder and smart-collection table. `bc-core::metadata_index` is the one auto-processing writes to. Pick one home for the query model before the smart-collection UI lands.
 - **Duplicate query spellings kept on purpose.** `bc-core::metadata_index` still accepts several field and operator spellings (`Field::Make`/`Field::CameraMake`, `Operator::Eq`/`Operator::Equals`, and `Query`'s `predicates`/`conditions`/`clauses`/`and` fields), normalized by `canonical_predicate`. They are kept because they are serialized into stored smart-collection rows; collapse them in the same change that designs the collection UI, with a migration for anything already on disk.
 - **Synonym API removed 2026-11-15.** Duplicate public aliases (`bc_core::search`/`index`/`metadata_search`/`versions` module re-exports, `bc_metadata::extract`/`projection`/`searchable`, `PublishPipeline`/`PublishJob`/`run`/`run_pipeline`, `ScriptEngine`/`AutomationHost`/`ScriptRunner`, the contact-sheet `generate_*`/`create_*`/`build_*` set, and the metadata-index `add`/`insert`/`upsert_file`/`put`/`scan*`/`lookup`/`cleanup` family) were deleted: they had no callers, no behavior, and inflated the apparent API surface of modules that are in fact unwired.
@@ -282,6 +283,42 @@ meantime, asserted by a test) and writing IPTC-IIM into TIFF.
   now runs submit -> worker -> publish and fails, naming the exported file, when
   the wiring is removed. Unit tests of a helper prove the helper; only a
   pipeline test proves the pipeline.
+
+### A latent index bug that my own slice 4 activated (2026-11-15)
+
+`metadata_index::read_metadata_for_path` was a fourth hand-written copy of the
+layer order, carrying the comment "Embedded XMP not extracted here; sidecar
+covers the common case." That was defensible while tags only ever went to a
+sidecar. Slice 4 moved tag writes **into** JPEG and TIFF files, so the sentence
+became false and the index began reporting every tagged photo as unrated, with
+anything built on it (sorting, filtering, smart collections) wrong about the
+common case.
+
+Found while planning index-backed tags, not from a failure: a test written to
+check the indexer saw in-place tags failed with `left: 0, right: 4`.
+
+Fixed by deleting the fourth copy and calling `bc_metadata::layers::read_file`,
+plus `EXTRACTOR_VERSION` 1 to 2 so `is_current` reports the wrong rows stale on
+the next pass.
+
+Honest limit on that fix: the version bump is **not covered by any test**, and
+cannot be in-process, because proving it needs a database written by the
+previous code. What `an_in_place_tag_edit_makes_the_indexed_row_stale` does
+prove is the mechanism the bump relies on, that an in-place tag edit changes the
+file fingerprint. Checked by hand: setting `EXTRACTOR_VERSION` back to 1 leaves
+all 108 bc-core tests green, which is why the bump is stated as a migration for
+rows written by the ingest action, not as something a test guarantees.
+
+Two things this exposed about my own testing, both now closed:
+
+- `merge_xmp` had its own assignment loop instead of calling
+  `merge_properties`, so the layer priority lived in two places. Inverting
+  `merge_properties` left `the_sidecar_outranks_the_embedded_packet_...` green,
+  which is how I found it. They are unified, and that test now fails on the
+  inversion, so the rule is pinned.
+- The roadmap and backlog implied index-backed browsing was a wiring step away.
+  It is not: nothing anywhere reads the index, so the missing piece is an
+  indexer, and the docs now say that instead of hinting at plumbing.
 
 ### Documentation corrected against the code on `main` (no behavior changes)
 

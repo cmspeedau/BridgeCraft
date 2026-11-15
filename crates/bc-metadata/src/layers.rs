@@ -89,9 +89,14 @@ pub fn merge_properties(target: &mut Metadata, source: &Metadata) {
 /// Merge an XMP packet, plus one projection step: EXIF and TIFF properties
 /// carried as XMP are also written into the short `"exif"` namespace, so a
 /// field list that reads `exif/Artist` sees the value however it was stored.
+///
+/// The priority itself comes from [`merge_properties`], not from a second
+/// copy of the same assignment loop. Without that, a change to one helper
+/// would silently leave the other implementing a different rule, which is how
+/// a layer-order bug survives a green test suite.
 pub fn merge_xmp(target: &mut Metadata, packet: &Metadata) {
+    merge_properties(target, packet);
     for (name, value) in packet.properties() {
-        target.set(name.namespace.clone(), name.name.clone(), value.clone());
         if name.namespace == XMP_EXIF_URI || name.namespace == XMP_TIFF_URI {
             if let Value::Text(text) = value {
                 target.set_text(crate::NS_EXIF, name.name.clone(), text.clone());
@@ -184,6 +189,34 @@ mod tests {
             "a broken packet must not cost the user their sidecar keywords"
         );
         assert_eq!(meta.color_label().as_label_str(), Some("Green"));
+    }
+
+    /// The two merge helpers exist to encode *one* priority direction, and the
+    /// previous code had a "first writer wins" helper doing the same job from
+    /// the other end. These tests pin the direction so a future edit cannot
+    /// quietly invert the layer order.
+    #[test]
+    fn merging_is_last_writer_wins_and_is_untouched_for_absent_fields() {
+        let mut target = Metadata::new();
+        target.set_text(crate::NS_EXIF, "Artist", "Low layer");
+        target.set_text(crate::NS_DC, "description", "Only in the low layer");
+
+        let mut high = Metadata::new();
+        high.set_text(crate::NS_EXIF, "Artist", "High layer");
+        high.set_text(crate::NS_XMP, "Rating", "3");
+
+        super::merge_properties(&mut target, &high);
+        assert_eq!(
+            target.text(crate::NS_EXIF, "Artist"),
+            Some("High layer"),
+            "the higher layer must overwrite, or the priority order is inverted"
+        );
+        assert_eq!(
+            target.text(crate::NS_DC, "description"),
+            Some("Only in the low layer"),
+            "a field the higher layer lacks must survive"
+        );
+        assert_eq!(target.rating().stars(), 3, "new properties arrive");
     }
 
     #[test]
