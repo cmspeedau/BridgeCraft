@@ -172,11 +172,6 @@ impl PluginHost for NoopPluginHost {
     }
 }
 
-// Compatibility aliases that do not imply or retain a Lua runtime.
-pub type ScriptEngine = ScriptHost;
-pub type AutomationHost = ScriptHost;
-pub type ScriptRunner = ScriptHost;
-
 #[cfg(test)]
 mod tests {
     use super::*;

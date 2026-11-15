@@ -1,6 +1,12 @@
 /target
 Cargo.lock.orig
 
+# Thumbnail cache SQLite database (created in the working directory by a GUI or
+# `--rebuild-cache` run; see ROADMAP.md Phase 6 for moving it to the data dir)
+.bridgecraft-thumbs.db
+.bridgecraft-thumbs.db-wal
+.bridgecraft-thumbs.db-shm
+
 # Backup / temp files
 *.swp
 *.swo

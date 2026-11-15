@@ -51,14 +51,6 @@ pub struct IndexedFile {
     pub extractor_version: i64,
 }
 
-// Type aliases for compatibility with likely hidden-test names.
-pub type IndexEntry = IndexedFile;
-pub type FileRecord = IndexedFile;
-pub type MetadataRecord = IndexedFile;
-pub type IndexedMetadata = IndexedFile;
-pub type Row = IndexedFile;
-pub type IndexRow = IndexedFile;
-
 #[derive(Debug, Clone, Default)]
 pub struct IndexStatus {
     pub files: usize,
@@ -121,10 +113,6 @@ pub enum Operator {
     Has,
 }
 
-pub type Op = Operator;
-pub type Cmp = Operator;
-pub type CompareOp = Operator;
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum QueryValue {
     Text(String),
@@ -133,18 +121,12 @@ pub enum QueryValue {
     Bool(bool),
 }
 
-pub type Value = QueryValue;
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Predicate {
     pub field: Field,
     pub operator: Operator,
     pub value: Option<QueryValue>,
 }
-
-pub type Condition = Predicate;
-pub type Clause = Predicate;
-pub type Rule = Predicate;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Combinator {
@@ -289,10 +271,6 @@ pub struct SmartCollection {
     pub query: Query,
 }
 
-pub type SavedQuery = SmartCollection;
-pub type SavedSearch = SmartCollection;
-pub type Collection = SmartCollection;
-
 // ---------------------------------------------------------------------------
 // Index store
 // ---------------------------------------------------------------------------
@@ -320,38 +298,6 @@ impl MetadataIndex {
         };
         idx.init()?;
         Ok(idx)
-    }
-
-    pub fn new() -> crate::Result<Self> {
-        Self::open_in_memory()
-    }
-
-    pub fn in_memory() -> crate::Result<Self> {
-        Self::open_in_memory()
-    }
-
-    pub fn add(&self, path: &Path, meta: &Metadata) -> crate::Result<()> {
-        self.index_file(path, meta)
-    }
-
-    pub fn insert(&self, path: &Path, meta: &Metadata) -> crate::Result<()> {
-        self.index_file(path, meta)
-    }
-
-    pub fn index(&self, path: &Path, meta: &Metadata) -> crate::Result<()> {
-        self.index_file(path, meta)
-    }
-
-    pub fn upsert_file(&self, path: &Path, meta: &Metadata) -> crate::Result<()> {
-        self.index_file(path, meta)
-    }
-
-    pub fn put(&self, path: &Path, meta: &Metadata) -> crate::Result<()> {
-        self.index_file(path, meta)
-    }
-
-    pub fn remove(&self, path: &Path) -> crate::Result<()> {
-        self.delete(path)
     }
 
     pub fn delete(&self, path: &Path) -> crate::Result<()> {
@@ -387,54 +333,6 @@ impl MetadataIndex {
             && row.extractor_version == EXTRACTOR_VERSION
     }
 
-    pub fn needs_reindex(&self, path: &Path) -> bool {
-        !self.is_current(path)
-    }
-
-    pub fn is_stale(&self, path: &Path) -> bool {
-        !self.is_current(path)
-    }
-
-    pub fn is_up_to_date(&self, path: &Path) -> bool {
-        self.is_current(path)
-    }
-
-    pub fn is_indexed(&self, path: &Path) -> bool {
-        self.contains(path)
-    }
-
-    pub fn entry(&self, path: &Path) -> crate::Result<Option<IndexedFile>> {
-        self.get(path)
-    }
-
-    pub fn row(&self, path: &Path) -> crate::Result<Option<IndexedFile>> {
-        self.get(path)
-    }
-
-    pub fn get_file(&self, path: &Path) -> crate::Result<Option<IndexedFile>> {
-        self.get(path)
-    }
-
-    pub fn scan(&self, root: &Path) -> crate::Result<usize> {
-        self.index_root(root)
-    }
-
-    pub fn scan_root(&self, root: &Path) -> crate::Result<usize> {
-        self.index_root(root)
-    }
-
-    pub fn index_folder(&self, root: &Path) -> crate::Result<usize> {
-        self.index_root(root)
-    }
-
-    pub fn index_dir(&self, root: &Path) -> crate::Result<usize> {
-        self.index_root(root)
-    }
-
-    pub fn index_tree(&self, root: &Path) -> crate::Result<usize> {
-        self.index_root(root)
-    }
-
     pub fn query_rows(&self, query: &Query) -> crate::Result<Vec<IndexedFile>> {
         let paths = self.query(query)?;
         let all = self.all()?;
@@ -442,30 +340,6 @@ impl MetadataIndex {
             .into_iter()
             .filter(|r| paths.contains(&r.path))
             .collect())
-    }
-
-    pub fn search_rows(&self, query: &Query) -> crate::Result<Vec<IndexedFile>> {
-        self.query_rows(query)
-    }
-
-    pub fn find(&self, query: &Query) -> crate::Result<Vec<IndexedFile>> {
-        self.query_rows(query)
-    }
-
-    pub fn lookup(&self, query: &Query) -> crate::Result<Vec<IndexedFile>> {
-        self.query_rows(query)
-    }
-
-    pub fn search_paths(&self, query: &Query) -> crate::Result<Vec<PathBuf>> {
-        self.query(query)
-    }
-
-    pub fn prune_stale(&self) -> crate::Result<usize> {
-        self.prune_missing()
-    }
-
-    pub fn cleanup(&self) -> crate::Result<usize> {
-        self.prune_missing()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -518,10 +392,6 @@ impl MetadataIndex {
 
     // -- roots --
 
-    pub fn register_root(&self, path: &Path) -> crate::Result<()> {
-        self.add_root(path)
-    }
-
     pub fn add_root(&self, path: &Path) -> crate::Result<()> {
         let conn = self.lock();
         conn.execute(
@@ -550,21 +420,11 @@ impl MetadataIndex {
         Ok(out)
     }
 
-    // -- fingerprint --
-
-    pub fn fingerprint(path: &Path) -> crate::Result<(i64, u64, Option<i64>)> {
-        fingerprint(path)
-    }
-
     // -- indexing --
-
-    pub fn upsert(&self, path: &Path, meta: &Metadata) -> crate::Result<()> {
-        self.index_file(path, meta)
-    }
 
     pub fn index_file(&self, path: &Path, meta: &Metadata) -> crate::Result<()> {
         let (mtime_ns, size, sidecar_mtime) = fingerprint(path)?;
-        let searchable = bc_metadata::extract_searchable(meta);
+        let searchable = bc_metadata::search::extract(meta);
         let conn = self.lock();
         conn.execute(
             "INSERT INTO files (path, root, size, mtime_ns, sidecar_mtime_ns, width, height, created, modified, camera_make, camera_model, rating, color_label, flag, title, description, schema_version, extractor_version, indexed_at)
@@ -626,15 +486,8 @@ impl MetadataIndex {
         self.index_file(path, &meta)
     }
 
-    pub fn index_paths(&self, paths: &[PathBuf]) -> crate::Result<()> {
-        for p in paths {
-            let _ = self.index_path(p);
-        }
-        Ok(())
-    }
-
     pub fn index_root(&self, root: &Path) -> crate::Result<usize> {
-        self.register_root(root)?;
+        self.add_root(root)?;
         let mut count = 0usize;
         if root.is_dir() {
             for entry in walkdir::WalkDir::new(root).into_iter().flatten() {
@@ -646,10 +499,6 @@ impl MetadataIndex {
         Ok(count)
     }
 
-    pub fn index_directory(&self, root: &Path) -> crate::Result<usize> {
-        self.index_root(root)
-    }
-
     // -- query --
 
     pub fn query(&self, query: &Query) -> crate::Result<Vec<PathBuf>> {
@@ -659,14 +508,6 @@ impl MetadataIndex {
             .filter(|r| query.matches(r))
             .map(|r| r.path)
             .collect())
-    }
-
-    pub fn search(&self, query: &Query) -> crate::Result<Vec<PathBuf>> {
-        self.query(query)
-    }
-
-    pub fn query_paths(&self, query: &Query) -> crate::Result<Vec<PathBuf>> {
-        self.query(query)
     }
 
     pub fn all(&self) -> crate::Result<Vec<IndexedFile>> {
@@ -773,10 +614,6 @@ impl MetadataIndex {
         Ok(removed)
     }
 
-    pub fn prune(&self) -> crate::Result<usize> {
-        self.prune_missing()
-    }
-
     // -- status --
 
     pub fn status(&self) -> IndexStatus {
@@ -798,10 +635,6 @@ impl MetadataIndex {
     // -- smart collections --
 
     pub fn save_smart_collection(&self, name: &str, query: &Query) -> crate::Result<()> {
-        self.save_collection(name, query)
-    }
-
-    pub fn save_collection(&self, name: &str, query: &Query) -> crate::Result<()> {
         let json = serde_json::to_string(query)
             .map_err(|e| crate::CoreError::InvalidOperation(e.to_string()))?;
         let conn = self.lock();
@@ -812,14 +645,6 @@ impl MetadataIndex {
         )
         .map_err(|e| crate::CoreError::InvalidOperation(e.to_string()))?;
         Ok(())
-    }
-
-    pub fn put_smart_collection(&self, name: &str, query: &Query) -> crate::Result<()> {
-        self.save_smart_collection(name, query)
-    }
-
-    pub fn load_smart_collections(&self) -> crate::Result<Vec<SmartCollection>> {
-        self.smart_collections()
     }
 
     pub fn smart_collections(&self) -> crate::Result<Vec<SmartCollection>> {
@@ -850,19 +675,7 @@ impl MetadataIndex {
         Ok(out)
     }
 
-    pub fn list_smart_collections(&self) -> crate::Result<Vec<SmartCollection>> {
-        self.smart_collections()
-    }
-
-    pub fn collections(&self) -> crate::Result<Vec<SmartCollection>> {
-        self.smart_collections()
-    }
-
     pub fn delete_smart_collection(&self, name: &str) -> crate::Result<()> {
-        self.remove_smart_collection(name)
-    }
-
-    pub fn remove_smart_collection(&self, name: &str) -> crate::Result<()> {
         let conn = self.lock();
         conn.execute(
             "DELETE FROM smart_collections WHERE name = ?1",
@@ -872,25 +685,13 @@ impl MetadataIndex {
         Ok(())
     }
 
-    pub fn delete_collection(&self, name: &str) -> crate::Result<()> {
-        self.delete_smart_collection(name)
-    }
-
     pub fn evaluate_smart_collection(&self, name: &str) -> crate::Result<Vec<PathBuf>> {
-        self.evaluate_collection(name)
-    }
-
-    pub fn evaluate_collection(&self, name: &str) -> crate::Result<Vec<PathBuf>> {
         let collections = self.smart_collections()?;
         let coll = collections
             .into_iter()
             .find(|c| c.name == name)
             .ok_or_else(|| crate::CoreError::PathNotFound(name.to_string()))?;
         self.query(&coll.query)
-    }
-
-    pub fn run_smart_collection(&self, name: &str) -> crate::Result<Vec<PathBuf>> {
-        self.evaluate_smart_collection(name)
     }
 }
 
@@ -1203,7 +1004,7 @@ mod tests {
         let mut meta = Metadata::new();
         meta.set_text(bc_metadata::NS_EXIF, "Make", "Canon".to_string());
         let idx = MetadataIndex::open_in_memory().unwrap();
-        idx.upsert(&file, &meta).unwrap();
+        idx.index_file(&file, &meta).unwrap();
         let q = Query::single(Predicate {
             field: Field::CameraMake,
             operator: Operator::Equals,
@@ -1220,7 +1021,7 @@ mod tests {
         std::fs::write(&file, b"x").unwrap();
         let idx = MetadataIndex::open_in_memory().unwrap();
         let meta = Metadata::new();
-        idx.upsert(&file, &meta).unwrap();
+        idx.index_file(&file, &meta).unwrap();
         // change file
         std::thread::sleep(std::time::Duration::from_millis(5));
         std::fs::write(&file, b"yy").unwrap();

@@ -61,17 +61,8 @@ impl Default for ContactSheetOptions {
     }
 }
 
-// Aliases for compatibility with likely hidden-test naming.
-pub type ContactSheetConfig = ContactSheetOptions;
-pub type Layout = ContactSheetOptions;
-pub type ContactSheetLayout = ContactSheetOptions;
-
 /// Render a flattened image contact sheet (PNG/JPEG-ready RGBA).
 pub fn render_image_sheet(sources: &[PathBuf], options: &ContactSheetOptions) -> Result<RgbaImage> {
-    image_sheet(sources, options)
-}
-
-pub fn image_sheet(sources: &[PathBuf], options: &ContactSheetOptions) -> Result<RgbaImage> {
     let cols = options.cols.max(1);
     let rows = options.rows.max(1);
     let cell = options.image_cell.max(16);
@@ -118,10 +109,6 @@ pub fn image_sheet(sources: &[PathBuf], options: &ContactSheetOptions) -> Result
 
 /// Render a paginated PDF contact sheet.
 pub fn render_pdf(sources: &[PathBuf], options: &ContactSheetOptions) -> Result<Vec<u8>> {
-    pdf_sheet(sources, options)
-}
-
-pub fn pdf_sheet(sources: &[PathBuf], options: &ContactSheetOptions) -> Result<Vec<u8>> {
     let cols = options.cols.max(1);
     let rows = options.rows.max(1);
     let per_page = (cols * rows) as usize;
@@ -325,33 +312,6 @@ pub fn pdf_sheet(sources: &[PathBuf], options: &ContactSheetOptions) -> Result<V
 }
 
 // Helpers
-pub fn generate_pdf(sources: &[PathBuf], options: &ContactSheetOptions) -> Result<Vec<u8>> {
-    render_pdf(sources, options)
-}
-
-pub fn create_pdf(sources: &[PathBuf], options: &ContactSheetOptions) -> Result<Vec<u8>> {
-    render_pdf(sources, options)
-}
-
-pub fn contact_sheet_pdf(sources: &[PathBuf], options: &ContactSheetOptions) -> Result<Vec<u8>> {
-    render_pdf(sources, options)
-}
-
-pub fn generate_image_sheet(
-    sources: &[PathBuf],
-    options: &ContactSheetOptions,
-) -> Result<RgbaImage> {
-    render_image_sheet(sources, options)
-}
-
-pub fn create_image_sheet(sources: &[PathBuf], options: &ContactSheetOptions) -> Result<RgbaImage> {
-    render_image_sheet(sources, options)
-}
-
-pub fn build_image_sheet(sources: &[PathBuf], options: &ContactSheetOptions) -> Result<RgbaImage> {
-    render_image_sheet(sources, options)
-}
-
 fn flatten_onto_white(image: &RgbaImage) -> image::RgbImage {
     let mut out = image::RgbImage::new(image.width(), image.height());
     for (x, y, pixel) in image.enumerate_pixels() {

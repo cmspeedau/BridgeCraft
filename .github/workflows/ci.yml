@@ -17,8 +17,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      # Keep this in step with rust-toolchain.toml so the pinned toolchain and
+      # its clippy/rustfmt components are installed rather than auto-fetched.
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.100.0
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - name: Install ffmpeg (video thumbnail tests)

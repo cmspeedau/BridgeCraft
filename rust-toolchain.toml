@@ -1,0 +1,8 @@
+# Pins the toolchain every contributor and CI builds with, so `cargo fmt`
+# output and clippy lints stay identical everywhere (AGENTS.md quality gates).
+#
+# This is a *pinned* toolchain, not a verified minimum supported Rust version:
+# no lower MSRV is claimed until CI checks one. See ROADMAP.md "Tech debt".
+[toolchain]
+channel = "1.100.0"
+components = ["rustfmt", "clippy"]

@@ -141,18 +141,6 @@ fn publish_one(source: &Path, preset: &PublishPreset) -> Result<PathBuf> {
     Ok(target)
 }
 
-// Aliases
-pub type PublishPipeline = PublishPreset;
-pub type PublishJob = PublishRequest;
-
-pub fn run(request: &PublishRequest) -> Result<PublishReport> {
-    publish(request)
-}
-
-pub fn run_pipeline(request: &PublishRequest) -> Result<PublishReport> {
-    publish(request)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

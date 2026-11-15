@@ -253,11 +253,6 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-// Aliases
-pub type VersionStackStore = VersionStacks;
-pub type VersionSet = VersionStack;
-pub type VersionSets = VersionStacks;
-
 #[cfg(test)]
 mod tests {
     use super::*;

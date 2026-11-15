@@ -16,10 +16,6 @@ pub mod search;
 pub mod templates;
 pub use templates::*;
 pub mod xmp;
-pub use search as extract;
-pub use search as projection;
-pub use search as searchable;
-pub use search as metadata_search;
 
 pub use search::*;
 use serde::{Deserialize, Serialize};

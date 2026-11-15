@@ -104,31 +104,6 @@ fn dc_text(meta: &Metadata, name: &str) -> Option<String> {
     }
 }
 
-// Convenience aliases.
-pub fn extract_searchable(meta: &Metadata) -> SearchableMetadata {
-    extract(meta)
-}
-
-pub fn searchable_metadata(meta: &Metadata) -> SearchableMetadata {
-    extract(meta)
-}
-
-pub fn projection(meta: &Metadata) -> SearchableMetadata {
-    extract(meta)
-}
-
-pub fn extract_metadata(meta: &Metadata) -> SearchableMetadata {
-    extract(meta)
-}
-
-pub fn extract_indexable(meta: &Metadata) -> SearchableMetadata {
-    extract(meta)
-}
-
-pub fn to_searchable(meta: &Metadata) -> SearchableMetadata {
-    extract(meta)
-}
-
 pub fn searchable(meta: &Metadata) -> SearchableMetadata {
     extract(meta)
 }
