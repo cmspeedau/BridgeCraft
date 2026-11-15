@@ -456,6 +456,10 @@ fn prepare_export(
         Ok(bytes) => bytes,
         Err(e) => return cancelled_or(e.to_string()),
     };
+    // Tags travel with the pixels when the output format can hold them. This
+    // runs before the temp write, so an export is never published without the
+    // metadata its dialog promised.
+    let bytes = export::carry_tags(source, bytes, format);
     if cancel.load(Ordering::Relaxed) {
         return Prepared::Cancelled;
     }
@@ -681,6 +685,55 @@ mod tests {
         assert_eq!(std::fs::read_dir(&out).unwrap().count(), 3);
         assert!(out.join("shot_64_1.png").exists());
         assert!(out.join("shot_64_2.png").exists());
+    }
+
+    #[test]
+    fn the_job_pipeline_itself_carries_tags_into_a_jpeg_export() {
+        // Not a unit test of `carry_tags`: this runs submit -> worker ->
+        // publish, the path a user's Export menu item actually takes. Without
+        // it the wiring in `prepare_export` could be deleted and every other
+        // test would still pass, which is exactly what happened while writing
+        // this. Verified by removal: deleting the call fails this test and
+        // names the exported file.
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("shot.jpg");
+        crate::export::fixtures::write_oriented_jpeg(&source, 64, 48, 1);
+        let mut tags = bc_metadata::Metadata::new();
+        tags.set_rating(bc_metadata::ratings::Rating::new(3));
+        tags.set_flag(bc_metadata::ratings::Flag::Rejected);
+        bc_metadata::keywords::add_keyword(&mut tags, "Pipeline");
+        bc_metadata::xmp::write_embedded_xmp_file(&source, &tags).unwrap();
+
+        let queue = ExportQueue::new(1);
+        let job = queue
+            .submit(ExportRequest {
+                sources: vec![source.clone()],
+                destination: None,
+                format: ExportFormat::Jpeg { quality: 80 },
+                max_edge: 32,
+            })
+            .unwrap();
+        wait_until("jpeg tag job", || job_finished(&queue, job.id).is_some());
+
+        let outputs: Vec<PathBuf> = job_finished(&queue, job.id)
+            .unwrap()
+            .files
+            .iter()
+            .filter_map(|record| match &record.state {
+                FileState::Done { output } => Some(output.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outputs.len(), 1, "the job should have produced one file");
+        let read = bc_metadata::layers::read_file(&outputs[0]).unwrap();
+        assert_eq!(
+            read.rating().stars(),
+            3,
+            "the exported {} lost its rating",
+            outputs[0].display()
+        );
+        assert_eq!(read.flag(), bc_metadata::ratings::Flag::Rejected);
+        assert!(bc_metadata::keywords::subjects(&read).contains(&"Pipeline".to_string()));
     }
 
     #[test]

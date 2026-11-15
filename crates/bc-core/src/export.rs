@@ -10,13 +10,16 @@
 //! path is shared), which is a documented limitation until full-tier
 //! decoders land. Formats out: JPEG (quality knob), PNG and WebP.
 //!
-//! Metadata policy: no XMP packet, rating, label or flag is copied yet. The
-//! writers landed (`bc_metadata::xmp::write_embedded_xmp` for JPEG and TIFF,
-//! sidecar for the rest), so this is now a wiring gap in the export path rather
-//! than a missing capability, and the UI has to say so plainly.
-//! The one piece of metadata that *is* honoured is EXIF orientation: it is
-//! applied to the pixel data rather than copied as a tag, so exports look right
-//! even though they carry no EXIF.
+//! Metadata policy: JPEG exports carry the asset's rating, colour label,
+//! approve/reject flag and keywords as an embedded XMP packet ([`carry_tags`]).
+//! Capture data (EXIF `Make`/`Model`/`Software`/dates) deliberately does not
+//! travel: an export is a downscaled re-encode, so copying exposure tags would
+//! claim a provenance the output does not have. PNG and WebP exports carry no
+//! tags, because this build has no packet writer for those containers and the
+//! policy forbids scattering surprise sidecars; the dialog says so before the
+//! job starts.
+//! The other piece of metadata that is honoured is EXIF orientation: it is
+//! applied to the pixel data rather than copied as a tag, so exports look right.
 
 use std::path::{Path, PathBuf};
 
@@ -195,6 +198,76 @@ pub fn apply_orientation(image: RgbaImage, code: u16) -> RgbaImage {
 }
 
 /// Encode RGBA pixels into the container bytes for `format`.
+/// The tag properties that travel with an export, and nothing else.
+///
+/// Rating, colour label, approve/reject flag and keywords are judgements the
+/// user made *about the asset*, so an export that loses them is a worse file
+/// than the one in the library. Capture data deliberately does not travel with
+/// this rule: EXIF `Make`/`Model`/`Software`/`DateTimeOriginal` describe the
+/// original exposure, and the exported pixels are a downscaled re-encode, so
+/// copying those tags would imply a provenance that is not true of the output.
+/// Copying them correctly means rewriting an EXIF tree and is its own change.
+pub const EXPORTED_TAG_PROPERTIES: &[(&str, &str)] = &[
+    (bc_metadata::NS_XMP, "Rating"),
+    (bc_metadata::NS_PHOTOSHOP, "Label"),
+    (bc_metadata::NS_DC, "subject"),
+    (bc_metadata::NS_BRIDGECRAFT, "Flag"),
+];
+
+/// Carry the source file's tags into `encoded`, when the output format can
+/// hold them.
+///
+/// JPEG takes a real embedded XMP packet. PNG and WebP have no packet writer
+/// in this build, so those bytes are returned unchanged rather than having a
+/// surprise `.xmp` file created beside them, which is the "no auto-sidecar"
+/// rule from `docs/design/0005-structured-metadata-model.md` section 4.
+///
+/// Failing to read the source never fails the export: an asset browser that
+/// refuses to write a picture because one tag layer is corrupt would be worse
+/// than one that writes a picture without tags. The reason is logged, and the
+/// dialog states the rule up front so the outcome is not a surprise.
+pub fn carry_tags(source: &Path, encoded: Vec<u8>, format: ExportFormat) -> Vec<u8> {
+    if !matches!(format, ExportFormat::Jpeg { .. }) {
+        return encoded;
+    }
+    let layers = match bc_metadata::layers::read_file(source) {
+        Ok(layers) => layers,
+        Err(error) => {
+            tracing::warn!("export: reading tags from {}: {error}", source.display());
+            return encoded;
+        }
+    };
+
+    let mut carried = bc_metadata::Metadata::new();
+    for (namespace, name) in EXPORTED_TAG_PROPERTIES {
+        if let Some(value) = layers.get(namespace, name) {
+            carried.set(*namespace, *name, value.clone());
+        }
+    }
+    if carried.is_empty() {
+        // Nothing to write, and writing an empty packet would add a segment
+        // that says the file has no tags.
+        return encoded;
+    }
+
+    match bc_metadata::xmp::write_embedded_xmp(&encoded, &carried) {
+        Ok(with_packet) => with_packet,
+        Err(error) => {
+            tracing::warn!(
+                "export: could not attach tags to {}: {error}",
+                source.display()
+            );
+            encoded
+        }
+    }
+}
+
+/// Whether this output format carries the tag properties, for the dialog to
+/// say plainly before the user commits to a job.
+pub fn format_carries_tags(format: ExportFormat) -> bool {
+    matches!(format, ExportFormat::Jpeg { .. })
+}
+
 pub fn encode_image(image: &RgbaImage, format: ExportFormat) -> Result<Vec<u8>> {
     let (width, height) = image.dimensions();
     let mut buffer: Vec<u8> = Vec::new();
@@ -514,5 +587,183 @@ mod tests {
     #[test]
     fn default_worker_count_is_sane() {
         assert!((1..=64).contains(&default_worker_count()));
+    }
+
+    /// A real JPEG with orientation 1, so the pixel path is a plain copy.
+    fn jpeg(dir: &std::path::Path, name: &str, w: u32, h: u32) -> PathBuf {
+        let path = dir.join(name);
+        fixtures::write_oriented_jpeg(&path, w, h, 1);
+        path
+    }
+
+    #[test]
+    fn a_jpeg_export_carries_the_rating_label_flag_and_keywords() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = jpeg(dir.path(), "shot.jpg", 40, 24);
+
+        // Tag the source the way the panel does: into the file itself.
+        let mut tags = bc_metadata::Metadata::new();
+        tags.set_rating(bc_metadata::ratings::Rating::new(4));
+        tags.set_color_label(bc_metadata::ratings::ColorLabel::Green);
+        tags.set_flag(bc_metadata::ratings::Flag::Approved);
+        bc_metadata::keywords::add_keyword(&mut tags, "Clients|ACME");
+        bc_metadata::keywords::add_keyword(&mut tags, "Selected");
+        bc_metadata::xmp::write_embedded_xmp_file(&source, &tags).unwrap();
+        assert_eq!(
+            bc_metadata::layers::read_file(&source)
+                .unwrap()
+                .rating()
+                .stars(),
+            4,
+            "the fixture itself must be tagged before testing the copy"
+        );
+
+        let image = decode_for_export(&source, 20).unwrap();
+        let encoded = encode_image(&image, ExportFormat::Jpeg { quality: 80 }).unwrap();
+        let out = dir.path().join("shot_20.jpg");
+        std::fs::write(
+            &out,
+            carry_tags(&source, encoded, ExportFormat::Jpeg { quality: 80 }),
+        )
+        .unwrap();
+
+        // Read the export back through the layer chain, not through the writer.
+        let read = bc_metadata::layers::read_file(&out).unwrap();
+        assert_eq!(read.rating().stars(), 4, "rating survived the export");
+        assert_eq!(read.color_label(), bc_metadata::ratings::ColorLabel::Green);
+        assert_eq!(read.flag(), bc_metadata::ratings::Flag::Approved);
+        let mut subjects = bc_metadata::keywords::subjects(&read);
+        subjects.sort();
+        assert_eq!(
+            subjects,
+            vec!["Clients|ACME".to_string(), "Selected".to_string()],
+            "the keyword hierarchy separator survives an export"
+        );
+
+        // And it is still a decodable picture at the size that was asked for.
+        let decoded = image::load_from_memory(&std::fs::read(&out).unwrap()).unwrap();
+        assert_eq!(decoded.width(), 20, "the export kept its requested size");
+    }
+
+    #[test]
+    fn tags_that_live_in_a_sidecar_reach_the_exported_file() {
+        // The chain decides what travels, not one container: a sidecar source
+        // must be able to produce an embedded packet in the output.
+        let dir = tempfile::tempdir().unwrap();
+        let source = jpeg(dir.path(), "rawish.jpg", 30, 30);
+        let mut side = bc_metadata::Metadata::new();
+        side.set_rating(bc_metadata::ratings::Rating::new(5));
+        bc_metadata::xmp::write_xmp_file(&bc_metadata::xmp::sidecar_path(&source), &side).unwrap();
+
+        let image = decode_for_export(&source, 15).unwrap();
+        let bytes = encode_image(&image, ExportFormat::Jpeg { quality: 90 }).unwrap();
+        let out = dir.path().join("out.jpg");
+        std::fs::write(
+            &out,
+            carry_tags(&source, bytes, ExportFormat::Jpeg { quality: 90 }),
+        )
+        .unwrap();
+        assert_eq!(
+            bc_metadata::layers::read_file(&out)
+                .unwrap()
+                .rating()
+                .stars(),
+            5,
+            "a sidecar tag must not be lost by an export"
+        );
+    }
+
+    #[test]
+    fn png_and_webp_exports_gain_no_packet_and_no_stray_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("flat.png");
+        fixtures::write_test_png(&source, 24, 18);
+        let mut tags = bc_metadata::Metadata::new();
+        tags.set_rating(bc_metadata::ratings::Rating::new(3));
+        bc_metadata::xmp::write_xmp_file(&bc_metadata::xmp::sidecar_path(&source), &tags).unwrap();
+
+        let image = decode_for_export(&source, 12).unwrap();
+        for format in [ExportFormat::Png, ExportFormat::WebP] {
+            let encoded = encode_image(&image, format).unwrap();
+            let carried = carry_tags(&source, encoded.clone(), format);
+            assert_eq!(encoded, carried, "{format:?} must be returned untouched");
+            let out = dir.path().join(format!("export.{}", format.extension()));
+            std::fs::write(&out, &carried).unwrap();
+            // No sidecar is created beside an export: that is exactly the
+            // surprise-file behaviour design/0005 section 4 forbids.
+            assert!(
+                !bc_metadata::xmp::sidecar_path(&out).exists(),
+                "{format:?} export grew an unexpected sidecar"
+            );
+            assert!(image::load_from_memory(&std::fs::read(&out).unwrap()).is_ok());
+        }
+        assert!(!format_carries_tags(ExportFormat::Png));
+        assert!(!format_carries_tags(ExportFormat::WebP));
+        assert!(format_carries_tags(ExportFormat::Jpeg { quality: 80 }));
+    }
+
+    #[test]
+    fn an_untagged_source_produces_an_export_with_no_empty_packet() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = jpeg(dir.path(), "plain.jpg", 20, 20);
+        let image = decode_for_export(&source, 10).unwrap();
+        let encoded = encode_image(&image, ExportFormat::Jpeg { quality: 80 }).unwrap();
+        let carried = carry_tags(&source, encoded.clone(), ExportFormat::Jpeg { quality: 80 });
+        assert_eq!(
+            encoded, carried,
+            "nothing to carry must not add a packet that says the file has no tags"
+        );
+    }
+
+    #[test]
+    fn unreadable_source_metadata_never_loses_the_picture() {
+        // The export already committed to writing an image; a tag layer that
+        // cannot be read must not cost the user their picture.
+        let dir = tempfile::tempdir().unwrap();
+        let source = jpeg(dir.path(), "good.jpg", 16, 16);
+        let image = decode_for_export(&source, 8).unwrap();
+        let encoded = encode_image(&image, ExportFormat::Jpeg { quality: 80 }).unwrap();
+
+        // A source that is gone: reading its layers is an error.
+        let gone = dir.path().join("deleted.jpg");
+        assert!(bc_metadata::layers::read_file(&gone).is_err());
+        let carried = carry_tags(&gone, encoded.clone(), ExportFormat::Jpeg { quality: 80 });
+        assert_eq!(
+            carried, encoded,
+            "an unreadable source must return the encoded pixels unchanged"
+        );
+        assert!(image::load_from_memory(&carried).is_ok());
+    }
+
+    #[test]
+    fn capture_data_is_not_claimed_as_the_export_s_provenance() {
+        // The whitelist is a decision, so pin it: camera and tool tags from
+        // the source must NOT travel, while the user's own rating does.
+        let dir = tempfile::tempdir().unwrap();
+        let source = jpeg(dir.path(), "camera.jpg", 32, 24);
+        let mut tags = bc_metadata::Metadata::new();
+        tags.set_text(bc_metadata::NS_EXIF, "Make", "Canon");
+        tags.set_text(bc_metadata::NS_EXIF, "Model", "R5");
+        tags.set_text(bc_metadata::NS_XMP, "CreatorTool", "Some Camera App");
+        tags.set_rating(bc_metadata::ratings::Rating::new(2));
+        bc_metadata::xmp::write_embedded_xmp_file(&source, &tags).unwrap();
+
+        let image = decode_for_export(&source, 16).unwrap();
+        let bytes = encode_image(&image, ExportFormat::Jpeg { quality: 80 }).unwrap();
+        let out = dir.path().join("out.jpg");
+        std::fs::write(
+            &out,
+            carry_tags(&source, bytes, ExportFormat::Jpeg { quality: 80 }),
+        )
+        .unwrap();
+
+        let read = bc_metadata::layers::read_file(&out).unwrap();
+        assert_eq!(read.rating().stars(), 2, "the asset judgement travels");
+        assert!(
+            read.text(bc_metadata::NS_EXIF, "Make").is_none(),
+            "camera make must not be asserted about a re-encode"
+        );
+        assert!(read.text(bc_metadata::NS_EXIF, "Model").is_none());
+        assert!(read.text(bc_metadata::NS_XMP, "CreatorTool").is_none());
     }
 }

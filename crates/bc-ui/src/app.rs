@@ -2654,11 +2654,18 @@ impl BridgeApp {
                     );
                 }
                 ui.separator();
-                ui.weak(
-                    "Metadata policy: no XMP packet, rating, label or flag is copied yet. \
-                     The writers exist, so this is a wiring gap in the export path, not a \
-                     missing capability. EXIF orientation is applied to the exported pixels.",
-                );
+                ui.weak(if dialog.format_choice == 0 {
+                    "Metadata policy: the rating, colour label, flag and keywords are copied \
+                     into each exported JPEG as an XMP packet. Camera data (make, model, \
+                     software, date taken) is not: an export is a re-encode, not the exposure. \
+                     EXIF orientation is applied to the exported pixels."
+                        .to_string()
+                } else {
+                    "Metadata policy: PNG and WebP have no XMP slot in BridgeCraft yet, so \
+                     these exports carry no tags. Choose JPEG to keep rating, label, flag and \
+                     keywords. EXIF orientation is still applied to the exported pixels."
+                        .to_string()
+                });
                 ui.horizontal(|ui| {
                     if ui.button("Start job").clicked() {
                         start = true;

@@ -9,14 +9,9 @@ use std::path::{Path, PathBuf};
 
 use bc_metadata::{
     ratings::{ColorLabel, Flag, Rating},
-    Metadata, Value, WritePolicy, NS_EXIF,
+    Metadata, WritePolicy, NS_EXIF,
 };
 use egui::Color32;
-
-/// EXIF namespace URI used by the XMP writer for aliased EXIF properties.
-const XMP_EXIF_URI: &str = "http://ns.adobe.com/exif/1.0/";
-/// TIFF namespace URI, also projected onto the EXIF view.
-const XMP_TIFF_URI: &str = "http://ns.adobe.com/tiff/1.0/";
 
 /// One editable metadata property.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -673,49 +668,12 @@ pub fn apply_changes(
 /// The file is read once and every layer parses those bytes: `exif::read_exif_file`
 /// used to do its own read, so a RAW file was pulled off disk twice per panel
 /// refresh for the same information.
+/// The panel's view of a file: every metadata layer, merged in the priority
+/// order design/0005 section 3 sets. The chain itself lives in
+/// `bc_metadata::layers`, shared with the export pipeline, so the UI and an
+/// export cannot disagree about what a file says.
 pub fn read_panel_metadata(path: &Path) -> Metadata {
-    let Ok(bytes) = std::fs::read(path) else {
-        return Metadata::new();
-    };
-    let mut meta = bc_metadata::exif::read_exif(&bytes).unwrap_or_default();
-
-    if let Ok(iptc) = bc_metadata::iptc::read_iptc(&bytes) {
-        for (name, value) in iptc.properties() {
-            meta.set(name.namespace.clone(), name.name.clone(), value.clone());
-        }
-    }
-
-    if let Ok(Some(embedded)) = bc_metadata::xmp::read_embedded_xmp(&bytes) {
-        merge_xmp(&mut meta, &embedded);
-    }
-
-    let sidecar = bc_metadata::xmp::sidecar_path(path);
-    if sidecar.exists() {
-        if let Ok(side) = bc_metadata::xmp::read_xmp_file(&sidecar) {
-            merge_xmp(&mut meta, &side);
-        }
-    }
-    meta
-}
-
-/// Project an XMP packet (embedded or sidecar) onto the panel's view.
-///
-/// The packet wins property by property, and it is not filtered down to EXIF
-/// any more: rating (`xmp:Rating`), color label (`photoshop:Label`), flag and
-/// keywords (`dc:subject`) exist only in XMP, so filtering to EXIF made the tag
-/// editor write values the panel could never read back.
-pub fn merge_xmp(meta: &mut Metadata, packet: &Metadata) {
-    for (name, value) in packet.properties() {
-        meta.set(name.namespace.clone(), name.name.clone(), value.clone());
-        // EXIF and TIFF properties are additionally projected onto the short
-        // EXIF namespace so the text fields show the same names regardless of
-        // which container the value came from.
-        if name.namespace == XMP_EXIF_URI || name.namespace == XMP_TIFF_URI {
-            if let Value::Text(text) = value {
-                meta.set_text(NS_EXIF, name.name.clone(), text.clone());
-            }
-        }
-    }
+    bc_metadata::layers::read_file(path).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -1261,11 +1219,11 @@ mod tests {
         let mut base = Metadata::new();
         base.set_text(NS_EXIF, "Make", "Embedded");
         let mut side = Metadata::new();
-        side.set_text(XMP_EXIF_URI, "Make", "Sidecar");
+        side.set_text(bc_metadata::layers::XMP_EXIF_URI, "Make", "Sidecar");
         side.set_text(bc_metadata::NS_DC, "title", "From the sidecar");
         side.set_text(bc_metadata::NS_XMP, "Rating", "4");
         side.set_text(bc_metadata::NS_PHOTOSHOP, "Label", "Orange");
-        merge_xmp(&mut base, &side);
+        bc_metadata::layers::merge_xmp(&mut base, &side);
         assert_eq!(base.text(NS_EXIF, "Make"), Some("Sidecar"));
         assert_eq!(
             base.text(bc_metadata::NS_DC, "title"),
