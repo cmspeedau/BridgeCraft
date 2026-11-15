@@ -55,10 +55,11 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [x] Metadata panel: Camera Data (EXIF) section for the selected file — camera, taken, exposure, aperture, ISO, focal length, orientation, color space, software, EXIF size, GPS — above File Properties; cached per path + modified time
 - [~] Embedded metadata read/write: EXIF read (issue #5 model) and EXIF write for JPEG/TIFF (issue #7) landed; IPTC-IIM read/write for JPEG APP13 (issue #8); XMP sidecar read/write (issue #9); TIFF IPTC container and embedded XMP still pending
 - [x] XMP sidecar read/write (`.xmp` files) — `bc-metadata::xmp` (parse/serialize + atomic file I/O)
-- [x] Metadata panel with editable fields — grouped list, dirty tracking, Save/Revert via the #5 write policy (`bc-ui::metadata_edit`), multi-selection bulk editor with per-file failure reporting
+- [x] Metadata panel with editable fields: grouped list, dirty tracking, Save/Revert via the #5 write policy (`bc-ui::metadata_edit`), multi-selection bulk editor with per-file failure reporting. Sidecar properties now merge in full, so `dc:` and `xmp:` values written by this app or another tool reach the panel instead of being filtered out
 - [~] Custom metadata templates: `bc-metadata::templates` has the model (Replace/Merge/Append), JSON persistence (`<data>/BridgeCraft/metadata_templates`) and tests, but nothing calls it: no save/apply UI and no path that writes a template onto a file
-- [~] Keyword hierarchy management & tagging (`bc-metadata::keywords`: dc:subject `Parent|Child` convention, tree/type-ahead/tag-count logic, tested). Not reachable as an editor: the panel has no keyword widget, and keywords only reach the app read-only, as `{keyword#N}` rename tokens
-- [~] Star ratings, color labels, approve/reject flags (typed API in `bc-metadata::ratings`, written through XMP, tested). **No UI editor**: the deferred "#11" editor was never built, the metadata panel writes text fields only, and the grid has no rating or label column
+- [x] Keyword hierarchy management & tagging: `bc-metadata::keywords` (dc:subject `Parent|Child` convention, tree/type-ahead/tag-count logic) plus a panel editor in `bc-ui::tag_widgets`: chips that remove on click, an add field, and completions drawn from the hierarchy the file already carries. Bulk add and remove across a selection. Cross-library suggestions wait on the index UI
+- [x] Star ratings, color labels, approve/reject flags: `bc-metadata::ratings` (XMP `xmp:Rating`, `photoshop:Label`, BridgeCraft `Flag`) plus the panel editor: five drawn stars, the label chips, Approve/Reject/No flag. Clicking the current rating clears it; each property is stampable on its own in the bulk editor, so "set the rating, leave the labels alone" is explicit. Tags write to the XMP sidecar, never into the image bytes, because there is no EXIF equivalent and embedded XMP is still open
+- [x] Rating and label display: label dot on the grid thumbnail, dot on list rows, and Rating plus Label columns in the details view, with the header sharing the row column math
 - [~] Metadata-driven search & smart collections: the query builder and SQLite index exist (`bc-core::metadata_index`, `bc-metadata::search`) and one auto-processing action writes to the index, but there is no search field, no saved-query UI, and no way to browse a smart collection. Two parallel search/projection implementations exist (see "Tech debt").
 
 ## Phase 4 — Batch Operations & Automation (Weeks 24–34)
@@ -118,13 +119,13 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 |---|---|---|---|
 | M1 — Browser MVP | Q1 2027 | Browse, sort, filter, live refresh, thumbnails, basic file ops | ◐ shipped including internal drag & drop; remaining: grid failure states, folder-open error surfacing, outbound OS drag |
 | M2 — Preview Engine | Q2 2027 | RAW/PSD/PDF/video previews with caching | ✅ PNG/JPEG/GIF/WebP/TIFF/BMP + video/PDF/camera RAW (runtime libs) + PSD/AI + SQLite cache + preview/1:1 zoom viewer |
-| M3 — Metadata Complete | Q3 2027 | XMP/EXIF/IPTC read-write, smart collections | ◐ engines ahead of the UI: EXIF read/write, IPTC-IIM (JPEG APP13) and XMP sidecars done, editable panel + bulk editor shipped; embedded XMP/IPTC-in-TIFF, ratings/labels/keywords UI and smart-collection UI remain |
+| M3 — Metadata Complete | Q3 2027 | XMP/EXIF/IPTC read-write, smart collections | ◐ EXIF read/write, IPTC-IIM (JPEG APP13), XMP sidecars, the editable panel, the bulk editor and the rating/label/flag/keyword editor with sidecar storage are shipped; embedded XMP, IPTC-in-TIFF and the smart-collection UI remain |
 | M4 — Automation | Q4 2027 | Batch ops, scripting API | ◐ batch rename, export pipeline + jobs UI, contact-sheet core, watched-folder automation and the WASM sandbox done; scripting and contact-sheet UI remain |
 | M5 — Integrations | 2028 | Plugin system, ArtCraft bridge plugin, PhotoCraft and LightCraft desktop integrations | ◐ plugin system, plugin manager and PhotoCraft/LightCraft launch actions shipped; ArtCraft not started, plugin panels and hand-off wiring remain |
 | M6 — 1:1 Parity Audit & Release | 2028 | Feature checklist parity vs. Bridge 2026 user guide; universal macOS build, Windows portable+MSI, AppImage+.zsync published (unsigned) | not started |
 
 ## Critical Path
-With ADR-0001 resolved (egui/eframe), the Phase 1 shell shipped (filter, live refresh, virtualized grid, list/details views, file operations, recents and trash all wired into the UI) and internal drag & drop landed on top of `transfer_into_folder`, M1's remaining work is the two surfacing defects above plus outbound OS drag. The next critical path is M3, which is now purely UI work on engines that already exist: **ratings, color labels and the keyword editor** in the metadata panel, then **smart-collection browsing** on the index that already works. Phase 6 packaging should start with the data-path cleanup, because bundle layouts break the current CWD-based thumbnail cache.
+With ADR-0001 resolved (egui/eframe), the Phase 1 shell shipped (filter, live refresh, virtualized grid, list/details views, file operations, recents, trash and internal drag & drop), and M3's editor half is done: rating, label, flag and keyword editing with sidecar storage, bulk stamping and column display. M1's remaining work is the two surfacing defects above plus outbound OS drag. The next critical path is **embedded metadata**: the XMP packet in JPEG APP1 and TIFF tag 700, the TIFF IPTC container, then the sidecar > embedded XMP > IPTC > EXIF precedence from `docs/design/0005`, which is what unblocks **metadata copy on export** (`export.rs` refuses it until the writers land). In parallel: **a search field and smart-collection browsing** over the index that already exists, then **contact sheets, publish presets, metadata templates and version stacks** wired into the UI. Phase 6 packaging should start with the data-path cleanup, because bundle layouts break the current CWD-based thumbnail cache.
 
 ## Tech debt
 
@@ -132,7 +133,9 @@ With ADR-0001 resolved (egui/eframe), the Phase 1 shell shipped (filter, live re
 - **Duplicate query spellings kept on purpose.** `bc-core::metadata_index` still accepts several field and operator spellings (`Field::Make`/`Field::CameraMake`, `Operator::Eq`/`Operator::Equals`, and `Query`'s `predicates`/`conditions`/`clauses`/`and` fields), normalized by `canonical_predicate`. They are kept because they are serialized into stored smart-collection rows; collapse them in the same change that designs the collection UI, with a migration for anything already on disk.
 - **Synonym API removed 2026-11-15.** Duplicate public aliases (`bc_core::search`/`index`/`metadata_search`/`versions` module re-exports, `bc_metadata::extract`/`projection`/`searchable`, `PublishPipeline`/`PublishJob`/`run`/`run_pipeline`, `ScriptEngine`/`AutomationHost`/`ScriptRunner`, the contact-sheet `generate_*`/`create_*`/`build_*` set, and the metadata-index `add`/`insert`/`upsert_file`/`put`/`scan*`/`lookup`/`cleanup` family) were deleted: they had no callers, no behavior, and inflated the apparent API surface of modules that are in fact unwired.
 - **Four spellings of the index action.** `bc-core::auto_process::AutoAction` has `ExtractMetadata`, `IndexMetadata`, `UpdateSearchIndex` and `IndexIntoMetadataIndex`, all handled by one arm that calls `MetadataIndex::index_path`. They are serialized into users' `auto-rules.json`, so collapse them with a read-side alias for old files, not a silent rename.
-- **Emoji as UI glyphs.** The folder marker in the grid is a literal `📁` drawn with the proportional font (`bc-ui::app::cell`), which renders inconsistently across platforms and cannot be themed or recolored. Replace with a drawn shape or a real icon asset when the icon set is decided.
+- **Emoji as UI glyphs.** The folder marker in the grid and in the list/details rows is a literal `📁` drawn with the proportional font (`bc-ui::app::cell`, `content_list`), which renders inconsistently across platforms and cannot be themed or recolored. The new rating stars are drawn shapes for exactly that reason; the folder marker is the remaining one.
+- **Tags live only in the sidecar.** Rating, label, flag and keywords are written to `.xmp` beside the original for every format, because they have no EXIF equivalent and embedded XMP writing is still open. Consequences to settle when it lands: JPEG and TIFF should carry the packet in place (matching `docs/design/0005` §4), the export pipeline should copy it (it currently drops all metadata), and sorting or filtering by rating/label should read the search index rather than stat and parse one sidecar per row per frame, which is what the grid and details overlays do today.
+- **No Bridge shortcut layer for tags.** Setting a rating or label from the keyboard today means Tab to the control and press Enter or Space. Bridge's `Ctrl+1`..`5` shortcuts are widely documented behavior, but the exact modifier chords across platforms are not something I have a source for, so they are left to the Phase 6 shortcut parity audit rather than guessed at here.
 
 ## Truth pass log (2026-11-15)
 
@@ -148,6 +151,27 @@ tests that drive the real widgets with synthetic egui pointer events and then ch
 - Using `Ui::allocate_ui_with_layout`'s outer response as the drop target silently missed the first
   cell of every row: it never reported the pointer inside it, so that folder could not be dropped
   onto. Fixed by keying the drop target to the cell's own response.
+
+### Ratings, labels, flags and keywords (slice 2, shipped 2026-11-15)
+
+The editor issue #10 left unbuilt is in the metadata panel: drawn stars, the label
+chips, Approve/Reject/No flag, and keyword chips with an add field and completions.
+The same four properties are stampable per-property across a selection.
+
+- Storage: the XMP sidecar only. Rating, label, flag and keywords have no EXIF
+  equivalent, so writing them into JPEG/TIFF in place would have meant inventing a
+  location; the image bytes are asserted unchanged in tests, and the packet is
+  checked for the standard wrapper and property names so the claim "interoperable"
+  is not just "our reader agrees with itself".
+- Two defects fixed on the way: `merge_sidecar` filtered every namespace except EXIF
+  and TIFF, so `dc:` and `xmp:` values never reached the panel; and `Enter` inside a
+  `TextEdit` releases focus in egui, which is why the keyboard test walks with Space.
+- Verified by driving the real panel with synthetic keyboard events: Tab plus Enter
+  sets a rating, and walking on to Save writes the sidecar. The label chip colors are
+  pinned and tested against WCAG's 3:1 non-text floor on the dark panel (lowest 4.71:1).
+- Left open, deliberately: cross-library keyword suggestions and tag-count trees need
+  the search index, and sorting by rating or label needs the same index rather than a
+  per-row sidecar read.
 
 ### Documentation corrected against the code on `main` (no behavior changes)
 

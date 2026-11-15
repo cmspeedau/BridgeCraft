@@ -16,17 +16,17 @@ A clean-room, from-scratch asset browser inspired by the workflows of classic di
 
 ![BridgeCraft workspace: favorites sidebar, thumbnail grid, and EXIF metadata panel](docs/screenshots/workspace.png)
 
-> **Status:** pre-1.0, under active development. Foundations (Phase 0) and thumbnails & previews (Phase 2) are **complete**; the browsing core (Phase 1) is done apart from drag & drop and hardening, on the Bridge-style workspace shell. Also shipped: the EXIF metadata panel and bulk editor, batch rename, batch export with a jobs list, watched-folder automation, and the WASM plugin layer with its manager dialog. There are no installers yet; build from source (below). Several engines are ahead of their UI (ratings and keyword editing, contact sheets, publish presets, smart collections, version stacks: working code in `bc-core`/`bc-metadata`, nothing to click yet), and those are the best contributor targets: see the [issue backlog](https://github.com/cmspeedau/BridgeCraft/issues/19) and the honest per-item state in [ROADMAP.md](ROADMAP.md).
+> **Status:** pre-1.0, under active development. Foundations (Phase 0) and thumbnails & previews (Phase 2) are **complete**; the browsing core (Phase 1) is done apart from outbound OS drag and hardening, on the Bridge-style workspace shell. Also shipped: the metadata panel with its rating, label, flag and keyword editor, batch rename, batch export with a jobs list, watched-folder automation, and the WASM plugin layer with its manager dialog. There are no installers yet; build from source (below). A few engines are still ahead of their UI (contact sheets, publish presets, metadata templates, smart collections and version stacks: working code in `bc-core`/`bc-metadata`, nothing to click yet), and those are the best contributor targets: see the [issue backlog](https://github.com/cmspeedau/BridgeCraft/issues/19) and the honest per-item state in [ROADMAP.md](ROADMAP.md).
 
 ## Everything in the box
 
 | Area | What works today |
 |---|---|
 | **Browse** | Folder navigation with breadcrumb chips, favorites sidebar (persistent), folders tree, recent folders, filter-as-you-type, sort by name/size/date |
-| **Views** | Thumbnail grid with zoom slider, list, and details table; "thumbnails only" mode |
+| **Views** | Thumbnail grid with zoom slider (label dot and star rating on rated items), list with a label dot, and details table with Name, Type, Size, Modified, Rating and Label columns; "thumbnails only" mode |
 | **Select** | Click / ctrl-toggle / shift-range / select-all; drag the selection onto a folder to move it (hold Alt to copy); drop files from the desktop to copy them into the folder under the pointer; right-click menu with copy, move, single-file rename, token-based batch rename with preview/apply and undo, trash & restore, permanent-delete confirm |
 | **Previews** | Instant 256 px thumbnails; click any file for a live 2048 px preview in the side panel; double-click for the full zoom viewer (100% = on-demand native decode) |
-| **Metadata** | Metadata panel for the selected file — editable description, artist, copyright, make, model, software and date taken (saved in place for JPEG/TIFF, XMP sidecar for RAW), plus read-only camera/exposure/GPS fields (JPEG, TIFF/DNG, both byte orders) |
+| **Metadata** | Metadata panel for the selected file: star rating, color label, approve/reject flag and keyword chips, plus editable description, artist, copyright, make, model, software and date taken (text fields saved in place for JPEG/TIFF, XMP sidecar for RAW; tags always in the XMP sidecar), with read-only camera/exposure/GPS fields (JPEG, TIFF/DNG, both byte orders). The same tags can be stamped across a selection, per property |
 | **Formats** | PNG, JPEG, TIFF, GIF, WebP, BMP, PSD (embedded previews), PDF-compatible AI — always; video, PDF, camera RAW when a local decoder is present (see below) |
 | **Speed** | SQLite thumbnail cache keyed by `(path, size-tier)`, invalidated on file change; virtualized grid; background decode worker |
 | **Live** | Watched folders auto-refresh; cache survives restarts; `--rebuild-cache` CLI for batch warm-up |
@@ -121,7 +121,7 @@ The long-term goal is a complete clean-room replacement for classic digital-asse
 
 ## Contributing
 
-Contributions are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md) first, every contributor signs a one-time clean-room attestation, and `cargo build/test/clippy/fmt` on the workspace must pass. Good starting points are the unwired engines listed above, in rough order of size: metadata templates (`bc-metadata::templates`, persistence and tests done, no caller), contact sheets (`bc-core::contact_sheet`), publish presets (`bc-core::publish`), the ratings/label/keyword editor in the metadata panel, and drag & drop in the browser (`bc_core::file_ops::transfer_into_folder` plus the `origin/feat/drag-and-drop-ui` branch).
+Contributions are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md) first, every contributor signs a one-time clean-room attestation, and `cargo build/test/clippy/fmt` on the workspace must pass. Good starting points are the unwired engines listed above, in rough order of size: metadata templates (`bc-metadata::templates`, persistence and tests done, no caller), contact sheets (`bc-core::contact_sheet`), publish presets (`bc-core::publish`), version stacks (`bc-core::version_stacks`), and a search field plus smart-collection browsing over the index in `bc-core::metadata_index`. The ratings/label/keyword editor and internal drag & drop shipped on 2026-11-15, so they are no longer open.
 
 ## Releases & packaging
 
