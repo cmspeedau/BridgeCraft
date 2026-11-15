@@ -65,10 +65,15 @@ Guarantees and current trade-offs:
   overwrite: collisions get `_1`, `_2`, … suffixes. Bytes land via a temp
   file plus rename, so a cancelled or failed export can never leave a
   truncated file behind.
-- **EXIF orientation is applied to the exported pixels**, not copied as a
-  tag. No other metadata is copied yet: the XMP writers now exist for JPEG and
-  TIFF, so exporting packets, ratings, labels and flags is a wiring gap in the
-  export path rather than a missing capability, and the dialog says so.
+- **Exports carry the asset's judgements, not its exposure.** A JPEG export gets
+  the rating, colour label, approve/reject flag and keywords as an embedded XMP
+  packet. Camera data (make, model, software, date taken) is deliberately not
+  copied: an export is a downscaled re-encode, so repeating those tags would
+  claim a provenance the output does not have. PNG and WebP exports carry no
+  tags yet, because this build has no XMP writer for those containers and the
+  storage policy forbids dropping surprise sidecars next to your exports; the
+  dialog says which is which before the job starts.
+- **EXIF orientation is applied to the exported pixels**, not copied as a tag.
 - Camera RAW, PDF, video and Illustrator/PSD sources go through the same
   decode path as thumbnails, so they **export at thumbnail quality** for
   now; plain raster formats export at full resolution up to your chosen

@@ -67,7 +67,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 
 ## Phase 4 — Batch Operations & Automation (Weeks 24–34) — ◐ rename, export and watched folders shipped with UI; contact sheets and the scripting surface are core-only
 - [x] Batch rename (token-based patterns) — `bc-core::batch_rename` parser/planner/journaled apply/undo plus `bc-ui` preview/apply dialog, pattern validation, and undo action
-- [x] Batch resize/convert/export (issue #15: queued `bc-core` export pipeline + jobs UI; JPEG/PNG/WebP, orientation applied). Metadata is not copied into exports yet; that is now an export-side wiring gap, since the writers it needed have landed
+- [x] Batch resize/convert/export (issue #15: queued `bc-core` export pipeline + jobs UI; JPEG/PNG/WebP, orientation applied). JPEG exports also carry the asset's rating, colour label, flag and keywords as an embedded XMP packet; camera/exposure tags are deliberately not copied, and PNG/WebP carry no tags until those containers get a writer. The dialog states which, per format, before the job starts
 - [~] Contact sheet / PDF contact sheet output: `bc-core::contact_sheet` renders RGBA and paginated PDF sheets and is tested, but no UI or export path calls it. Remaining: a "Contact Sheet…" action plus layout picker
 - [~] Watched-folder auto-processing: persisted rules, settle gate, bounded worker queue, preferences/history UI and docs landed. The `IndexIntoMetadataIndex` action exists in core but is not selectable in the rules UI (Thumbnail / Rename / Export PNG / Dated folder only)
 - [~] Scripting/automation API (WASM): local manifest-based scripts use the shared `wasmi` sandbox, fuel/memory limits, default-deny persisted capability and filesystem grants, and permissioned selection/current-folder/metadata/thumbnail/file-operation host imports; per-script failures are isolated. **Runtime is done, the surface is not**: `bc-core::scripting::ScriptHost` has no UI (no scripts window), so scripts can only be discovered from the scripts directory; the plugin path below is what users can actually drive today
@@ -132,11 +132,11 @@ With ADR-0001 resolved (egui/eframe), the Phase 1 shell shipped (filter, live re
 
 What is left on the critical path, in the order that unblocks the most:
 
-1. **Metadata copy on export.** The writers exist and the readers understand every layer, so `export.rs` copying packets, ratings, labels and flags is now wiring, not a blocked dependency.
-2. **Index-backed tags.** The grid and details overlays stat and parse a sidecar plus a packet for every visible row each frame; that belongs in `bc-core::metadata_index`, which is the same work needed to sort or filter by rating and label.
-3. **A search field and smart-collection browsing** over that index, and one search implementation instead of two.
-4. **Contact sheets, publish presets, metadata templates and version stacks** wired into the UI: all implemented, tested and unreachable.
-5. **The data-path cleanup** before Phase 6 packaging, because bundle layouts break the current CWD-based thumbnail cache.
+1. **Index-backed tags.** The grid and details overlays stat and parse a sidecar plus a packet for every visible row each frame; that belongs in `bc-core::metadata_index`, which is the same work needed to sort or filter by rating and label. Export copying now reads through `bc_metadata::layers`, so the index can replace that per-row cost in one place.
+2. **A search field and smart-collection browsing** over that index, and one search implementation instead of two.
+3. **Contact sheets, publish presets, metadata templates and version stacks** wired into the UI: all implemented, tested and unreachable.
+4. **The data-path cleanup** before Phase 6 packaging, because bundle layouts break the current CWD-based thumbnail cache.
+5. **Tags for PNG and WebP exports, and IPTC-IIM written back into TIFF.** Each needs a container writer that does not exist yet; until then the export dialog says plainly that these formats carry no tags.
 
 M1's remaining items are the two surfacing defects (failed-versus-pending thumbnails, folder-open errors only in the status bar) plus outbound OS drag, which needs an eframe upgrade.
 
@@ -258,6 +258,30 @@ partial one, however the file got that way.
 
 Still open from §4: PNG in-place XMP (needs an `iTXt` writer; sidecar in the
 meantime, asserted by a test) and writing IPTC-IIM into TIFF.
+
+### Metadata copy on export (slice 5, shipped 2026-11-15)
+
+- The layer chain moved out of `bc-ui` into `bc_metadata::layers`, because the
+  export pipeline needed exactly the same rule and a second implementation would
+  have meant a file could mean one thing in the panel and another in an export.
+  `read_panel_metadata` is now a call, not a copy of the chain, and the two
+  duplicate namespace constants went with it.
+- JPEG exports carry rating, colour label, flag and keywords as an embedded XMP
+  packet. Camera and tool tags are deliberately **not** copied: an export is a
+  downscaled re-encode, so repeating `Make`/`Model`/`Software`/`CreatorTool`
+  would assert a provenance the output does not have. `capture_data_is_not_claimed_as_the_export_s_provenance`
+  pins that decision rather than leaving it in a comment.
+- PNG and WebP gain nothing at all, including no sidecar, because design/0005
+  section 4 forbids surprise files appearing beside output. The dialog now says
+  which behaviour applies, per format, before the job starts.
+- Reading the source's tags can never fail an export: unreadable metadata costs
+  the tags, not the picture.
+- **A wiring gap in my own testing, caught by checking rather than assuming.**
+  The first six tests called `carry_tags` directly, so deleting the call inside
+  `prepare_export` left all 105 tests green. `the_job_pipeline_itself_carries_tags_into_a_jpeg_export`
+  now runs submit -> worker -> publish and fails, naming the exported file, when
+  the wiring is removed. Unit tests of a helper prove the helper; only a
+  pipeline test proves the pipeline.
 
 ### Documentation corrected against the code on `main` (no behavior changes)
 
