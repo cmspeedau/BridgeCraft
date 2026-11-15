@@ -213,6 +213,101 @@ fn for_each_jpeg_segment(
     Ok(None)
 }
 
+/// Where the XMP packet's `APP1` segment sits in a **JPEG**, as `(start, end)`
+/// of the whole segment including its marker and length bytes. Writing needs
+/// the range, not just the payload: replacing a packet is a splice.
+///
+/// Deliberately JPEG-only. In TIFF the packet is one tag inside the tree and is
+/// rewritten through `exif_write::write_tiff_bytes_tag`; returning a fake byte
+/// range for it would invite a caller to splice at offset zero and corrupt the
+/// file, so there is no such value to return.
+pub fn find_jpeg_xmp_segment_range(data: &[u8]) -> Option<(usize, usize)> {
+    if !is_jpeg(data) {
+        return None;
+    }
+    let mut pos = 2usize;
+    while pos + 4 <= data.len() {
+        if data[pos] != 0xFF {
+            return None;
+        }
+        let marker = data[pos + 1];
+        if marker == 0xFF {
+            pos += 1;
+            continue;
+        }
+        if marker == 0xDA || marker == 0xD9 {
+            return None;
+        }
+        if marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
+            pos += 2;
+            continue;
+        }
+        let size = read_u16(data, pos + 2, false)? as usize;
+        if size < 2 {
+            return None;
+        }
+        let body_start = pos + 4;
+        let body_end = body_start.checked_add(size - 2)?;
+        if body_end > data.len() {
+            return None;
+        }
+        if marker == 0xE1 && data[body_start..body_end].starts_with(XMP_JPEG_SIGNATURE) {
+            return Some((pos, body_end));
+        }
+        pos = body_end;
+    }
+    None
+}
+
+/// Where a new XMP `APP1` belongs in a JPEG: after the EXIF `APP1` when one
+/// exists (so the two stay together and before the scan data), otherwise after
+/// `APP0`/JFIF, otherwise right after `SOI`.
+pub fn jpeg_xmp_insert_offset(data: &[u8]) -> usize {
+    if !is_jpeg(data) {
+        return 0;
+    }
+    let mut pos = 2usize;
+    let mut after_app0 = None;
+    while pos + 4 <= data.len() {
+        if data[pos] != 0xFF {
+            break;
+        }
+        let marker = data[pos + 1];
+        if marker == 0xDA || marker == 0xD9 {
+            break;
+        }
+        if marker == 0xFF {
+            pos += 1;
+            continue;
+        }
+        if marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
+            pos += 2;
+            continue;
+        }
+        let Some(size) = read_u16(data, pos + 2, false) else {
+            break;
+        };
+        let size = size as usize;
+        if size < 2 {
+            break;
+        }
+        let body_start = pos + 4;
+        let body_end = match body_start.checked_add(size - 2) {
+            Some(end) if end <= data.len() => end,
+            _ => break,
+        };
+        if marker == 0xE1 && data[body_start..body_end].starts_with(b"Exif\0\0") {
+            // The EXIF APP1 is the natural neighbour for an XMP packet.
+            return body_end;
+        }
+        if marker == 0xE0 && after_app0.is_none() {
+            after_app0 = Some(body_end);
+        }
+        pos = body_end;
+    }
+    after_app0.unwrap_or(2)
+}
+
 /// The XMP packet bytes from a JPEG `APP1` or a TIFF tag 700, if the file has one.
 pub fn find_xmp_packet(data: &[u8]) -> Result<Option<Vec<u8>>, MetadataError> {
     if is_jpeg(data) {
@@ -436,12 +531,6 @@ mod tests {
         ));
     }
 
-    /// Real-world check against a file written by another application.
-    ///
-    /// The fixtures above are built by this crate, so they can only prove the
-    /// reader agrees with our own writer. Set `XMP_SAMPLE` to a JPEG or TIFF that
-    /// some other tool saved with an XMP packet (Pillow, Darktable, ExifTool) and
-    /// this asserts the packet is located and parsed anyway.
     #[test]
     fn reads_an_xmp_packet_written_by_another_application() {
         let Some(sample) = std::env::var_os("XMP_SAMPLE") else {

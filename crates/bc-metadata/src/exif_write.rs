@@ -997,6 +997,47 @@ fn splice_app1(
 // TIFF container
 // ---------------------------------------------------------------------------
 
+/// Byte-string field type, which is what an embedded XMP packet is stored as.
+const TYPE_UNDEFINED: u16 = 7;
+
+/// Replace or insert one raw byte-valued tag in a TIFF tree, leaving every
+/// other tag, strip, tile and unparsed block exactly where it was.
+///
+/// This is the same append-a-new-tree path `write_tiff` uses, so the XMP writer
+/// cannot drift from the EXIF writer about how a TIFF is rewritten. Passing an
+/// empty `value` removes the tag, which is how a cleared rating stops being
+/// written as `<xmp:Rating>0</xmp:Rating>` forever.
+pub fn write_tiff_bytes_tag(data: &[u8], tag: u16, value: &[u8]) -> Result<Vec<u8>, MetadataError> {
+    if !crate::embedded::is_tiff(data) {
+        return Err(MetadataError::UnsupportedWriteTarget(
+            "raw tag write expects TIFF-family bytes".to_string(),
+        ));
+    }
+    let mut doc = parse_doc(data)?;
+    if value.is_empty() {
+        doc.ifd0.entries.retain(|entry| entry.tag != tag);
+    } else {
+        set_entry(
+            &mut doc.ifd0,
+            RawEntry {
+                tag,
+                type_id: TYPE_UNDEFINED,
+                count: value.len() as u32,
+                value: value.to_vec(),
+            },
+        );
+    }
+    let mut out = data.to_vec();
+    if !out.len().is_multiple_of(2) {
+        out.push(0);
+    }
+    let base = out.len();
+    let tree = build_tree(&doc, data, base, false);
+    write_u32_at(&mut out[4..8], base as u32, doc.le);
+    out.extend_from_slice(&tree);
+    Ok(out)
+}
+
 fn write_tiff(data: &[u8], metadata: &Metadata) -> Result<Vec<u8>, MetadataError> {
     let mut doc = parse_doc(data)?;
     let current = crate::exif::read_exif(data).unwrap_or_default();

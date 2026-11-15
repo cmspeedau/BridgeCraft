@@ -83,6 +83,135 @@ pub fn read_embedded_xmp_file(path: &Path) -> Result<Option<Metadata>, MetadataE
     read_embedded_xmp(&bytes)
 }
 
+/// Splice a finished packet into a JPEG, replacing the old `APP1` XMP segment
+/// or inserting a new one.
+fn splice_jpeg_xmp(data: &[u8], packet: &[u8]) -> Result<Vec<u8>, MetadataError> {
+    let segment_len = 2 + crate::embedded::XMP_JPEG_SIGNATURE.len() + packet.len();
+    if segment_len > 0xFFFF {
+        return Err(MetadataError::UnsupportedWriteTarget(format!(
+            "XMP packet too large for one JPEG APP1 segment ({segment_len} bytes)"
+        )));
+    }
+    let range = match crate::embedded::find_jpeg_xmp_segment_range(data) {
+        Some(range) => range,
+        None => {
+            let at = crate::embedded::jpeg_xmp_insert_offset(data);
+            (at, at)
+        }
+    };
+    let (start, end) = range;
+    let mut out = Vec::with_capacity(data.len() - (end - start) + segment_len);
+    out.extend_from_slice(&data[..start]);
+    out.extend_from_slice(&[0xFF, 0xE1]);
+    out.extend_from_slice(&(segment_len as u16).to_be_bytes());
+    out.extend_from_slice(crate::embedded::XMP_JPEG_SIGNATURE);
+    out.extend_from_slice(packet);
+    out.extend_from_slice(&data[end..]);
+    Ok(out)
+}
+
+/// Read the packet that is already in the file, ready to be merged into.
+///
+/// An existing packet that this parser cannot understand is an **error**, not an
+/// empty starting point. Merging into empty and writing back would delete every
+/// property the reader did not recognize, which is how a rating change could
+/// silently destroy another application's metadata. Files with no packet at all
+/// legitimately start empty.
+fn existing_packet(data: &[u8]) -> Result<Metadata, MetadataError> {
+    let Some(packet) = crate::embedded::find_xmp_packet(data)? else {
+        return Ok(Metadata::new());
+    };
+    let parsed = parse_xmp(&packet)?;
+    if parsed.is_empty() && packet.len() > 32 {
+        // A real packet is never this empty: refuse rather than rewrite it away.
+        return Err(MetadataError::MalformedPacket(
+            "embedded XMP packet exists but no properties could be read from it".to_string(),
+        ));
+    }
+    Ok(parsed)
+}
+
+/// Write an XMP packet into the file itself: JPEG `APP1` or TIFF tag 700.
+///
+/// The existing packet is read first and only the properties in `metadata` are
+/// changed, so writing a rating does not delete the keywords, history or any
+/// other application's namespace that was already in the packet. An empty
+/// result removes the packet entirely rather than leaving an empty shell.
+///
+/// Containers that cannot carry a packet here (PNG, GIF, WebP, camera RAW)
+/// return `UnsupportedWriteTarget`: the caller then uses a sidecar, which is
+/// the same rule the EXIF writer already follows.
+pub fn write_embedded_xmp(data: &[u8], metadata: &Metadata) -> Result<Vec<u8>, MetadataError> {
+    if crate::embedded::is_jpeg(data) {
+        let mut merged = existing_packet(data)?;
+        apply_properties(&mut merged, metadata);
+        if merged.is_empty() {
+            // Nothing to store: drop the packet instead of writing an empty one.
+            return match crate::embedded::find_jpeg_xmp_segment_range(data) {
+                Some((start, end)) => {
+                    let mut out = Vec::with_capacity(data.len() - (end - start));
+                    out.extend_from_slice(&data[..start]);
+                    out.extend_from_slice(&data[end..]);
+                    Ok(out)
+                }
+                None => Ok(data.to_vec()),
+            };
+        }
+        let packet = write_xmp(&merged);
+        return splice_jpeg_xmp(data, packet.as_bytes());
+    }
+
+    if crate::embedded::is_tiff(data) {
+        let mut merged = existing_packet(data)?;
+        apply_properties(&mut merged, metadata);
+        let packet = write_xmp(&merged);
+        let payload = if merged.is_empty() {
+            Vec::new()
+        } else {
+            let mut bytes = Vec::with_capacity(packet.len());
+            bytes.extend_from_slice(packet.as_bytes());
+            // Packets in TIFF are byte strings; a trailing NUL keeps tools that
+            // treat the tag as text from reading past the end.
+            bytes.push(0);
+            bytes
+        };
+        let written =
+            crate::exif_write::write_tiff_bytes_tag(data, crate::embedded::TAG_XMP, &payload)?;
+        return Ok(written);
+    }
+
+    Err(MetadataError::UnsupportedWriteTarget(
+        "embedded XMP needs JPEG or TIFF-family bytes".to_string(),
+    ))
+}
+
+/// Copy every property of `source` into `target`, replacing same-named ones.
+fn apply_properties(target: &mut Metadata, source: &Metadata) {
+    for (name, value) in source.properties() {
+        target.set(name.namespace.clone(), name.name.clone(), value.clone());
+    }
+}
+
+/// Read, update and atomically replace the embedded packet in a file.
+pub fn write_embedded_xmp_file(path: &Path, metadata: &Metadata) -> Result<(), MetadataError> {
+    let input = std::fs::read(path)?;
+    let output = write_embedded_xmp(&input, metadata)?;
+    if output == input {
+        return Ok(());
+    }
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = dir.join(format!(
+        ".{}.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    std::fs::write(&tmp, &output)?;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let _ = std::fs::set_permissions(&tmp, meta.permissions());
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 pub fn write_xmp_file(path: &Path, metadata: &Metadata) -> Result<(), MetadataError> {
     let xml = write_xmp(metadata);
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
@@ -514,6 +643,10 @@ fn alias_map_local(ns: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{NS_DC, NS_XMP};
+
+    /// The namespace the preservation fixture writes under.
+    const NS_CAMERA_RAW: &str = "http://ns.adobe.com/camera-raw-settings/1.0/";
 
     #[test]
     fn roundtrip_simple_and_array() {
@@ -612,5 +745,221 @@ mod tests {
     fn sidecar_path_helper() {
         let p = std::path::Path::new("/tmp/foo.jpg");
         assert_eq!(sidecar_path(p), std::path::PathBuf::from("/tmp/foo.xmp"));
+    }
+    #[test]
+    fn writes_a_packet_into_a_jpeg_and_keeps_the_rest_of_the_file() {
+        let exif_body = b"Exif\0\0some-tiff-bytes";
+        let mut jpeg = vec![0xFF, 0xD8];
+        jpeg.extend_from_slice(&[0xFF, 0xE0]);
+        jpeg.extend_from_slice(&5u16.to_be_bytes());
+        jpeg.extend_from_slice(b"\0\0\0");
+        jpeg.extend_from_slice(&[0xFF, 0xE1]);
+        jpeg.extend_from_slice(&((exif_body.len() + 2) as u16).to_be_bytes());
+        jpeg.extend_from_slice(exif_body);
+        jpeg.extend_from_slice(&[0xFF, 0xDA, 0x04, 0x00, 0x01, 0x00, 0x00]);
+        jpeg.extend_from_slice(&[0x01, 0x02, 0x03]);
+        jpeg.extend_from_slice(&[0xFF, 0xD9]);
+
+        let mut meta = Metadata::new();
+        meta.set_text(NS_XMP, "Rating", "4".to_string());
+        let written = write_embedded_xmp(&jpeg, &meta).unwrap();
+
+        // The packet is readable, and it went in after the EXIF APP1.
+        let read = read_embedded_xmp(&written)
+            .unwrap()
+            .expect("packet written");
+        assert_eq!(read.rating().stars(), 4);
+        let exif_end = written
+            .windows(b"Exif\0\0".len())
+            .position(|w| w == b"Exif\0\0")
+            .expect("EXIF APP1 still present");
+        let xmp_at = crate::embedded::find_jpeg_xmp_segment_range(&written)
+            .unwrap()
+            .0;
+        assert!(
+            xmp_at > exif_end,
+            "the XMP segment should follow the EXIF segment"
+        );
+        // Scan data and EOI survive the splice byte-for-byte.
+        assert!(written.ends_with(&[0xFF, 0xD9]));
+        assert!(written.windows(3).any(|w| w == b"\x01\x02\x03"));
+        assert!(written.len() > jpeg.len());
+    }
+
+    #[test]
+    fn rewriting_a_packet_preserves_what_the_caller_did_not_change() {
+        // A packet that already carries keywords and another tool's namespace.
+        let original = concat!(
+            "<?xpacket begin='\u{feff}' id='W5M0MpCehiHzreSzNTczkc9d'?>",
+            "<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>",
+            "<rdf:Description rdf:about='' xmlns:dc='http://purl.org/dc/elements/1.1/'",
+            " xmlns:xmp='http://ns.adobe.com/xap/1.0/'",
+            " xmlns:crs='http://ns.adobe.com/camera-raw-settings/1.0/'>",
+            "<dc:subject><rdf:Bag><rdf:li>KeepMe</rdf:li></rdf:Bag></dc:subject>",
+            "<xmp:Rating>2</xmp:Rating>",
+            "<crs:LocalName>other tool</crs:LocalName>",
+            "</rdf:Description></rdf:RDF></x:xmpmeta><?xpacket end='w'?>"
+        );
+        let mut body = crate::embedded::XMP_JPEG_SIGNATURE.to_vec();
+        body.extend_from_slice(original.as_bytes());
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE1];
+        jpeg.extend_from_slice(&((body.len() + 2) as u16).to_be_bytes());
+        jpeg.extend_from_slice(&body);
+        jpeg.extend_from_slice(&[0xFF, 0xD9]);
+
+        // Change only the rating.
+        let mut change = Metadata::new();
+        change.set_text(NS_XMP, "Rating", "5".to_string());
+        let written = write_embedded_xmp(&jpeg, &change).unwrap();
+        let meta = read_embedded_xmp(&written)
+            .unwrap()
+            .expect("packet readable");
+
+        assert_eq!(meta.rating().stars(), 5, "the change applied");
+        assert!(
+            crate::keywords::subjects(&meta).contains(&"KeepMe".to_string()),
+            "existing keywords survived a rating-only change: {:?}",
+            crate::keywords::subjects(&meta)
+        );
+        let keys: Vec<String> = meta
+            .properties()
+            .keys()
+            .map(|k| format!("{}::{}", k.namespace, k.name))
+            .collect();
+        assert!(
+            meta.get(NS_CAMERA_RAW, "LocalName").is_some(),
+            "another application's namespace must not be dropped; got {keys:?}"
+        );
+        // Exactly one XMP segment: replacement, not accumulation.
+        assert_eq!(
+            written
+                .windows(crate::embedded::XMP_JPEG_SIGNATURE.len())
+                .filter(|w| *w == crate::embedded::XMP_JPEG_SIGNATURE)
+                .count(),
+            1,
+            "a second packet was inserted instead of replacing the first"
+        );
+    }
+
+    #[test]
+    fn a_packet_too_large_for_one_segment_is_refused_not_truncated() {
+        let mut meta = Metadata::new();
+        let huge = "x".repeat(70_000);
+        meta.set_text(NS_DC, "description", huge);
+        let jpeg = vec![0xFF, 0xD8, 0xFF, 0xD9];
+        let error = write_embedded_xmp(&jpeg, &meta).unwrap_err();
+        assert!(
+            matches!(error, MetadataError::UnsupportedWriteTarget(_)),
+            "{error:?}"
+        );
+        assert_eq!(
+            jpeg,
+            vec![0xFF, 0xD8, 0xFF, 0xD9],
+            "refused write left bytes alone"
+        );
+    }
+
+    #[test]
+    fn formats_without_an_embedded_packet_slot_are_reported_as_such() {
+        let png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        let mut meta = Metadata::new();
+        meta.set_text(NS_XMP, "Rating", "3".to_string());
+        let error = write_embedded_xmp(&png, &meta).unwrap_err();
+        assert!(
+            matches!(error, MetadataError::UnsupportedWriteTarget(_)),
+            "PNG must say it cannot take a packet, not silently do nothing"
+        );
+    }
+    #[test]
+    fn a_packet_this_parser_cannot_read_is_never_rewritten_from_empty() {
+        // Well-formed XML, right namespaces, but no RDF Description this parser
+        // recognizes: it parses to zero properties. Merging into that empty
+        // result and writing back would have deleted the original bytes, so the
+        // writer must refuse instead.
+        let foreign = concat!(
+            "<?xpacket begin=''?><x:xmpmeta xmlns:x='adobe:ns:meta/'>",
+            "<something:else xmlns:something='urn:whatever'/></x:xmpmeta><?xpacket end='w'?>"
+        );
+        let mut body = crate::embedded::XMP_JPEG_SIGNATURE.to_vec();
+        body.extend_from_slice(foreign.as_bytes());
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE1];
+        jpeg.extend_from_slice(&((body.len() + 2) as u16).to_be_bytes());
+        jpeg.extend_from_slice(&body);
+        jpeg.extend_from_slice(&[0xFF, 0xDA, 0x04, 0x00, 0x01]);
+        jpeg.extend_from_slice(&[0xFF, 0xD9]);
+
+        let mut change = Metadata::new();
+        change.set_text(NS_XMP, "Rating", "5".to_string());
+        let error = write_embedded_xmp(&jpeg, &change).unwrap_err();
+        assert!(
+            matches!(error, MetadataError::MalformedPacket(_)),
+            "expected a refusal, got {error:?}"
+        );
+        assert_eq!(
+            write_embedded_xmp(&jpeg, &change).unwrap_err().to_string(),
+            error.to_string(),
+            "the refusal must be stable, not a partial write the first time"
+        );
+    }
+
+    #[test]
+    fn a_file_with_no_packet_at_all_can_still_be_written() {
+        // The refusal above is about an unreadable packet, not about absence.
+        let jpeg = vec![0xFF, 0xD8, 0xFF, 0xDA, 0x04, 0x00, 0x01, 0xFF, 0xD9];
+        let mut meta = Metadata::new();
+        meta.set_text(NS_XMP, "Rating", "1".to_string());
+        let written = write_embedded_xmp(&jpeg, &meta).unwrap();
+        assert_eq!(
+            read_embedded_xmp(&written)
+                .unwrap()
+                .unwrap()
+                .rating()
+                .stars(),
+            1
+        );
+    }
+    /// Round trip against the third-party sample: write into a file another
+    /// application produced, then re-read it. A gated companion to the Pillow
+    /// check above, run as `XMP_WRITE_SAMPLE=<file>` so the original is a copy.
+    #[test]
+    fn writes_into_a_file_another_application_produced() {
+        let Some(sample) = std::env::var_os("XMP_WRITE_SAMPLE") else {
+            eprintln!("XMP_WRITE_SAMPLE not set; skipping third-party write check");
+            return;
+        };
+        let path = Path::new(&sample);
+        let input = std::fs::read(path).unwrap();
+        let before = read_embedded_xmp(&input)
+            .unwrap()
+            .expect("the sample must already carry a packet");
+
+        let mut change = Metadata::new();
+        change.set_text(NS_XMP, "Rating", "5".to_string());
+        let written = write_embedded_xmp(&input, &change).unwrap();
+        std::fs::write(path, &written).unwrap();
+
+        let after = read_embedded_xmp(&written)
+            .unwrap()
+            .expect("the rewritten packet must be readable");
+        assert_eq!(after.rating().stars(), 5);
+        // Everything the other tool wrote is still there.
+        let before_keys: Vec<String> = before
+            .properties()
+            .keys()
+            .map(|k| format!("{}::{}", k.namespace, k.name))
+            .collect();
+        let after_keys: Vec<String> = after
+            .properties()
+            .keys()
+            .map(|k| format!("{}::{}", k.namespace, k.name))
+            .collect();
+        for key in &before_keys {
+            assert!(after_keys.contains(key), "lost {key} rewriting a real file");
+        }
+        eprintln!(
+            "rewrote third-party sample: {} properties before, {} after",
+            before_keys.len(),
+            after_keys.len()
+        );
     }
 }
