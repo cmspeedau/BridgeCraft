@@ -7,6 +7,7 @@ pub use photocraft::*;
 pub mod auto_process;
 pub mod contact_sheet;
 pub mod metadata_index;
+pub mod paths;
 pub mod plugins;
 pub mod publish;
 pub use metadata_index::*;

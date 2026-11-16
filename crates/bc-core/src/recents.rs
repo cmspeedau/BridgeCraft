@@ -100,22 +100,15 @@ impl Recents {
 }
 
 /// Resolve BridgeCraft's per-user data directory without external dependencies.
+///
+/// The rules themselves live in [`crate::paths`]; this stays as a thin alias so
+/// the existing stores keep calling one obvious name. Before that, `recents`
+/// and `auto_process` each carried their own copy of the platform branches and
+/// they had already drifted: one looked in the data directory, the other in the
+/// config directory, which is how the metadata index ended up filed with the
+/// wrong kind of thing.
 pub(crate) fn user_data_dir() -> Result<PathBuf> {
-    #[cfg(target_os = "windows")]
-    let path = std::env::var_os("APPDATA").map(PathBuf::from);
-    #[cfg(target_os = "macos")]
-    let path = std::env::var_os("HOME")
-        .map(|home| PathBuf::from(home).join("Library/Application Support"));
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let path = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")));
-    #[cfg(not(any(unix, target_os = "windows")))]
-    let path: Option<PathBuf> = None;
-
-    path.ok_or_else(|| {
-        CoreError::InvalidOperation("could not determine per-user data directory".into())
-    })
+    crate::paths::user_data_root()
 }
 
 #[cfg(test)]

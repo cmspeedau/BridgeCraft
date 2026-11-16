@@ -223,6 +223,10 @@ impl AutoProcessor {
             history,
             ..State::default()
         };
+        // Resolved before the Arc is built so a failure is returned rather
+        // than swallowed: silently falling back to a second location would
+        // split one index across two databases, which is the bug this fixes.
+        let index_path = crate::paths::metadata_index_path()?;
         let shared = Arc::new(Shared {
             shutdown: AtomicBool::new(false),
             state: Mutex::new(state),
@@ -231,10 +235,11 @@ impl AutoProcessor {
             cache_path,
             journal_path,
             config_path: config_path.to_path_buf(),
-            index_path: config_path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join("metadata.sqlite"),
+            // One definition of where the index lives, shared with the
+            // browser's indexer. This used to be "next to the auto-rules
+            // file", which filed a growing database in the config directory
+            // while every other store lived in the data directory.
+            index_path,
             rename_lock: Mutex::new(()),
         });
         let workers = (0..MAX_WORKERS)
@@ -864,17 +869,7 @@ fn date_parts(seconds: i64) -> (i64, u32, u32) {
 }
 
 pub fn default_config_path() -> Result<PathBuf> {
-    let path = if cfg!(target_os = "windows") {
-        std::env::var_os("APPDATA").map(PathBuf::from)
-    } else if cfg!(target_os = "macos") {
-        std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Library/Application Support"))
-    } else {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-    };
-    path.map(|path| path.join("BridgeCraft").join("auto-rules.json"))
-        .ok_or_else(|| CoreError::InvalidOperation("could not locate user config directory".into()))
+    crate::paths::config_file("auto-rules.json")
 }
 
 fn load_config(path: &Path) -> Result<AutoConfig> {
