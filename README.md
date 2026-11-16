@@ -86,7 +86,7 @@ Guarantees and current trade-offs:
 
 | Crate | Purpose |
 |---|---|
-| `bc-core` | Filesystem scanning, directory watching, selection model, favorites & recents, trash bin, file operations, queued batch-export pipeline |
+| `bc-core` | Filesystem scanning, directory watching, selection model, favorites & recents, trash bin, file operations, queued batch-export pipeline, background metadata indexer (same pool, same job list) |
 | `bc-metadata` | EXIF read/write (JPEG/TIFF), IPTC-IIM read/write, XMP sidecar read/write, hierarchical keywords, ratings & labels |
 | `bc-thumbnails` | SQLite-backed cache plus decoders: `image` (PNG/JPEG/TIFF/GIF/WebP/BMP), PSD embedded previews, Illustrator, and runtime-bound ffmpeg / pdfium / LibRaw paths |
 | `bc-ui` | egui/eframe frontend: the workspace above, virtualized grids, the zoom viewer |
@@ -105,7 +105,9 @@ The build toolchain is pinned in `rust-toolchain.toml`; rustup installs it (with
 `clippy`) on first command. No minimum supported Rust version is claimed yet: the pinned toolchain
 is what we build and test with, not a verified lower bound.
 
-Thumbnails cache into `.bridgecraft-thumbs.db` in the working directory. Optional runtimes unlock more formats:
+Thumbnails cache into `.bridgecraft-thumbs.db` in the working directory (still — moving that is open work). BridgeCraft's own state lives in the per-user data directory: favourites, recents, trash, plugins, version stacks and the metadata search index (`metadata.sqlite`) under `~/.local/share/BridgeCraft` on Linux, `~/Library/Application Support/BridgeCraft` on macOS and `%APPDATA%\BridgeCraft` on Windows; the watched-folder rules are the one thing kept in the *configuration* directory instead (`~/.config/BridgeCraft/auto-rules.json`). Opening a folder queues a background pass that writes each file's rating, label, flag, keywords and camera fields into that index, so a second visit to the same folder reads nothing that has not changed. Nothing queries it yet — the search field and the index-backed grid are the next work.
+
+Optional runtimes unlock more formats:
 
 | Enable by installing | Gets you |
 |---|---|

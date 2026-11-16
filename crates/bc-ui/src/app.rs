@@ -11,16 +11,18 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bc_core::auto_process::{AutoAction, AutoProcessor, AutoRule};
 use bc_core::browser::BrowserState;
-use bc_core::export::{ExportFormat, ExportQueue, ExportRequest};
+use bc_core::export::{ExportFormat, ExportRequest};
 use bc_core::favorites::Favorites;
 use bc_core::file_ops::{
     copy_path, delete_path, move_path, rename_path, transfer_into_folder, TransferMode,
 };
 use bc_core::fs::{SortDir, SortKey};
+use bc_core::jobs::{JobKind, JobQueue};
 use bc_core::plugins::{Capability as PluginCapability, PluginHost, PluginManager};
 use bc_core::recents::Recents;
 use bc_core::selection::Selection;
@@ -284,15 +286,29 @@ pub struct BridgeApp {
     bulk_label_enabled: bool,
     bulk_flag_enabled: bool,
 
-    // ------------------------------------------------------------- export --
-    /// Session-lifetime export job queue (all logic lives in `bc-core`).
-    export_queue: ExportQueue,
+    // ------------------------------------------------------------- jobs --
+    /// Session-lifetime worker pool: batch exports and metadata index passes
+    /// alike (all the logic lives in `bc-core`).
+    job_queue: JobQueue,
+    /// Shared metadata index database, opened on the first folder that needs
+    /// it. `None` with `index_error` set is a *reported* state, not a silent
+    /// one: the status bar says the index is unavailable rather than letting a
+    /// later search look like an empty library.
+    index: Option<Arc<bc_core::MetadataIndex>>,
+    index_error: Option<String>,
+    /// The folder pass in the queue right now, so opening another folder can
+    /// cancel it instead of leaving two writers on the same rows.
+    index_job: Option<u64>,
+    /// Files settled out of the running pass, for the status bar. Refreshed by
+    /// the job poll rather than read in the paint pass, which would take the
+    /// registry lock once per frame per widget.
+    index_progress: Option<(usize, usize)>,
     /// Open Export dialog parameters, if any.
     export_dialog: Option<ExportDialog>,
     /// Jobs list window visibility.
     jobs_window: bool,
     /// Count of jobs still queued/running, refreshed by the poll.
-    export_active: usize,
+    jobs_active: usize,
     /// Jobs whose completion summary has already been put in the status bar.
     jobs_notified: HashSet<u64>,
     /// Local WASM plugin registry; discovery is explicit from the manager dialog.
@@ -380,10 +396,14 @@ impl BridgeApp {
             bulk_rating_enabled: false,
             bulk_label_enabled: false,
             bulk_flag_enabled: false,
-            export_queue: ExportQueue::new(bc_core::export::default_worker_count()),
+            job_queue: JobQueue::new(bc_core::export::default_worker_count()),
+            index: None,
+            index_error: None,
+            index_job: None,
+            index_progress: None,
             export_dialog: None,
             jobs_window: false,
-            export_active: 0,
+            jobs_active: 0,
             jobs_notified: HashSet::new(),
             plugin_manager: PluginManager::open_default().unwrap_or_else(|error| {
                 tracing::warn!("plugin manager unavailable: {error}");
@@ -445,6 +465,7 @@ impl BridgeApp {
                 // Keep the tree anchored on the folder the user is in.
                 self.expanded.insert(root.to_path_buf());
                 self.attach_watcher(root);
+                self.start_indexing(root);
             }
             Err(e) => {
                 self.status = format!("Error: {e}");
@@ -465,6 +486,72 @@ impl BridgeApp {
                 None
             }
         };
+    }
+
+    /// Open the metadata index once and keep the handle.
+    ///
+    /// Shared rather than opened per pass because the queue hands the same
+    /// `Arc` to every worker: one SQLite connection means one writer, which is
+    /// what a store whose rows are keyed by path wants. A failure is remembered
+    /// in `index_error` and reported, not retried every frame — a missing data
+    /// directory does not become a read-only disk by clicking twice.
+    fn open_index(&mut self) -> Option<Arc<bc_core::MetadataIndex>> {
+        if self.index.is_some() {
+            return self.index.clone();
+        }
+        let path = match bc_core::paths::metadata_index_path() {
+            Ok(path) => path,
+            Err(error) => {
+                self.index_error = Some(error.to_string());
+                return None;
+            }
+        };
+        match bc_core::MetadataIndex::open(&path) {
+            Ok(index) => {
+                self.index_error = None;
+                self.index = Some(Arc::new(index));
+                self.index.clone()
+            }
+            Err(error) => {
+                self.index_error = Some(format!("{}: {error}", path.display()));
+                None
+            }
+        }
+    }
+
+    /// Queue a metadata-index pass over the folder just opened.
+    ///
+    /// Opening a folder while an earlier pass runs cancels that pass first: the
+    /// rows it would still write belong to a folder nobody is looking at, and
+    /// two passes on the same connection would fight over the same rows. The
+    /// cancelled pass's sweep still runs, so nothing already true on disk gets
+    /// left behind.
+    fn start_indexing(&mut self, root: &Path) {
+        let files: Vec<PathBuf> = self
+            .browser
+            .entries
+            .iter()
+            .filter(|entry| !entry.is_dir)
+            .map(|entry| entry.path.clone())
+            .collect();
+        let total = files.len();
+        let Some(index) = self.open_index() else {
+            // Reachable state, and the user has to be told: without a database
+            // there is no search and no index-backed sorting, so saying nothing
+            // would make an empty result look like an empty library.
+            self.status = format!(
+                "Search index unavailable ({}); search and sorting by tag will be incomplete",
+                self.index_error.as_deref().unwrap_or("no reason recorded")
+            );
+            tracing::warn!("{}", self.status);
+            return;
+        };
+        if let Some(previous) = self.index_job.take() {
+            self.job_queue.cancel(previous);
+        }
+        let job = self.job_queue.submit_index(root, files, index);
+        self.index_job = Some(job.id);
+        tracing::debug!("indexing {} ({total} files)", root.display());
     }
 
     /// Reload the listing after a drop so the results are visible immediately
@@ -494,6 +581,15 @@ impl BridgeApp {
                         self.failed.clear();
                         self.tree_children.clear();
                         self.status = format!("Refreshed ({} items)", self.browser.len());
+                        // …and their index rows may be stale. A settled watcher
+                        // event is the only signal that something changed
+                        // outside BridgeCraft, so re-run the pass over the
+                        // folder: rows that are still current cost two stats
+                        // and one indexed lookup each, and are reported as
+                        // skipped rather than re-read.
+                        if let Some(root) = self.browser.root.clone() {
+                            self.start_indexing(&root);
+                        }
                     }
                     Err(e) => tracing::warn!("live refresh failed: {e}"),
                 }
@@ -2584,18 +2680,48 @@ impl BridgeApp {
 
     /// Refresh job counters, announce freshly finished jobs once, and keep
     /// the frame clock running while work is in flight.
-    fn poll_export_jobs(&mut self, ctx: &egui::Context) {
-        let snapshots = self.export_queue.snapshot();
-        self.export_active = snapshots.iter().filter(|job| !job.finished).count();
+    fn poll_jobs(&mut self, ctx: &egui::Context) {
+        let snapshots = self.job_queue.snapshot();
+        self.jobs_active = snapshots.iter().filter(|job| !job.finished).count();
         for job in snapshots.iter().filter(|job| job.finished) {
             if self.jobs_notified.insert(job.id) {
-                self.status = format!(
-                    "Export job #{} finished: {} done, {} failed, {} cancelled",
-                    job.id, job.completed, job.failed, job.cancelled
-                );
+                self.status = match &job.kind {
+                    JobKind::Index { root } => format!(
+                        "Indexed {}: {} read, {} already current, {} stale rows removed, {} failed",
+                        root.display(),
+                        job.completed,
+                        job.skipped,
+                        job.pruned,
+                        job.failed
+                    ),
+                    JobKind::Export { .. } => format!(
+                        "Export job #{} finished: {} done, {} failed, {} cancelled",
+                        job.id, job.completed, job.failed, job.cancelled
+                    ),
+                };
             }
         }
-        if self.export_active > 0 {
+        // The folder pass is the one job the status bar follows by id, so that
+        // its row can clear itself when it ends rather than linger as a stale
+        // count from a cancelled pass.
+        self.index_progress = self.index_job.and_then(|id| {
+            snapshots
+                .iter()
+                .find(|job| job.id == id)
+                .filter(|job| !job.finished)
+                .map(|job| {
+                    (
+                        job.completed + job.skipped + job.failed + job.cancelled,
+                        job.total,
+                    )
+                })
+        });
+        if let Some(id) = self.index_job {
+            if snapshots.iter().any(|job| job.id == id && job.finished) {
+                self.index_job = None;
+            }
+        }
+        if self.jobs_active > 0 {
             ctx.request_repaint_after(std::time::Duration::from_millis(120));
         }
     }
@@ -2692,7 +2818,7 @@ impl BridgeApp {
                 format,
                 max_edge: dialog.max_edge.max(0) as u32,
             };
-            match self.export_queue.submit(request) {
+            match self.job_queue.submit(request) {
                 Ok(handle) => {
                     self.status =
                         format!("Export job #{} started ({file_count} file(s)).", handle.id);
@@ -3226,9 +3352,12 @@ impl BridgeApp {
             .default_size([440.0, 340.0])
             .open(&mut open)
             .show(ctx, |ui| {
-                let snapshots = self.export_queue.snapshot();
+                let snapshots = self.job_queue.snapshot();
                 if snapshots.is_empty() {
-                    ui.weak("No export jobs yet. Right-click a selection and choose Export…");
+                    ui.weak(
+                        "No jobs yet. Right-click a selection and choose Export…; opening a \
+                         folder queues a metadata index pass for it.",
+                    );
                     return;
                 }
                 ui.horizontal(|ui| {
@@ -3237,7 +3366,7 @@ impl BridgeApp {
                         .on_hover_text("Hide finished jobs from this list")
                         .clicked()
                     {
-                        self.export_queue.clear_finished();
+                        self.job_queue.clear_finished();
                     }
                 });
                 ui.separator();
@@ -3245,31 +3374,39 @@ impl BridgeApp {
                     for job in snapshots.iter().rev() {
                         ui.group(|ui| {
                             ui.horizontal(|ui| {
-                                ui.strong(format!(
-                                    "Job #{} · {} · ≤{} px",
-                                    job.id,
-                                    job.format.label(),
-                                    job.max_edge
-                                ));
+                                ui.strong(format!("Job #{} · {}", job.id, job.kind.heading()));
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
                                         if !job.finished && ui.button("Cancel job").clicked() {
-                                            self.export_queue.cancel(job.id);
+                                            self.job_queue.cancel(job.id);
                                         }
                                     },
                                 );
                             });
-                            ui.weak(format!("→ {}", job.destination));
-                            let done = job.completed + job.failed + job.cancelled;
+                            ui.weak(format!("→ {}", job.kind.target()));
+                            let done = job.completed + job.skipped + job.failed + job.cancelled;
                             ui.add(
                                 egui::ProgressBar::new(done as f32 / job.total.max(1) as f32)
                                     .text(format!("{done}/{}", job.total)),
                             );
-                            ui.weak(format!(
+                            let mut summary = format!(
                                 "{} done · {} failed · {} cancelled · {} queued · {} running",
                                 job.completed, job.failed, job.cancelled, job.queued, job.running
-                            ));
+                            );
+                            if job.skipped > 0 {
+                                summary = format!("{} skipped · {summary}", job.skipped);
+                            }
+                            if job.pruned > 0 {
+                                summary = format!("{summary} · {} stale rows removed", job.pruned);
+                            }
+                            ui.weak(summary);
+                            let indexing = matches!(job.kind, JobKind::Index { .. });
+                            let running_text = if indexing {
+                                "indexing…"
+                            } else {
+                                "exporting…"
+                            };
                             egui::ScrollArea::vertical()
                                 .max_height(150.0)
                                 .auto_shrink([false, true])
@@ -3285,18 +3422,33 @@ impl BridgeApp {
                                                 ui.weak(format!("· {name}"));
                                             }
                                             bc_core::jobs::FileState::Running => {
-                                                ui.label(format!("▶ {name} — exporting…"));
+                                                ui.label(format!("▶ {name} — {running_text}"));
                                             }
                                             bc_core::jobs::FileState::Done { output } => {
-                                                let out_name = output
-                                                    .file_name()
-                                                    .map(|n| n.to_string_lossy().into_owned())
-                                                    .unwrap_or_default();
-                                                ui.colored_label(
-                                                    egui::Color32::from_rgb(120, 200, 120),
-                                                    format!("✓ {name} → {out_name}"),
-                                                )
-                                                .on_hover_text(output.display().to_string());
+                                                if indexing {
+                                                    // An index pass writes a row,
+                                                    // not a file, so the only name
+                                                    // worth showing is the photo's.
+                                                    ui.colored_label(
+                                                        egui::Color32::from_rgb(120, 200, 120),
+                                                        format!("✓ {name} indexed"),
+                                                    )
+                                                    .on_hover_text(output.display().to_string());
+                                                } else {
+                                                    let out_name = output
+                                                        .file_name()
+                                                        .map(|n| n.to_string_lossy().into_owned())
+                                                        .unwrap_or_default();
+                                                    ui.colored_label(
+                                                        egui::Color32::from_rgb(120, 200, 120),
+                                                        format!("✓ {name} → {out_name}"),
+                                                    )
+                                                    .on_hover_text(output.display().to_string());
+                                                }
+                                            }
+                                            bc_core::jobs::FileState::Skipped { reason } => {
+                                                ui.weak(format!("– {name}: {reason}"))
+                                                    .on_hover_text(reason);
                                             }
                                             bc_core::jobs::FileState::Failed { message } => {
                                                 ui.colored_label(
@@ -3675,8 +3827,31 @@ impl BridgeApp {
                     self.auto_window = !self.auto_window;
                 }
                 ui.separator();
-                let jobs_label = if self.export_active > 0 {
-                    format!("Jobs ({})", self.export_active)
+                // Metadata index state, next to the job list it comes from.
+                // Three cases, and the idle-and-working one says nothing: a
+                // quiet status bar is not a signal to look for problems.
+                match (&self.index_progress, &self.index_error) {
+                    (Some((done, total)), _) => {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(120, 200, 120),
+                            format!("Indexing {done}/{total}"),
+                        )
+                        .on_hover_text(
+                            "Reading metadata for this folder in the background.                              Files whose row already matches the file are
+                             skipped, not re-read.",
+                        );
+                    }
+                    (None, Some(reason)) => {
+                        ui.colored_label(egui::Color32::from_rgb(220, 160, 90), "Index offline")
+                            .on_hover_text(format!(
+                                "The metadata index could not be opened, so search and \
+                                 index-backed sorting are unavailable.\n{reason}"
+                            ));
+                    }
+                    (None, None) => {}
+                }
+                let jobs_label = if self.jobs_active > 0 {
+                    format!("Jobs ({})", self.jobs_active)
                 } else {
                     "Jobs".to_string()
                 };
@@ -3906,7 +4081,7 @@ impl eframe::App for BridgeApp {
                 ctx.request_repaint_after(Duration::from_millis(250));
             }
         }
-        self.poll_export_jobs(ctx);
+        self.poll_jobs(ctx);
         self.poll_watcher();
         self.prune_preview_textures();
 
@@ -4778,6 +4953,147 @@ mod tests {
             }
         }
         None
+    }
+
+    #[test]
+    fn opening_a_folder_queues_an_index_pass_that_lands_in_the_database() {
+        // The claim this slice exists to keep: indexing is reachable by
+        // navigating, not only by a test calling into `bc-core`. Everything the
+        // pass does after this point is the queue's, so what is asserted here
+        // is that `open_root` produced a job and that job produced rows.
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        let first = root.join("first.jpg");
+        let second = root.join("second.jpg");
+        std::fs::write(&first, [0xFFu8, 0xD8, 0xFF, 0xD9]).unwrap();
+        std::fs::write(&second, [0xFFu8, 0xD8, 0xFF, 0xD9]).unwrap();
+        // A folder is listed but never indexed: the pass covers the folder's
+        // own files, the same non-recursive reach the grid shows.
+        let deeper = root.join("nested").join("deeper.jpg");
+        std::fs::write(&deeper, [0xFFu8, 0xD8, 0xFF, 0xD9]).unwrap();
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data);
+        assert!(app.index_job.is_some(), "opening a folder queued nothing");
+        let job = app.index_job.expect("job id");
+        // Frames, not sleeps: `poll_jobs` is what a running window calls.
+        for _ in 0..400 {
+            app.poll_jobs(&ctx);
+            if app.index_job.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(app.index_job, None, "the pass never finished");
+
+        // Ask the same helper the app used rather than spelling the path out:
+        // `isolated_app` nests its own `data` under the isolation root, and a
+        // guessed second answer to "where is the index" is how two databases
+        // for one index get written in the first place.
+        let database = bc_core::paths::metadata_index_path().unwrap();
+        let index =
+            bc_core::MetadataIndex::open(&database).expect("the database the app just wrote");
+        assert!(index.contains(&first), "first.jpg never indexed");
+        assert!(index.contains(&second), "second.jpg never indexed");
+        assert!(
+            !index.contains(&deeper),
+            "a folder pass indexed a file the listing never contained"
+        );
+        assert!(
+            app.jobs_notified.contains(&job),
+            "the finished pass never reached the status bar: {}",
+            app.status
+        );
+        assert!(
+            app.status.contains("Indexed"),
+            "the status bar should name the pass it finished, got {:?}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn navigating_mid_pass_indexes_the_folder_the_user_ended_up_in() {
+        // The bug this design was chosen to remove: superseding a pass used to
+        // cancel the running one and then return without queueing the new
+        // folder, so navigating during a pass dropped the destination.
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let left = temp.path().join("left");
+        let right = temp.path().join("right");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::create_dir_all(&right).unwrap();
+        for i in 0..24 {
+            std::fs::write(
+                left.join(format!("l{i:02}.jpg")),
+                [0xFFu8, 0xD8, 0xFF, 0xD9],
+            )
+            .unwrap();
+        }
+        let landed = right.join("here.jpg");
+        std::fs::write(&landed, [0xFFu8, 0xD8, 0xFF, 0xD9]).unwrap();
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &left, &data);
+        let first_job = app.index_job.expect("first pass queued");
+        // Navigate while that pass is still running.
+        app.open_root(&right);
+        let second_job = app.index_job.expect("second pass queued");
+        assert_ne!(first_job, second_job, "navigating reused the old pass");
+
+        for _ in 0..400 {
+            app.poll_jobs(&ctx);
+            if app.index_job.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let database = bc_core::paths::metadata_index_path().unwrap();
+        let index = bc_core::MetadataIndex::open(&database).expect("database");
+        assert!(
+            index.contains(&landed),
+            "the destination folder of a superseded pass was never indexed"
+        );
+    }
+
+    #[test]
+    fn an_unusable_index_is_reported_rather_than_left_invisible() {
+        // Where the "index offline" state comes from: the data directory
+        // cannot be created, so the app says so instead of letting a later
+        // search look like an empty library.
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("shot.jpg"), [0xFFu8, 0xD8, 0xFF, 0xD9]).unwrap();
+        // A *file* standing where the data directory would have to be.
+        let blocker = temp.path().join("data");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        std::env::set_var("HOME", temp.path());
+        std::env::set_var("APPDATA", &blocker);
+        std::env::set_var("XDG_DATA_HOME", &blocker);
+
+        let ctx = egui::Context::default();
+        let app = BridgeApp::new(&ctx, Some(root.display().to_string()), None);
+        assert!(
+            app.index_error.is_some(),
+            "a database that could not be opened must be recorded"
+        );
+        assert!(app.index.is_none(), "no handle should exist");
+        assert!(
+            app.index_job.is_none(),
+            "nothing should be queued when the index is unavailable"
+        );
+        assert!(
+            app.status.contains("index unavailable"),
+            "the status bar should say why there is no index, got {:?}",
+            app.status
+        );
     }
 
     #[test]

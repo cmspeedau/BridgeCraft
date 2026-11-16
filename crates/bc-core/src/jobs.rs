@@ -1,11 +1,24 @@
-//! Queued background execution for the batch export pipeline (issue #15).
+//! Queued background execution for the two jobs that walk a folder's files:
+//! batch export (issue #15) and the metadata indexer (issue #13's producer).
 //!
-//! [`ExportQueue`] owns a bounded worker pool (default
+//! [`JobQueue`] owns a bounded worker pool (default
 //! [`crate::export::default_worker_count`], i.e. half the cores) that drains
-//! per-file export tasks. All state — per-file progress, completion counts,
-//! cancellation — lives behind one registry lock here, so the UI can stay a
-//! thin polling view ([`ExportQueue::snapshot`]) and every rule is testable
+//! per-file tasks from every job. All state — per-file progress, completion
+//! counts, cancellation — lives behind one registry lock here, so the UI stays
+//! a thin polling view ([`JobQueue::snapshot`]) and every rule is testable
 //! headless.
+//!
+//! Both job kinds share the pool because the work has the same shape: take a
+//! folder's files, do one cheap thing per file, report per-file progress, stop
+//! between files on request. Indexing got its own thread once anyway, and that
+//! thread is why this module owns it: two of its tests hung at near-zero CPU
+//! time, both from calling `join()` while holding the mutex the worker's last
+//! line also wanted (the `if let` scrutinee guard in Rust 2021 keeps that lock
+//! for the whole block). A shared queue has no handle to join, so that class of
+//! bug has nowhere to live. Superseding a pass is the same win: navigating away
+//! mid-pass cancels the old job and submits a new one through the one path that
+//! already works, instead of a generation counter plus a pending slot that a
+//! buggy `start()` left unwritten.
 //!
 //! Guarantees:
 //! - **No truncated output.** Pixels are encoded to memory, written to a
@@ -16,6 +29,11 @@
 //!   re-checked under the registry lock at publish time.
 //! - **Cancellation is honoured between files and before publish.** Already
 //!   finished outputs are kept; anything in flight discards its temp file.
+//! - **Indexing is resumable.** Rows are written per file and committed on
+//!   return, so a cancelled or crashed pass leaves a correct partial index;
+//!   the next pass skips what is already current. The folder's sweep runs once
+//!   per job even after cancellation, because it prunes only rows whose file is
+//!   gone from disk, which is true whether or not this pass reached it.
 //!
 //! The one documented race window: between the final availability check and
 //! the rename, a *different process* could create the same name. BridgeCraft
@@ -30,17 +48,32 @@ use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::export::{self, ExportFormat, ExportRequest, Result};
+use crate::indexer;
+use crate::metadata_index::MetadataIndex;
 
 /// Cap so a stray request cannot spawn hundreds of decode threads.
 const MAX_WORKERS: usize = 64;
 
-/// Lifecycle of one file inside an export job.
+/// Lifecycle of one file inside a job.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileState {
     Queued,
     Running,
-    Done { output: PathBuf },
-    Failed { message: String },
+    Done {
+        output: PathBuf,
+    },
+    /// Worked on, nothing to do: the row was already current, or the file
+    /// vanished between the folder listing and this task. Distinct from
+    /// [`FileState::Cancelled`] (a user stopped the job) and from
+    /// [`FileState::Failed`] (something went wrong). Indexing a folder twice
+    /// must be able to say "148 files, nothing to re-read" rather than
+    /// pretending it wrote 148 rows.
+    Skipped {
+        reason: String,
+    },
+    Failed {
+        message: String,
+    },
     Cancelled,
 }
 
@@ -57,26 +90,61 @@ pub struct FileProgress {
     pub state: FileState,
 }
 
+/// What a job is, in the two words the job list needs plus where it points.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobKind {
+    Export {
+        format: ExportFormat,
+        max_edge: u32,
+        /// Destination folder, or `"beside originals"`.
+        destination: String,
+    },
+    /// A pass over one folder's files, writing rows into the metadata index.
+    Index { root: PathBuf },
+}
+
+impl JobKind {
+    /// Title line for the job list.
+    pub fn heading(&self) -> String {
+        match self {
+            JobKind::Export {
+                format, max_edge, ..
+            } => {
+                format!("Export · {} · ≤{max_edge} px", format.label())
+            }
+            JobKind::Index { .. } => "Metadata index".to_string(),
+        }
+    }
+
+    /// Second line: the folder the results land in, or the folder being read.
+    pub fn target(&self) -> String {
+        match self {
+            JobKind::Export { destination, .. } => destination.clone(),
+            JobKind::Index { root } => root.display().to_string(),
+        }
+    }
+}
+
 /// Pollable summary of one submitted job.
 #[derive(Debug, Clone)]
 pub struct JobSnapshot {
     pub id: u64,
-    pub format: ExportFormat,
-    pub max_edge: u32,
-    /// Destination folder, or `"beside originals"`.
-    pub destination: String,
+    pub kind: JobKind,
     pub files: Vec<FileProgress>,
     pub total: usize,
     pub completed: usize,
+    pub skipped: usize,
     pub failed: usize,
     pub cancelled: usize,
     pub queued: usize,
     pub running: usize,
+    /// Index jobs only: rows removed for files no longer on disk.
+    pub pruned: usize,
     pub cancel_requested: bool,
     pub finished: bool,
 }
 
-/// Token returned by [`ExportQueue::submit`].
+/// Token returned by [`JobQueue::submit`] and [`JobQueue::submit_index`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JobHandle {
     pub id: u64,
@@ -85,23 +153,85 @@ pub struct JobHandle {
 struct FileRecord {
     source: PathBuf,
     /// Planned output while Queued/Running (its name is reserved); `None`
-    /// once the file reached a terminal state.
+    /// once the file reached a terminal state. Always `None` for index jobs,
+    /// which write a row rather than a file, so no name can collide.
     planned: Option<PathBuf>,
     state: FileState,
 }
 
-struct JobRecord {
-    id: u64,
-    format: ExportFormat,
-    max_edge: u32,
-    destination_label: String,
-    files: Vec<FileRecord>,
-    cancel: Arc<AtomicBool>,
+/// The per-file work a job performs, and what a task needs to perform it.
+enum Body {
+    Export {
+        format: ExportFormat,
+        max_edge: u32,
+        destination_label: String,
+    },
+    Index {
+        root: PathBuf,
+        /// Shared so every worker writes through one SQLite connection rather
+        /// than each opening its own: the writers serialise on the handle's own
+        /// lock, which is what a single-writer store wants.
+        index: Arc<MetadataIndex>,
+    },
 }
 
+/// Whether a job's end-of-folder sweep still has to run. Export jobs have no
+/// sweep at all.
+#[derive(Debug)]
+enum Sweep {
+    None,
+    Pending,
+    Running,
+    Done { pruned: usize },
+}
+
+struct JobRecord {
+    id: u64,
+    body: Body,
+    files: Vec<FileRecord>,
+    cancel: Arc<AtomicBool>,
+    sweep: Sweep,
+}
+
+impl JobRecord {
+    /// True while this job still has work: a file that is not terminal, or a
+    /// sweep that has not run. The sweep half matters for more than reporting —
+    /// [`JobQueue::clear_finished`] drops jobs, and a job dropped while its
+    /// sweep task is still queued would leave that task pointing at nothing.
+    fn live(&self) -> bool {
+        self.files.iter().any(|file| !file.state.is_terminal())
+            || matches!(self.sweep, Sweep::Pending | Sweep::Running)
+    }
+
+    fn kind(&self) -> JobKind {
+        match &self.body {
+            Body::Export {
+                format,
+                max_edge,
+                destination_label,
+            } => JobKind::Export {
+                format: *format,
+                max_edge: *max_edge,
+                destination: destination_label.clone(),
+            },
+            Body::Index { root, .. } => JobKind::Index { root: root.clone() },
+        }
+    }
+}
+
+/// One unit of work: a file, or a job's end-of-folder sweep.
 struct Task {
     job: u64,
-    file: usize,
+    step: Step,
+}
+
+enum Step {
+    /// Index or export the file at this index in the job's `files`.
+    File(usize),
+    /// Prune the folder's stale rows. Queued after every file task of its job,
+    /// and safe to run while a file task is still in flight: it only removes
+    /// rows whose file is gone from disk, which no in-flight task can recreate.
+    Sweep,
 }
 
 /// Jobs plus the set of output names currently reserved by queued or
@@ -128,18 +258,19 @@ fn lock<T>(slot: &Mutex<T>) -> MutexGuard<'_, T> {
     slot.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Bounded worker pool that executes export jobs. The UI holds one for the
-/// session lifetime.
-pub struct ExportQueue {
+/// Bounded worker pool that executes export and indexing jobs. The UI holds
+/// one for the session lifetime.
+pub struct JobQueue {
     pool: Arc<Pool>,
     /// Detached on drop: a worker finishing its current file is no reason to
     /// block application shutdown, and interrupted work can only ever be a
-    /// hidden temp file, never a truncated output.
+    /// hidden temp file, never a truncated output. Index rows are committed
+    /// per file, so a detached worker simply finishes the file it has.
     _workers: Vec<JoinHandle<()>>,
 }
 
-impl ExportQueue {
-    /// Spawn a pool of `workers` export threads (clamped to 1..=64).
+impl JobQueue {
+    /// Spawn a pool of `workers` threads (clamped to 1..=64).
     pub fn new(workers: usize) -> Self {
         let pool = Arc::new(Pool {
             registry: Mutex::new(Registry::default()),
@@ -153,9 +284,9 @@ impl ExportQueue {
             .map(|id| {
                 let pool = Arc::clone(&pool);
                 std::thread::Builder::new()
-                    .name(format!("export-{id}"))
+                    .name(format!("bc-job-{id}"))
                     .spawn(move || worker_loop(&pool, id))
-                    .expect("failed to spawn export worker")
+                    .expect("failed to spawn job worker")
             })
             .collect();
         Self { pool, _workers }
@@ -179,27 +310,96 @@ impl ExportQueue {
             }
             let queued = (0..files.len())
                 .filter(|&i| files[i].state == FileState::Queued)
-                .map(|file| Task { job: id, file })
+                .map(|file| Task {
+                    job: id,
+                    step: Step::File(file),
+                })
                 .collect();
             registry.jobs.push(JobRecord {
                 id,
-                format: request.format,
-                max_edge: request.max_edge,
-                destination_label: match &request.destination {
-                    Some(dir) => dir.display().to_string(),
-                    None => "beside originals".to_string(),
+                body: Body::Export {
+                    format: request.format,
+                    max_edge: request.max_edge,
+                    destination_label: match &request.destination {
+                        Some(dir) => dir.display().to_string(),
+                        None => "beside originals".to_string(),
+                    },
                 },
                 files,
                 cancel: Arc::new(AtomicBool::new(false)),
+                sweep: Sweep::None,
             });
             queued
         };
 
-        if !queued.is_empty() {
-            lock(&self.pool.pending).extend(queued);
-            self.pool.ready.notify_all();
-        }
+        self.wake(queued);
         Ok(JobHandle { id })
+    }
+
+    /// Queue a metadata-index pass over `files`, the folder's own listing.
+    ///
+    /// Unlike an export, nothing is pre-flighted here: the listing can be tens
+    /// of thousands of paths, and `submit` runs on the UI thread the moment a
+    /// folder is opened, so a stat per file would cost the click. Each file's
+    /// existence is checked by the worker instead, and the result is a
+    /// `Skipped` row rather than a failure. The queue's existing guarantees
+    /// apply unchanged, which is the point of putting indexing here: at most
+    /// one pass writes a given folder, and one pass's rows cannot be lost when
+    /// the user navigates away, because navigating cancels the old job and
+    /// submits the new one through this same path.
+    pub fn submit_index(
+        &self,
+        root: &Path,
+        files: Vec<PathBuf>,
+        index: Arc<MetadataIndex>,
+    ) -> JobHandle {
+        let id = self.pool.next_id.fetch_add(1, Ordering::Relaxed);
+        let queued: Vec<Task> = {
+            let mut registry = lock(&self.pool.registry);
+            let mut queued: Vec<Task> = (0..files.len())
+                .map(|file| Task {
+                    job: id,
+                    step: Step::File(file),
+                })
+                .collect();
+            registry.jobs.push(JobRecord {
+                id,
+                body: Body::Index {
+                    root: root.to_path_buf(),
+                    index,
+                },
+                files: files
+                    .into_iter()
+                    .map(|source| FileRecord {
+                        source,
+                        planned: None,
+                        state: FileState::Queued,
+                    })
+                    .collect(),
+                cancel: Arc::new(AtomicBool::new(false)),
+                sweep: Sweep::Pending,
+            });
+            // Queued after every file task of this pass, so pruning follows
+            // indexing. An empty folder has no file tasks and still gets one.
+            queued.push(Task {
+                job: id,
+                step: Step::Sweep,
+            });
+            queued
+        };
+
+        self.wake(queued);
+        JobHandle { id }
+    }
+
+    /// Hand tasks to the workers. A queue that cannot spawn is not this
+    /// function's problem: the pool is built once at startup.
+    fn wake(&self, tasks: Vec<Task>) {
+        if tasks.is_empty() {
+            return;
+        }
+        lock(&self.pool.pending).extend(tasks);
+        self.pool.ready.notify_all();
     }
 
     /// Ask a job to stop. Queued files become [`FileState::Cancelled`]
@@ -235,38 +435,37 @@ impl ExportQueue {
             .collect()
     }
 
-    /// True while any job still has queued or running files.
+    /// True while any job still has queued or running files, or a sweep
+    /// still to run.
     pub fn has_active(&self) -> bool {
-        lock(&self.pool.registry)
-            .jobs
-            .iter()
-            .any(|job| job.files.iter().any(|f| !f.state.is_terminal()))
+        lock(&self.pool.registry).jobs.iter().any(JobRecord::live)
     }
 
     /// Drop finished jobs from the job list (their outputs stay on disk).
     /// A finished job has no pending tasks and no live reservations.
     pub fn clear_finished(&self) {
-        lock(&self.pool.registry)
-            .jobs
-            .retain(|job| job.files.iter().any(|f| !f.state.is_terminal()));
+        lock(&self.pool.registry).jobs.retain(JobRecord::live);
     }
 }
 
 fn snapshot_of(job: &JobRecord) -> JobSnapshot {
     let mut snap = JobSnapshot {
         id: job.id,
-        format: job.format,
-        max_edge: job.max_edge,
-        destination: job.destination_label.clone(),
+        kind: job.kind(),
         files: Vec::with_capacity(job.files.len()),
         total: job.files.len(),
         completed: 0,
+        skipped: 0,
         failed: 0,
         cancelled: 0,
         queued: 0,
         running: 0,
+        pruned: match job.sweep {
+            Sweep::Done { pruned } => pruned,
+            _ => 0,
+        },
         cancel_requested: job.cancel.load(Ordering::Relaxed),
-        finished: true,
+        finished: !job.live(),
     };
     for file in &job.files {
         snap.files.push(FileProgress {
@@ -283,6 +482,7 @@ fn snapshot_of(job: &JobRecord) -> JobSnapshot {
                 snap.finished = false;
             }
             FileState::Done { .. } => snap.completed += 1,
+            FileState::Skipped { .. } => snap.skipped += 1,
             FileState::Failed { .. } => snap.failed += 1,
             FileState::Cancelled => snap.cancelled += 1,
         }
@@ -358,58 +558,149 @@ fn wait_for_task(pool: &Pool) -> Option<Task> {
 }
 
 fn process_task(pool: &Pool, worker_id: usize, task: Task) {
-    // Claim the file under the registry lock; cancelled or already-terminal
-    // files are skipped without ever touching a decoder.
-    let claim = {
-        let registry = lock(&pool.registry);
-        let Some(job) = registry.jobs.iter().find(|job| job.id == task.job) else {
-            return;
-        };
-        let Some(record) = job.files.get(task.file) else {
-            return;
-        };
-        if record.state != FileState::Queued || job.cancel.load(Ordering::Relaxed) {
-            return;
-        }
-        let Some(planned) = record.planned.clone() else {
-            return;
-        };
-        (
-            record.source.clone(),
-            planned,
-            job.format,
-            job.max_edge,
-            Arc::clone(&job.cancel),
-        )
-    };
-    let (source, planned, format, max_edge, cancel) = claim;
-
-    {
-        let mut registry = lock(&pool.registry);
-        let Some(record) = find_file_mut(&mut registry, task.job, task.file) else {
-            return;
-        };
-        if record.state != FileState::Queued {
-            return; // cancelled in the claim gap
-        }
-        record.state = FileState::Running;
+    match task.step {
+        Step::File(file) => process_file(pool, worker_id, task.job, file),
+        Step::Sweep => process_sweep(pool, task.job),
     }
+}
 
-    let final_state = match prepare_export(&source, &planned, format, max_edge, &cancel, worker_id)
-    {
-        Prepared::Ready(tmp) => publish(pool, task.job, task.file, &planned, &tmp, &cancel),
-        // prepare_export removed any temp file it had created already.
-        Prepared::Failed(message) => FileState::Failed { message },
-        Prepared::Cancelled => FileState::Cancelled,
+/// A file a worker has taken, with everything its job kind needs. Built in
+/// the same critical section that marks the file `Running`, so a job cannot
+/// be cancelled between the two and leave a row claiming to be in flight.
+enum Claim {
+    Export {
+        source: PathBuf,
+        planned: PathBuf,
+        format: ExportFormat,
+        max_edge: u32,
+        cancel: Arc<AtomicBool>,
+    },
+    Index {
+        source: PathBuf,
+        index: Arc<MetadataIndex>,
+        cancel: Arc<AtomicBool>,
+    },
+}
+
+fn process_file(pool: &Pool, worker_id: usize, job: u64, file: usize) {
+    let Some(claim) = claim_file(pool, job, file) else {
+        return;
     };
+    let final_state = match claim {
+        Claim::Export {
+            source,
+            planned,
+            format,
+            max_edge,
+            cancel,
+        } => match prepare_export(&source, &planned, format, max_edge, &cancel, worker_id) {
+            // `prepare_export` removed any temp file it had created already.
+            Prepared::Ready(tmp) => publish(pool, job, file, &planned, &tmp, &cancel),
+            Prepared::Failed(message) => FileState::Failed { message },
+            Prepared::Cancelled => FileState::Cancelled,
+        },
+        Claim::Index {
+            source,
+            index,
+            cancel,
+        } => indexer::index_one(&index, &source, &cancel).into_state(source),
+    };
+    finish_file(pool, job, file, final_state);
+}
 
+fn claim_file(pool: &Pool, job_id: u64, file: usize) -> Option<Claim> {
     let mut registry = lock(&pool.registry);
-    let released = find_file_mut(&mut registry, task.job, task.file).and_then(|r| r.planned.take());
-    if let Some(record) = find_file_mut(&mut registry, task.job, task.file) {
-        record.state = final_state;
+    let job = registry.jobs.iter_mut().find(|job| job.id == job_id)?;
+    let record = job.files.get_mut(file)?;
+    if record.state != FileState::Queued || job.cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    record.state = FileState::Running;
+    match &job.body {
+        Body::Export {
+            format, max_edge, ..
+        } => {
+            let planned = record.planned.clone()?;
+            Some(Claim::Export {
+                source: record.source.clone(),
+                planned,
+                format: *format,
+                max_edge: *max_edge,
+                cancel: Arc::clone(&job.cancel),
+            })
+        }
+        Body::Index { index, .. } => Some(Claim::Index {
+            source: record.source.clone(),
+            index: Arc::clone(index),
+            cancel: Arc::clone(&job.cancel),
+        }),
+    }
+}
+
+/// Record what happened to a file, and hand back the output name it was
+/// holding so no other job can plan the same one.
+fn finish_file(pool: &Pool, job_id: u64, file: usize, state: FileState) {
+    let mut registry = lock(&pool.registry);
+    let released =
+        find_file_mut(&mut registry, job_id, file).and_then(|record| record.planned.take());
+    if let Some(record) = find_file_mut(&mut registry, job_id, file) {
+        record.state = state;
     }
     if let Some(planned) = released {
         registry.reserved.remove(&planned);
+    }
+}
+
+/// Remove rows this folder no longer has files for. One task per pass, run
+/// after the file tasks were queued; see
+/// [`MetadataIndex::prune_absent_from_listing`] for why both conditions are
+/// needed. Claiming the sweep under the lock means two workers cannot both
+/// prune, and a job that was cancelled still prunes: a file the pass never
+/// reached is either still on disk (so it keeps its row) or gone (so the row
+/// should go, pass or no pass).
+fn process_sweep(pool: &Pool, job_id: u64) {
+    let claim = {
+        let mut registry = lock(&pool.registry);
+        let Some(job) = registry.jobs.iter_mut().find(|job| job.id == job_id) else {
+            return;
+        };
+        if !matches!(job.sweep, Sweep::Pending) {
+            return; // already swept, or an export job that never asks
+        }
+        job.sweep = Sweep::Running;
+        match &job.body {
+            Body::Index { root, index } => Some((root.clone(), Arc::clone(index))),
+            // Export jobs sweep nothing; settle the flag so the job can be
+            // reported finished rather than hanging on a task that ran.
+            Body::Export { .. } => {
+                job.sweep = Sweep::Done { pruned: 0 };
+                None
+            }
+        }
+    };
+    let Some((root, index)) = claim else { return };
+    let listed: Vec<PathBuf> = {
+        let registry = lock(&pool.registry);
+        registry
+            .jobs
+            .iter()
+            .find(|job| job.id == job_id)
+            .map(|job| job.files.iter().map(|file| file.source.clone()).collect())
+            .unwrap_or_default()
+    };
+    let outcome = indexer::sweep_folder(&index, &root, &listed);
+    let mut registry = lock(&pool.registry);
+    if let Some(job) = registry.jobs.iter_mut().find(|job| job.id == job_id) {
+        job.sweep = match outcome {
+            Ok(pruned) => Sweep::Done { pruned },
+            Err(error) => {
+                // Say so in the log and still finish the job: a folder whose
+                // stale rows could not be pruned has correctly indexed files,
+                // and re-running the pass is enough to try the sweep again.
+                tracing::warn!("could not prune {}: {error}", root.display());
+                Sweep::Done { pruned: 0 }
+            }
+        };
     }
 }
 
@@ -503,7 +794,14 @@ fn publish(
                 .files
                 .get(file)
                 .filter(|r| r.planned.as_deref() == Some(planned))?;
-            Some((record.source.clone(), job.max_edge, job.format))
+            match &job.body {
+                Body::Export {
+                    format, max_edge, ..
+                } => Some((record.source.clone(), *max_edge, *format)),
+                // Only an export reserves a name, so a publish task for an
+                // index job means the job list was rewritten under us.
+                Body::Index { .. } => None,
+            }
         });
     let Some((source, max_edge, format)) = info else {
         drop(registry);
@@ -592,7 +890,7 @@ mod tests {
         }
     }
 
-    fn job_finished(queue: &ExportQueue, id: u64) -> Option<JobSnapshot> {
+    fn job_finished(queue: &JobQueue, id: u64) -> Option<JobSnapshot> {
         queue
             .snapshot()
             .into_iter()
@@ -620,7 +918,7 @@ mod tests {
         for name in ["a.png", "b.png", "c.png"] {
             write_test_png(&temp.path().join(name), 37, 11);
         }
-        let queue = ExportQueue::new(2);
+        let queue = JobQueue::new(2);
         let handle = queue
             .submit(ExportRequest {
                 sources: ["a.png", "b.png", "c.png"]
@@ -659,7 +957,7 @@ mod tests {
         write_test_png(&right.join("shot.png"), 20, 20);
         std::fs::write(out.join("shot_64.png"), b"KEEP").unwrap();
 
-        let queue = ExportQueue::new(1);
+        let queue = JobQueue::new(1);
         let a = queue
             .submit(ExportRequest {
                 sources: vec![left.join("shot.png")],
@@ -704,7 +1002,7 @@ mod tests {
         bc_metadata::keywords::add_keyword(&mut tags, "Pipeline");
         bc_metadata::xmp::write_embedded_xmp_file(&source, &tags).unwrap();
 
-        let queue = ExportQueue::new(1);
+        let queue = JobQueue::new(1);
         let job = queue
             .submit(ExportRequest {
                 sources: vec![source.clone()],
@@ -747,7 +1045,7 @@ mod tests {
         std::fs::write(&text, b"not an image").unwrap();
         std::fs::write(&broken, b"\x89PNG cut off").unwrap();
 
-        let queue = ExportQueue::new(2);
+        let queue = JobQueue::new(2);
         let handle = queue
             .submit(ExportRequest {
                 sources: vec![good.clone(), missing, text, broken],
@@ -787,7 +1085,7 @@ mod tests {
             write_test_png(&path, 120, 80);
             sources.push(path);
         }
-        let queue = ExportQueue::new(1);
+        let queue = JobQueue::new(1);
         let handle = queue
             .submit(ExportRequest {
                 sources,
@@ -828,7 +1126,7 @@ mod tests {
         let source = temp.path().join("rotated.jpg");
         write_oriented_jpeg(&source, 40, 20, 6);
 
-        let queue = ExportQueue::new(1);
+        let queue = JobQueue::new(1);
         let handle = queue
             .submit(ExportRequest {
                 sources: vec![source],
@@ -849,7 +1147,7 @@ mod tests {
     #[test]
     fn clear_finished_keeps_active_jobs_visible() {
         let temp = tempfile::tempdir().unwrap();
-        let queue = ExportQueue::new(1);
+        let queue = JobQueue::new(1);
 
         let done = queue
             .submit(ExportRequest {
@@ -897,7 +1195,7 @@ mod tests {
 
     #[test]
     fn submit_validation_rejects_the_whole_batch() {
-        let queue = ExportQueue::new(1);
+        let queue = JobQueue::new(1);
         assert!(matches!(
             queue.submit(ExportRequest {
                 sources: vec![],

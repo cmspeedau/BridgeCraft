@@ -19,6 +19,7 @@ pub mod export;
 pub mod favorites;
 pub mod file_ops;
 pub mod fs;
+pub mod indexer;
 pub mod jobs;
 pub mod recents;
 pub mod scripting;

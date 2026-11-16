@@ -26,8 +26,6 @@ use std::path::{Path, PathBuf};
 use image::{imageops, ColorType, ImageEncoder, RgbaImage};
 use thiserror::Error;
 
-pub use crate::jobs::ExportQueue;
-
 #[derive(Debug, Error)]
 pub enum ExportError {
     #[error("invalid export request: {0}")]
