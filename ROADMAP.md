@@ -64,7 +64,9 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [x] Star ratings, color labels, approve/reject flags: `bc-metadata::ratings` (XMP `xmp:Rating`, `photoshop:Label`, BridgeCraft `Flag`) plus the panel editor: five drawn stars, the label chips, Approve/Reject/No flag. Clicking the current rating clears it; each property is stampable on its own in the bulk editor, so "set the rating, leave the labels alone" is explicit. Tags write to the XMP sidecar, never into the image bytes, because there is no EXIF equivalent and embedded XMP is still open
 - [x] Rating and label display: label dot on the grid thumbnail, dot on list rows, and Rating plus Label columns in the details view, with the header sharing the row column math
 - [x] Background metadata indexing: opening a folder queues a pass over its files on the shared job pool (`bc-core::jobs::JobQueue::submit_index` running `bc-core::indexer::index_one`), and a settled watcher event re-runs it. A row that still matches its file is skipped after two `stat`s and one indexed lookup rather than re-read; a pass also records the folder (`add_root`) and prunes rows under it whose file is gone (`prune_absent_from_listing`), clearing their keyword projection rows with them. Progress, per-file states and cancellation are the Jobs window's, the same ones exports use (`bc-ui::app::start_indexing`, an `Indexing 4/7` readout in the status bar, `Index offline` when the database cannot be opened). Verified against the release binary, not only in unit tests: a run over a 6-file folder wrote 6 rows and the folder into `$XDG_DATA_HOME/BridgeCraft/metadata.sqlite`; a second run with one file added left all six existing rows' `indexed_at` untouched and added the seventh; a third run after deleting two files took the table from 7 rows to 5
-- [~] Metadata-driven search & smart collections: the index now has a producer (above), so there are rows to query — but nothing queries them: no search field, no saved-query UI, no way to browse a smart collection, and no sort or filter by rating or label. Two parallel search/projection implementations exist (see "Tech debt").
+- [x] Index-backed sorting and filtering: the grid, list and details views can order by rating, colour label or flag (`SortKey::Rating`/`Label`/`Flag` in `bc-core::fs`, fed by `MetadataIndex::tag_values_for` — one indexed range query per folder, not one lookup per file), and the toolbar's Tags menu filters by a rating floor, a label or a flag. A tag sort inherits the direction the user already chose and the button names the end that comes first (`1★`/`5★`, `A-Z`/`Z-A`, `smallest`/`largest`), because `Asc` means nothing useful for a rating. Ties break by name so the order is the same twice in a row. Saving tags writes the row back through `index_saved_tags`, so a starred photo moves immediately instead of sitting in the unrated half of the folder until the next pass. Files the index has not read sort as unrated and are *hidden* by a tag filter, which the status bar and the menu both count — the alternative is a grid that quietly omits photos
+- [~] Cross-library keyword suggestions and the tag overlay on cells still read files directly: the suggestions menu offers only the keywords the current file carries, and the rating badge on a visible cell keeps its own mtime-checked cache. Neither is wrong; both are the remaining per-file work in this area
+- [~] Metadata-driven search & smart collections: the index has a producer and, since this slice, a reader — sorting and filtering in the browser (`bc-core::browser::BrowserState::tags`, `tag_filter`). What is still missing is free text: no search field, no saved-query UI and no way to browse a smart collection. Two parallel search/projection implementations exist (see "Tech debt").
 
 ## Phase 4 — Batch Operations & Automation (Weeks 24–34) — ◐ rename, export and watched folders shipped with UI; contact sheets and the scripting surface are core-only
 - [x] Batch rename (token-based patterns) — `bc-core::batch_rename` parser/planner/journaled apply/undo plus `bc-ui` preview/apply dialog, pattern validation, and undo action
@@ -133,7 +135,7 @@ With ADR-0001 resolved (egui/eframe), the Phase 1 shell shipped (filter, live re
 
 What is left on the critical path, in the order that unblocks the most:
 
-1. **Index-backed tags.** The index now has a producer (slice 7: a folder pass queues on opening a folder and on settled watcher events), so the rows exist. What remains is the reader: the grid and details overlays still stat and parse a sidecar plus a packet for every visible row each frame, and that per-row cost is exactly what `bc-core::metadata_index` is for — the same work needed to sort or filter by rating and label. Export copying already reads through `bc_metadata::layers`, so one reader can serve all of it.
+1. **Index-backed tags.** Done for sorting and filtering, which is where the index was the only way to do the job at all: ordering a folder by stars needs every file's rating, and reading every file costs 14.9 µs each against 1.3 µs each for one indexed range query. What this slice measured and then *rejected* was the plan I wrote in the previous commit — "the grid and details overlays stat and parse a sidecar plus a packet for every visible row each frame; that belongs in `metadata_index`". The overlays cache on the file's own mtime, so a frame costs 2.3 µs per visible row and can never show a stale tag, while a per-file index lookup costs 98 µs — 6.6× slower than parsing the file, and permitted to lag it. Per-row display stays as it is; the remaining per-file work here is cross-library keyword suggestions and the panel's full layer read, both of which need more than the four tag columns the index holds.
 2. **A search field and smart-collection browsing** over that index, and one search implementation instead of two.
 3. **Contact sheets, publish presets, metadata templates and version stacks** wired into the UI: all implemented, tested and unreachable.
 4. **The data-path cleanup** before Phase 6 packaging, because bundle layouts break the current CWD-based thumbnail cache.
@@ -143,8 +145,11 @@ M1's remaining items are the two surfacing defects (failed-versus-pending thumbn
 
 ## Tech debt
 
-- **Nothing reads the index (it now has a producer).** `bc-core::metadata_index` has long been fully implemented and tested, and since 2026-11-16 it is finally written by the application: opening a folder queues a pass, and a settled watcher event re-runs it (see the Phase 3 item). What is still missing is the other half — no search field, no smart-collection browsing, no sort or filter by rating or label, and the grid and details overlays still read each file's metadata layers per row instead of asking the index. `roots()` and `status()`/`IndexStatus` remain written-but-unread: a pass records the folder it covered, and nothing displays that coverage yet.
+- **The index is written and read, but only for four columns.** Sorting and filtering consume `rating`, `color_label`, `flag` and (for a future search) `keywords`; nothing yet offers free text, saved queries or smart-collection browsing, and `roots()`/`status()`/`IndexStatus`/`query_rows()` are still written-but-unread API — a pass records the folder it covered and no interface reports that coverage. The grid's own rating badge and the metadata panel keep reading files directly, deliberately: see the measurement in Critical Path item 1.
+- **A test can assert the in-memory copy and pass while the database is untouched.** The first test for the `root` column checked `index.roots()` — the table the same sweep writes — and stayed green through a release run in which every real row's `root` was `NULL`. Split the claim when two stores are involved, and check the new assertion fails by deleting the line it covers; that is how the ordering flaw below was found at all.
 - **`IndexFile::path` is a lossy key, not a name.** Rows are keyed by `to_string_lossy()`, so for a filename whose bytes are not valid UTF-8 (legal on Linux, common in mirrored downloads) the row's own `path` opens no file. Lookups by the real path work, so such a file is read once and then reported current; what does not work is taking a search result's path and acting on it. `prune_absent_from_listing` therefore refuses to delete rows whose key contains the replacement character: two different names can share one lossy key, so the key's absence from disk proves nothing. Measured and pinned by `a_non_utf8_name_is_findable_by_the_path_but_its_row_does_not_name_a_file`. Storing paths as the OS bytes (a BLOB) is the fix, and it needs a schema version bump.
+- **Reading one file's tags from the index is slower than reading the file.** Measured on a 2 000-row index: `get` 98 µs per file, `bc_metadata::layers::read_file` 14.9 µs, the overlays' mtime-checked cache 2.3 µs per visible row per frame. Bulk is the only shape worth querying: `tag_values_for` is 1.3 µs per file in one statement. Any proposal to "put the grid onto the index" has to beat those numbers per row and cannot, and it would also give up the freshness that makes a saved star appear at once.
+- **Sidecar files are listed and indexed like any other file.** A folder of PNG or RAW assets gains one `.xmp` row per asset, so the row count is roughly double the photo count and a tag filter can hide a sidecar whose rating it inherited from the file beside it. They genuinely *are* files, so this is not a bug to patch silently — but a search UI over this index will surface them until the listing decides otherwise, and that decision has not been made.
 - **Two metadata search/index implementations.** `bc-metadata::search` projects a `Metadata` into a flat searchable record, while `bc-core::metadata_index` owns a SQLite index with its own query builder and smart-collection table. `bc-core::metadata_index` is the one auto-processing writes to. Pick one home for the query model before the smart-collection UI lands.
 - **Duplicate query spellings kept on purpose.** `bc-core::metadata_index` still accepts several field and operator spellings (`Field::Make`/`Field::CameraMake`, `Operator::Eq`/`Operator::Equals`, and `Query`'s `predicates`/`conditions`/`clauses`/`and` fields), normalized by `canonical_predicate`. They are kept because they are serialized into stored smart-collection rows; collapse them in the same change that designs the collection UI, with a migration for anything already on disk.
 - **Synonym API removed 2026-11-15.** Duplicate public aliases (`bc_core::search`/`index`/`metadata_search`/`versions` module re-exports, `bc_metadata::extract`/`projection`/`searchable`, `PublishPipeline`/`PublishJob`/`run`/`run_pipeline`, `ScriptEngine`/`AutomationHost`/`ScriptRunner`, the contact-sheet `generate_*`/`create_*`/`build_*` set, and the metadata-index `add`/`insert`/`upsert_file`/`put`/`scan*`/`lookup`/`cleanup` family) were deleted: they had no callers, no behavior, and inflated the apparent API surface of modules that are in fact unwired.
@@ -343,6 +348,70 @@ that was already tested.
 - **One flake, not explained.** `an_in_place_tag_edit_makes_the_indexed_row_stale` failed once, in the first full run after I added a two-connection concurrent-write test. It then passed 60 consecutive isolated runs, 8 full parallel runs and a single-threaded run, so the cause is not established and I am not claiming it is fixed. Its assertion now prints both fingerprints it compared, so a recurrence explains itself instead of being re-run until green.
 - **A limitation the tests found rather than I did.** Rows are keyed by `to_string_lossy()`. For a non-UTF-8 filename the lookup still works (both sides lose the same way), but `IndexedFile::path` is the key, not the name, so it opens nothing — recorded in Tech debt. It also decided the sweep's rules: such a row is never pruned, because two names can share one lossy key and the key's absence from disk proves nothing about the file.
 - **Verified against the shipped binary, not only in tests.** A release build pointed at a 6-file folder wrote 6 rows and the folder's root; a second run left every existing row's `indexed_at` untouched and added the one new file; a third run after deleting two files took the table from 7 rows to 5.
+
+### Index-backed sorting and filtering (slice 8, shipped 2026-11-17)
+
+The premise for this slice came from me and was wrong: the previous commit's
+Critical Path entry said the grid's per-row tag reads "belong in
+`bc-core::metadata_index`". Measured, an index lookup for one file costs 98 µs
+against 14.9 µs to parse the file, and the existing mtime-checked cache costs
+2.3 µs per visible row per frame. Moving the overlays onto the index would have
+made the grid slower and allowed it to show tags the user had already changed.
+The index is the right tool for a different job — ordering or filtering a whole
+folder, where you cannot avoid knowing every file's value — so that is what
+shipped, and the entry now records the numbers instead of the intention.
+
+- **A false alarm I raised and retracted.** Running the release binary against
+  a library I had generated showed every rating as 0, and I reported a
+  significant interop bug in the XMP reader. The reader was fine: **my fixture
+  was wrong**. I had retyped the RDF namespace from text rendered on screen,
+  and the date separators arrived as hyphens (`1999-02-22`) instead of soliduses
+  (`1999/02/22`), so `parse_xmp` correctly returned an empty result for a packet
+  in a namespace that does not exist. Rebuilt byte-by-byte, the same run read
+  1/3/5/0 with the right labels. Two lessons kept: verify identifiers as bytes,
+  and an assertion that a fixture "looks right" is not a test — see the new Tech
+  debt entry about a wrong namespace reading as a parser gap.
+- **A real ordering bug in the same sweep, found by the retraction.** Rows carry
+  the folder they were indexed from; I had that stamped by a range `UPDATE` at
+  the end of a pass, so a row written after the sweep kept `NULL` — the release
+  run showed three rows stamped and one not. Stamped at write time instead
+  (`index_file` uses the containing directory, which is what a non-recursive
+  pass covered for every writer including the ingest action), and the back-fill
+  function was deleted along with its caller. Rows written by an earlier build
+  keep their `NULL` folder until they are indexed again — a row that still
+  matches its file is skipped rather than rewritten — which is harmless today
+  because nothing in the interface reads the column yet, and it repairs itself
+  on the next tag edit or extractor-version bump.
+- **The test that hid it.** My first `root` assertion checked the `roots` table,
+  which a different line of the same function writes, and stayed green for the
+  whole time the column was broken. It now asserts the column too, and I checked
+  it fails when the stamping line is removed — the same verification I did for
+  supersession in the previous slice.
+- **A pre-existing interface bug fixed in passing:** the sort menu assigned
+  `browser.sort_key` directly, so choosing a different key re-labelled the menu
+  without re-ordering the folder until the direction button was also pressed.
+  Changing the key now goes through `set_sort`, which is what the direction
+  button already did.
+- **A test-suite race that my change exposed.** Two older tests built a
+  `BridgeApp` without holding `STORE_ENV_LOCK`, and since folder open now
+  resolves the index path, an indexing test could read whichever `HOME` another
+  thread had set. Their fixtures landed in another test's directory — and, in a
+  fresh process, the developer's real one: `/tmp/opencode/*` paths appeared in a
+  real `recents.json`, which is what made me look. Isolation is now
+  compile-enforced: the helpers take the guard as an argument, so a test cannot
+  isolate without holding it.
+- **One design question settled by consistency rather than guesswork.** Whether
+  a descending tag sort also reverses its name tie-break: it does, because that
+  is what `Desc` already means for name and size. My first test asserted the
+  opposite on an assumption, and the code was the more coherent answer. The
+  label ordering is alphabetical with unlabeled last rather than the eight chip
+  names, because those are an identity list and no Bridge behaviour for label
+  ordering has been verified.
+- **Framework limits learned the hard way.** A frame drawn 60 px tall clipped
+  the sort menu, so a new test reported two missing keys that a real user can
+  see; and an egui menu closes when the frame following its click carries no
+  pointer, so the toolbar helpers now rest the cursor where a hand would be.
+  Both were bugs in my tests, not in the app.
 
 ### Documentation corrected against the code on `main` (no behavior changes)
 

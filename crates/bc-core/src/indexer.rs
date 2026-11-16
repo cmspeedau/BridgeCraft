@@ -115,6 +115,9 @@ pub fn index_one(index: &MetadataIndex, path: &Path, cancel: &AtomicBool) -> Ind
 /// was cancelled, since the folder has been indexed as of now and pruning is
 /// correct either way.
 pub fn sweep_folder(index: &MetadataIndex, root: &Path, listed: &[PathBuf]) -> Result<usize> {
+    // The `roots` table records the folder as covered; each row already
+    // carries the folder it was written from, so nothing here has to go back
+    // and stamp the rows.
     index.add_root(root)?;
     index.prune_absent_from_listing(root, listed)
 }
@@ -385,19 +388,80 @@ mod tests {
     }
 
     #[test]
-    fn a_pass_records_the_folder_it_covered() {
+    fn a_pass_records_the_folder_it_covered_in_the_rows_and_the_table() {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path();
+        let file = jpeg(dir, "one.jpg");
         let index = index_in(dir);
         let queue = JobQueue::new(1);
-        let job = queue.submit_index(dir, vec![jpeg(dir, "one.jpg")], Arc::clone(&index));
+        let job = queue.submit_index(dir, vec![file.clone()], Arc::clone(&index));
         run(&queue, job.id);
-        // What is asserted here is the *write*. `roots()` has no reader in the
-        // interface yet, which is named in the roadmap rather than assumed
-        // away by a test that pretends otherwise.
+
+        // Two separate claims, checked separately. An earlier version of this
+        // test asserted only the table, so a pass that recorded the folder but
+        // never stamped its rows passed green while the column stayed `NULL`.
         assert!(
             index.roots().unwrap().contains(&dir.to_path_buf()),
             "the pass never recorded the folder it indexed"
+        );
+        let row = index.get(&file).unwrap().expect("row written");
+        assert_eq!(
+            row.root.as_deref(),
+            Some(dir),
+            "the row does not say which folder was indexed"
+        );
+    }
+
+    #[test]
+    fn a_current_row_is_left_alone_rather_than_polished() {
+        // Skipping is not a no-op with a safety net behind it. A row that still
+        // matches its file is never rewritten, so anything about that row that
+        // an older build left unset stays unset until the file itself changes.
+        // This is the behaviour the roadmap records for the `root` column, and
+        // it is worth a test because the alternative — a pass that rewrites
+        // every row to fix one column — would read every file in the library on
+        // every folder open.
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        let file = jpeg(dir, "steady.jpg");
+        let database = dir.join("metadata.sqlite");
+        let index = Arc::new(MetadataIndex::open(&database).unwrap());
+        let queue = JobQueue::new(1);
+
+        let first = queue.submit_index(dir, vec![file.clone()], Arc::clone(&index));
+        assert_eq!(run(&queue, first.id).completed, 1);
+        assert_eq!(
+            index.get(&file).unwrap().unwrap().root.as_deref(),
+            Some(dir),
+            "a fresh row should name the folder it came from"
+        );
+
+        // Blank it the way an earlier build's row would look.
+        let conn = rusqlite::Connection::open(&database).unwrap();
+        conn.execute(
+            "UPDATE files SET root = NULL WHERE path = ?1",
+            rusqlite::params![file.to_string_lossy()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let again = queue.submit_index(dir, vec![file.clone()], Arc::clone(&index));
+        let snap = run(&queue, again.id);
+        assert_eq!(snap.skipped, 1, "the row was re-read, not skipped");
+        assert!(
+            index.get(&file).unwrap().unwrap().root.is_none(),
+            "a skipped row was rewritten, which contradicts what the roadmap says \
+             an old NULL repairs itself by"
+        );
+
+        // Change the file and the same pass rewrites it, folder included.
+        std::fs::write(&file, b"pixels differ").unwrap();
+        let third = queue.submit_index(dir, vec![file.clone()], Arc::clone(&index));
+        assert_eq!(run(&queue, third.id).completed, 1);
+        assert_eq!(
+            index.get(&file).unwrap().unwrap().root.as_deref(),
+            Some(dir),
+            "a rewritten row lost the folder stamp"
         );
     }
 

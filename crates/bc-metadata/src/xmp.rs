@@ -702,6 +702,40 @@ mod tests {
     }
 
     #[test]
+    fn reads_a_sidecar_that_carries_only_attributes_on_a_self_closing_description() {
+        // The shape other tools reach for when a file has simple properties
+        // and nothing complex: one `rdf:Description`, self-closing, every
+        // property an attribute. No other test in this module uses that shape,
+        // and it fails in a way that is easy to misread: a packet whose RDF
+        // namespace is misspelled parses as *empty* rather than as an error,
+        // which looks exactly like a parser that cannot handle attributes.
+        let xml = concat!(
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">",
+            "<rdf:RDF xmlns:rdf=\"http://www.w3.org/",
+            "1999/02/22-rdf-syntax-ns#\">",
+            "<rdf:Description rdf:about=\"\"",
+            " xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\"",
+            " xmlns:photoshop=\"http://ns.adobe.com/photoshop/1.0/\"",
+            " xmp:Rating=\"4\"",
+            " photoshop:Label=\"Red\"/>",
+            "</rdf:RDF></x:xmpmeta>",
+        );
+        // Spelled out rather than pasted, because the character that was wrong
+        // in this test's first draft is invisible in most renderings.
+        assert!(
+            xml.contains("1999/02/22-rdf-syntax-ns#"),
+            "the RDF namespace separates its date with soliduses"
+        );
+        let m = parse_xmp(xml.as_bytes()).unwrap();
+        assert_eq!(m.rating().stars(), 4, "attribute form lost its rating");
+        assert_eq!(
+            m.color_label(),
+            crate::ratings::ColorLabel::Red,
+            "attribute form lost its label"
+        );
+    }
+
+    #[test]
     fn parse_sample_xmp() {
         let xml = r#"<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/">
