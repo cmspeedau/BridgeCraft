@@ -279,15 +279,11 @@ impl SearchScope {
     }
 }
 
-/// The version of the document stored in `smart_collections.query_json`.
-///
-/// This column used to hold a bare `Query` and the `version` column was
-/// hardcoded to 1 by the writer and never read by anything. No code ever called
-/// that writer, so there are no such rows in the world and the document shape
-/// below is version 1 of something new rather than version 2 of something old.
-pub const COLLECTION_DOCUMENT_VERSION: u32 = 1;
-
 /// A search a user chose to keep: the rules to match, and where to look.
+///
+/// Encoding and versioning belong to the store that persists this
+/// (`crate::saved_searches`), not here: keeping the JSON shape in one place is
+/// what stops a writer and a reader disagreeing about the same file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SavedSearch {
     pub query: Query,
@@ -295,15 +291,6 @@ pub struct SavedSearch {
 }
 
 impl SavedSearch {
-    fn from_json(json: &str) -> Result<Self, String> {
-        serde_json::from_str(json)
-            .map_err(|e| format!("the stored definition could not be read: {e}"))
-    }
-
-    fn to_json(&self) -> Result<String, String> {
-        serde_json::to_string(self).map_err(|e| format!("the definition could not be stored: {e}"))
-    }
-
     /// The words a saved search is made of, for the search box. Empty when the
     /// rules are richer than words — a collection with a rating rule has no
     /// honest text to put in a field that claims to be what was typed.
@@ -333,29 +320,6 @@ fn text_words(query: &Query) -> Vec<String> {
             _ => None,
         })
         .collect()
-}
-
-/// A collection as it came out of the database: the name and version always
-/// read, the definition only if it parses. `definition` being an `Err` is a
-/// state the interface has to show, not one to hide — see `collections()`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct LoadedCollection {
-    pub name: String,
-    pub version: u32,
-    pub definition: Result<SavedSearch, String>,
-}
-
-impl LoadedCollection {
-    /// What the collection will ask for, so two saved searches are
-    /// distinguishable in the sidebar without running either. Delegates rather
-    /// than restating the rule: the sentence and the box contents belong to the
-    /// definition, not to the row it was read from.
-    pub fn summary(&self) -> String {
-        match &self.definition {
-            Ok(search) => search.summary(),
-            Err(_) => "unreadable definition".to_string(),
-        }
-    }
 }
 
 /// The shortest honest sentence about a query and its scope.
@@ -555,11 +519,6 @@ impl MetadataIndex {
                 keyword TEXT NOT NULL,
                 PRIMARY KEY (path, keyword),
                 FOREIGN KEY (path) REFERENCES files (path) ON DELETE CASCADE
-             );
-             CREATE TABLE IF NOT EXISTS smart_collections (
-                name TEXT PRIMARY KEY,
-                version INTEGER NOT NULL,
-                query_json TEXT NOT NULL
              );",
         )
         .map_err(|e| crate::CoreError::InvalidOperation(e.to_string()))?;
@@ -900,103 +859,6 @@ impl MetadataIndex {
             pending: 0,
             indexing: false,
         }
-    }
-
-    // -- saved collections --
-
-    /// Store one collection. `name` is the key: saving an existing name
-    /// replaces that collection rather than creating a second one beside it,
-    /// which is what the user asking to "save this search" again means.
-    pub fn save_collection(&self, name: &str, search: &SavedSearch) -> crate::Result<()> {
-        if name.trim().is_empty() {
-            return Err(crate::CoreError::InvalidOperation(
-                "a collection needs a name".to_string(),
-            ));
-        }
-        // Encode and decode live on the type, so the shape written and the
-        // shape read back cannot drift apart inside one function pair.
-        let json = search
-            .to_json()
-            .map_err(|e| crate::CoreError::InvalidOperation(e.to_string()))?;
-        let conn = self.lock();
-        conn.execute(
-            "INSERT INTO smart_collections (name, version, query_json) VALUES (?1, ?2, ?3)
-             ON CONFLICT(name) DO UPDATE SET version=excluded.version, query_json=excluded.query_json",
-            params![name, COLLECTION_DOCUMENT_VERSION as i64, json],
-        )
-        .map_err(|e| crate::CoreError::InvalidOperation(e.to_string()))?;
-        Ok(())
-    }
-
-    /// Every stored collection, in name order.
-    ///
-    /// Ordered, because this list is shown in the sidebar: an unordered `SELECT`
-    /// let SQLite return rows in whatever order the b-tree felt like, so the
-    /// user's collections could shuffle between two looks at the same panel.
-    ///
-    /// A definition that will not parse comes back as a *named failure* rather
-    /// than being skipped. The previous version filtered rows through
-    /// `if let Ok(...)`, which meant a damaged collection disappeared from the
-    /// interface entirely — indistinguishable from the user having deleted it,
-    /// and with no way to find out what happened to it.
-    pub fn collections(&self) -> crate::Result<Vec<LoadedCollection>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare("SELECT name, version, query_json FROM smart_collections ORDER BY name")
-            .map_err(|e| crate::CoreError::InvalidOperation(e.to_string()))?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)? as u32,
-                    row.get::<_, String>(2)?,
-                ))
-            })
-            .map_err(|e| crate::CoreError::InvalidOperation(e.to_string()))?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (name, version, json) =
-                row.map_err(|e| crate::CoreError::InvalidOperation(e.to_string()))?;
-            out.push(LoadedCollection {
-                name,
-                version,
-                definition: SavedSearch::from_json(&json),
-            });
-        }
-        Ok(out)
-    }
-
-    pub fn delete_collection(&self, name: &str) -> crate::Result<()> {
-        let conn = self.lock();
-        let removed = conn
-            .execute(
-                "DELETE FROM smart_collections WHERE name = ?1",
-                params![name],
-            )
-            .map_err(|e| crate::CoreError::InvalidOperation(e.to_string()))?;
-        if removed == 0 {
-            // Report it: the interface offers a delete for a name the user can
-            // see, and silently succeeding against nothing would hide a list
-            // that had already lost the row.
-            return Err(crate::CoreError::PathNotFound(name.to_string()));
-        }
-        Ok(())
-    }
-
-    /// Run a stored collection and return the rows it matches, honouring the
-    /// scope the collection was saved with — a search of one folder stays a
-    /// search of that folder when it is reopened a month later, rather than
-    /// silently widening to the library.
-    pub fn collection_rows(&self, name: &str) -> crate::Result<Vec<IndexedFile>> {
-        let collection = self
-            .collections()?
-            .into_iter()
-            .find(|c| c.name == name)
-            .ok_or_else(|| crate::CoreError::PathNotFound(name.to_string()))?;
-        let search = collection.definition.map_err(|reason| {
-            crate::CoreError::InvalidOperation(format!("saved collection “{name}”: {reason}"))
-        })?;
-        self.search(&search.query, &search.scope)
     }
 }
 
@@ -1657,203 +1519,39 @@ mod tests {
         );
     }
 
-    fn saved(query: Query, scope: SearchScope) -> SavedSearch {
-        SavedSearch { query, scope }
-    }
-
     #[test]
-    fn a_saved_collection_round_trips_its_rules_and_its_scope() {
+    fn a_summary_says_what_a_set_of_rules_will_ask_for() {
+        // The sentence the sidebar shows. Tested on the type rather than
+        // through a store, because what the rules mean is the query model's
+        // business; where they are kept is `crate::saved_searches`.
         let dir = tempfile::tempdir().unwrap();
-        let inner = dir.path().join("x");
-        std::fs::create_dir_all(&inner).unwrap();
-        let idx = MetadataIndex::open_in_memory().unwrap();
-        rich(&idx, &inner, "a.jpg", 4, "Canon", "beach", &[]);
-        let search = saved(Query::text("beach"), SearchScope::Folder(inner.clone()));
-        idx.save_collection("beach shots", &search).unwrap();
-
-        let stored = idx.collections().unwrap();
-        assert_eq!(stored.len(), 1);
-        assert_eq!(
-            stored[0].definition.as_ref().ok(),
-            Some(&search),
-            "the stored document is not the one saved"
-        );
-        assert_eq!(
-            stored[0].version, COLLECTION_DOCUMENT_VERSION,
-            "the version column still says nothing about the shape stored"
-        );
-        let rows = idx.collection_rows("beach shots").unwrap();
-        assert_eq!(rows.len(), 1, "{rows:?}");
-    }
-
-    #[test]
-    fn a_collection_reopens_with_the_scope_it_was_saved_with() {
-        // The point of storing the scope: a saved search of one folder is not
-        // quietly widened into a library search when it is reopened.
-        let dir = tempfile::tempdir().unwrap();
-        let inside = dir.path().join("inside");
-        let other = dir.path().join("other");
-        std::fs::create_dir_all(&inside).unwrap();
-        std::fs::create_dir_all(&other).unwrap();
-        let idx = MetadataIndex::open_in_memory().unwrap();
-        let here = rich(&idx, &inside, "a.jpg", 4, "Canon", "beach", &[]);
-        let there = rich(&idx, &other, "b.jpg", 4, "Canon", "beach", &[]);
-
-        idx.save_collection(
-            "folder only",
-            &saved(Query::text("beach"), SearchScope::Folder(inside.clone())),
-        )
-        .unwrap();
-        let names: Vec<String> = idx
-            .collection_rows("folder only")
-            .unwrap()
-            .iter()
-            .map(|r| r.path.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(names, vec!["a.jpg".to_string()], "{names:?}");
-        assert_ne!(here, there);
-
-        // And the same rules, saved with the library scope, do reach both.
-        idx.save_collection(
-            "everywhere",
-            &saved(Query::text("beach"), SearchScope::Library),
-        )
-        .unwrap();
-        assert_eq!(idx.collection_rows("everywhere").unwrap().len(), 2);
-    }
-
-    #[test]
-    fn collections_are_listed_in_a_stable_order() {
-        // The sidebar shows this list. Without ORDER BY the database could
-        // return rows in whatever order suited it, so the user's collections
-        // could shuffle between two looks at the same panel.
-        let idx = MetadataIndex::open_in_memory().unwrap();
-        for name in ["zebra", "alpha", "mango"] {
-            idx.save_collection(name, &saved(Query::text(name), SearchScope::Library))
-                .unwrap();
-        }
-        let listed: Vec<String> = idx
-            .collections()
-            .unwrap()
-            .iter()
-            .map(|c| c.name.clone())
-            .collect();
-        assert_eq!(listed, vec!["alpha", "mango", "zebra"]);
-    }
-
-    #[test]
-    fn an_unreadable_definition_is_reported_rather_than_dropped() {
-        // The behaviour this replaces: rows that failed to parse were skipped
-        // inside `smart_collections()`, so a damaged collection vanished from
-        // the interface with no trace — indistinguishable from the user having
-        // deleted it.
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("metadata.sqlite");
-        let idx = MetadataIndex::open(&db).unwrap();
-        idx.save_collection("kept", &saved(Query::text("sunset"), SearchScope::Library))
-            .unwrap();
-        {
-            let conn = rusqlite::Connection::open(&db).unwrap();
-            conn.execute(
-                r#"UPDATE smart_collections SET query_json = '{"not":"a saved search"}' WHERE name = 'kept'"#,
-                [],
-            )
-            .unwrap();
-        }
-
-        let listed = idx.collections().unwrap();
-        assert_eq!(listed.len(), 1, "the collection vanished from the list");
-        assert!(
-            listed[0].definition.is_err(),
-            "the damaged definition parsed, which is the other bug"
-        );
-        assert_eq!(listed[0].summary(), "unreadable definition");
-        let error = idx.collection_rows("kept").unwrap_err().to_string();
-        assert!(
-            error.contains("could not be read"),
-            "running it must explain why not: {error}"
-        );
-    }
-
-    #[test]
-    fn saving_a_name_twice_replaces_that_collection() {
-        let dir = tempfile::tempdir().unwrap();
-        let inner = dir.path().join("x");
-        std::fs::create_dir_all(&inner).unwrap();
-        let idx = MetadataIndex::open_in_memory().unwrap();
-        let sunset = rich(&idx, &inner, "sunset.jpg", 1, "Canon", "sunset", &[]);
-        let _pines = rich(&idx, &inner, "pines.jpg", 2, "Nikon", "pines", &[]);
-
-        idx.save_collection("trip", &saved(Query::text("pines"), SearchScope::Library))
-            .unwrap();
-        idx.save_collection("trip", &saved(Query::text("sunset"), SearchScope::Library))
-            .unwrap();
-
-        let listed = idx.collections().unwrap();
-        assert_eq!(listed.len(), 1, "saving the same name made a second one");
-        let names: Vec<String> = idx
-            .collection_rows("trip")
-            .unwrap()
-            .iter()
-            .map(|r| r.path.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(names, vec!["sunset.jpg".to_string()], "{sunset:?}");
-    }
-
-    #[test]
-    fn deleting_a_collection_removes_it_and_says_when_it_was_already_gone() {
-        let idx = MetadataIndex::open_in_memory().unwrap();
-        idx.save_collection("gone soon", &saved(Query::text("x"), SearchScope::Library))
-            .unwrap();
-        idx.delete_collection("gone soon").unwrap();
-        assert!(idx.collections().unwrap().is_empty());
-
-        // A delete that matched no row is reported: the interface offers the
-        // button against a name it can see, and a silent success would hide a
-        // list that had already lost the entry.
-        let error = idx.delete_collection("gone soon").unwrap_err().to_string();
-        assert!(error.contains("gone soon"), "{error}");
-    }
-
-    #[test]
-    fn a_collection_needs_a_name() {
-        let idx = MetadataIndex::open_in_memory().unwrap();
-        for blank in ["", "   "] {
-            let error = idx
-                .save_collection(blank, &saved(Query::text("x"), SearchScope::Library))
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains("needs a name"), "{error} for {blank:?}");
-        }
-        assert!(
-            idx.collections().unwrap().is_empty(),
-            "a blank row was written anyway"
-        );
-    }
-
-    #[test]
-    fn a_summary_says_what_the_collection_will_ask_for() {
-        // Two saved searches must be tellible apart in the sidebar without
-        // running either.
-        let dir = tempfile::tempdir().unwrap();
-        let idx = MetadataIndex::open_in_memory().unwrap();
-        let query = Query::text("red shoes");
-        idx.save_collection(
-            "words",
-            &saved(
-                query,
-                SearchScope::FolderAndSubfolders(dir.path().to_path_buf()),
-            ),
-        )
-        .unwrap();
-        let listed = idx.collections().unwrap();
-        let summary = listed[0].summary();
+        let search = SavedSearch {
+            query: Query::text("red shoes"),
+            scope: SearchScope::FolderAndSubfolders(dir.path().to_path_buf()),
+        };
+        let summary = search.summary();
         assert!(summary.contains("red shoes"), "{summary}");
         assert!(summary.contains("under"), "{summary}");
         assert!(
             summary.contains(&dir.path().display().to_string()),
             "{summary}"
         );
+
+        // Rules that are not words are described by their count, not faked as
+        // an empty search.
+        let rules = SavedSearch {
+            query: Query::single(Predicate {
+                field: Field::Rating,
+                operator: Operator::GreaterThan,
+                value: Some(QueryValue::Integer(2)),
+            }),
+            scope: SearchScope::Library,
+        };
+        assert_eq!(rules.summary(), "1 rule(s) in the library");
+
+        // And the box only ever mirrors a words-only rule set.
+        assert_eq!(search.box_text(), "red shoes");
+        assert_eq!(rules.box_text(), "");
     }
 
     #[test]
@@ -2190,20 +1888,27 @@ mod tests {
     }
 
     #[test]
-    fn smart_collection_roundtrip() {
+    fn a_rating_rule_is_evaluated_by_the_reader_not_the_storage() {
+        // The rules themselves are the query model's business; where a
+        // collection is *kept* is the store's. This keeps coverage of a numeric
+        // rule against a reader after the storage moved out of this file.
         let idx = MetadataIndex::open_in_memory().unwrap();
         let q = Query::single(Predicate {
             field: Field::Rating,
             operator: Operator::GreaterThan,
             value: Some(QueryValue::Integer(2)),
         });
-        idx.save_collection("high", &saved(q.clone(), SearchScope::Library))
-            .unwrap();
-        let cols = idx.collections().unwrap();
-        assert_eq!(cols.len(), 1);
-        assert_eq!(cols[0].name, "high");
-        // A rule the empty index cannot satisfy returns nothing, not an error.
-        assert!(idx.collection_rows("high").unwrap().is_empty());
+        assert!(idx.search(&q, &SearchScope::Library).unwrap().is_empty());
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("rated.jpg");
+        std::fs::write(&file, b"x").unwrap();
+        let mut tags = bc_metadata::Metadata::new();
+        tags.set_rating(bc_metadata::ratings::Rating::new(4));
+        idx.index_file(&file, &tags).unwrap();
+        let matched = idx.search(&q, &SearchScope::Library).unwrap();
+        assert_eq!(matched.len(), 1, "a four-star file missed a >2 rule");
+        assert_eq!(matched[0].rating, 4);
     }
     #[test]
     fn same_size_edits_reuse_the_timestamp_and_a_reindex_covers_them() {

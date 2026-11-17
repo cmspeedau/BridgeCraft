@@ -409,11 +409,18 @@ pub struct BridgeApp {
     /// Saved searches, as last read from the index. Refreshed when the tab is
     /// opened and after every save or delete, so the list cannot show a
     /// collection that no longer exists — or hide one that does.
-    collections: Vec<bc_core::LoadedCollection>,
+    /// The user's saved searches, as read from their own file. Held as a
+    /// `Vec` copy for drawing and owned by `saved_store` for writing, so the
+    /// panel never reads the file per frame and never writes blind.
+    collections: Vec<bc_core::NamedSearch>,
+    /// The store itself, opened on first use. `None` with
+    /// `saved_store_error` set is the state where the file exists but cannot
+    /// be understood: the panel says so, and nothing overwrites it.
+    saved_store: Option<bc_core::SavedSearches>,
+    saved_store_error: Option<String>,
     /// Which tab the last drawn sidebar showed, so entering Collections is an
     /// event that can be detected instead of a query to repeat every frame.
     sidebar_tab_shown: SidebarTab,
-    collections_error: Option<String>,
     /// The name being typed in the Collections panel.
     collection_name: String,
     bulk_rating_enabled: bool,
@@ -459,7 +466,21 @@ pub struct BridgeApp {
 }
 
 impl BridgeApp {
-    pub fn new(ctx: &egui::Context, root: Option<String>, cache_path: Option<PathBuf>) -> Self {
+    pub fn new(ctx: &egui::Context, root: Option<String>) -> Self {
+        // The cache path is resolved here, from the one definition in
+        // `bc_core::paths`, rather than handed in. A caller that derived it
+        // from the working directory was the bug this closes: a bundled `.app`
+        // or a read-only AppImage has no writable directory to put a
+        // gigabyte-scale cache in. A failure to resolve the data directory
+        // leaves the app running without a cache, which costs regeneration and
+        // nothing else.
+        let cache_path = match bc_core::paths::thumbnail_cache_path() {
+            Ok(path) => Some(path),
+            Err(error) => {
+                tracing::warn!("thumbnail cache disabled: {error}");
+                None
+            }
+        };
         let (job_tx, job_rx) = channel::<ThumbJob>();
         let (res_tx, res_rx) = channel::<ThumbResult>();
         spawn_thumb_worker(cache_path.clone(), job_rx, res_tx);
@@ -544,8 +565,9 @@ impl BridgeApp {
             search_scope_total: 0,
             search_scope_unindexed: 0,
             collections: Vec::new(),
+            saved_store: None,
+            saved_store_error: None,
             sidebar_tab_shown: SidebarTab::default(),
-            collections_error: None,
             collection_name: String::new(),
             bulk_rating_enabled: false,
             bulk_label_enabled: false,
@@ -882,17 +904,11 @@ impl BridgeApp {
 
     /// Saved searches: list, run, delete, and save what is on screen.
     fn collections_panel(&mut self, ui: &mut egui::Ui) {
-        if self.index.is_none() && self.index_error.is_some() {
-            ui.weak(
-                "Collections are stored in the metadata index, which is offline. Fix that \
-                 first: saving a search that cannot be read back is not a feature.",
-            );
-            return;
-        }
-        if self.index.is_none() {
-            ui.weak("Open a folder to start the index.");
-            return;
-        }
+        // Nothing here needs the metadata index any more. The definitions are
+        // their own file precisely because the index is a cache, so an offline
+        // index costs *running* a search and not keeping one; the list and the
+        // save control stay available and say so where it matters.
+        let store_unreadable = self.saved_store_error.is_some();
 
         // Save what the grid is currently showing.
         let showing = self.browser.search().is_some();
@@ -926,12 +942,22 @@ impl BridgeApp {
                 "Store these rules and this scope under the name above."
             };
             let entered = name_field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            // Disabled rather than silently refused: pressing "Save" into an
+            // unreadable file must never look like it worked.
+            let can_save = showing && !typed.is_empty() && !store_unreadable;
             let clicked = ui
-                .add_enabled_ui(showing && !typed.is_empty(), |ui| {
-                    ui.button(&button_label).on_hover_text(hover).clicked()
+                .add_enabled_ui(can_save, |ui| {
+                    ui.button(&button_label)
+                        .on_hover_text(if store_unreadable {
+                            "The saved-search file cannot be read, so nothing will be written \
+                             over it."
+                        } else {
+                            hover
+                        })
+                        .clicked()
                 })
                 .inner;
-            if clicked || (entered && showing && !typed.is_empty()) {
+            if clicked || (entered && can_save) {
                 self.save_current_collection();
             }
             if !showing {
@@ -940,10 +966,12 @@ impl BridgeApp {
         });
         ui.separator();
 
-        if let Some(error) = &self.collections_error {
+        if let Some(error) = &self.saved_store_error {
+            // The wording a user can act on: the file is named, and the reason
+            // is the parser's own, not a shrug.
             ui.colored_label(
                 egui::Color32::from_rgb(220, 120, 120),
-                format!("Collections unavailable: {error}"),
+                format!("Saved searches unavailable: {error}"),
             );
             return;
         }
@@ -961,7 +989,7 @@ impl BridgeApp {
                     let hover = if running {
                         "This is the collection on screen.".to_string()
                     } else {
-                        format!("Run: {}", entry.summary())
+                        format!("Run: {}", entry.search.summary())
                     };
                     if ui
                         .selectable_label(running, &entry.name)
@@ -979,44 +1007,48 @@ impl BridgeApp {
                     }
                 });
                 ui.add(
-                    egui::Label::new(egui::RichText::new(entry.summary()).weak().small())
+                    egui::Label::new(egui::RichText::new(entry.search.summary()).weak().small())
                         .selectable(false)
                         .truncate(true),
                 );
-                if entry.definition.is_err() {
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(
-                                "This definition cannot be read; running it will explain why.",
-                            )
-                            .weak()
-                            .small(),
-                        )
-                        .selectable(false),
-                    );
-                }
             }
         });
     }
 
-    /// Re-read the saved collections. Failures here are shown, never swallowed:
-    /// a panel that silently listed nothing would look like the user's
-    /// collections had gone.
+    /// Open the saved-search store, or explain why it cannot be opened.
+    ///
+    /// A file that will not parse is left alone and reported. That is the whole
+    /// reason these moved out of the metadata index: the index is a cache that
+    /// may be rebuilt at any time, while this file holds work nothing else has.
+    /// Overwriting an unreadable version of it on the next unrelated save would
+    /// turn one bad byte into every collection the user ever named.
+    fn saved_store(&mut self) -> Option<&mut bc_core::SavedSearches> {
+        if self.saved_store.is_some() {
+            return self.saved_store.as_mut();
+        }
+        match bc_core::SavedSearches::open_default() {
+            Ok(store) => {
+                self.saved_store_error = None;
+                self.saved_store = Some(store);
+                self.saved_store.as_mut()
+            }
+            Err(error) => {
+                self.saved_store_error = Some(error.to_string());
+                self.saved_store = None;
+                None
+            }
+        }
+    }
+
+    /// Re-read the saved searches. Failures are shown, never swallowed: a panel
+    /// that silently listed nothing would look like the user's collections had
+    /// gone.
     fn refresh_collections(&mut self) {
-        let Some(index) = self.index.as_ref() else {
+        let Some(store) = self.saved_store() else {
             self.collections.clear();
             return;
         };
-        match index.collections() {
-            Ok(listed) => {
-                self.collections = listed;
-                self.collections_error = None;
-            }
-            Err(error) => {
-                self.collections_error = Some(error.to_string());
-                self.collections.clear();
-            }
-        }
+        self.collections = store.list().to_vec();
     }
 
     /// Store the rules and scope the grid is showing under a name.
@@ -1038,16 +1070,21 @@ impl BridgeApp {
             self.status = "A collection needs a name.".to_string();
             return;
         }
-        let Some(index) = self.index.clone() else {
-            self.status = "Collections need the metadata index, which is offline.".to_string();
-            return;
+        let search = bc_core::SavedSearch { query, scope };
+        // The store borrow ends here: everything below writes through `self`,
+        // and a held `&mut` store would make that a borrow conflict on the
+        // happy path.
+        let outcome = match self.saved_store() {
+            Some(store) => store
+                .save(&name, &search)
+                .map_err(|error| error.to_string()),
+            None => Err(self
+                .saved_store_error
+                .clone()
+                .unwrap_or_else(|| "the saved-search file could not be opened".to_string())),
         };
-        let search = bc_core::SavedSearch {
-            query: query.clone(),
-            scope: scope.clone(),
-        };
-        match index.save_collection(&name, &search) {
-            Ok(()) => {
+        match outcome {
+            Ok(replaced) => {
                 self.refresh_collections();
                 self.collection_name.clear();
                 // Nothing is re-run and no rows are dropped: the grid already
@@ -1055,31 +1092,34 @@ impl BridgeApp {
                 // labelled. A second save then offers to replace it, and the
                 // status line can name what the user is looking at.
                 self.browser.name_collection(&name);
-                self.status = format!("Saved collection “{name}” ({})", search.summary());
+                // Naming a replacement matters: saving over "trip" quietly is
+                // how a user loses the rules they meant to keep.
+                let verb = if replaced { "Replaced" } else { "Saved" };
+                self.status = format!("{verb} collection “{name}” ({})", search.summary());
             }
-            Err(error) => self.status = format!("Could not save “{name}”: {error}"),
+            Err(reason) => self.status = format!("Could not save “{name}”: {reason}"),
         }
     }
 
     /// Run a saved collection through the same worker a typed search uses.
     fn run_collection(&mut self, name: &str) {
+        // The definition comes from the list the user clicked, not from the
+        // store again: if the two ever disagreed, running what is on screen is
+        // the behaviour the click promises.
         let Some(entry) = self.collections.iter().find(|c| c.name == name) else {
             self.status = format!("“{name}” is no longer in the list.");
             self.refresh_collections();
             return;
         };
-        let Ok(search) = entry.definition.clone() else {
-            let reason = entry
-                .definition
-                .as_ref()
-                .err()
-                .cloned()
-                .unwrap_or_else(|| "unreadable".to_string());
-            self.status = format!("Collection “{name}” cannot run: {reason}");
-            return;
-        };
+        let search = entry.search.clone();
         let Some(index) = self.index.clone() else {
-            self.status = "Collections need the metadata index, which is offline.".to_string();
+            // Searching needs the index; the saved definition does not live
+            // there any more, so this is a different failure from the store
+            // being unreadable and gets its own words.
+            self.status = format!(
+                "Cannot run “{name}”: the metadata index is offline. {}",
+                self.index_error.as_deref().unwrap_or("")
+            );
             return;
         };
         // The box mirrors the collection's words when it can, so what the user
@@ -1104,12 +1144,17 @@ impl BridgeApp {
     }
 
     fn delete_collection(&mut self, name: &str) {
-        let Some(index) = self.index.clone() else {
-            self.status = "Collections need the metadata index, which is offline.".to_string();
-            return;
+        // Nothing else may hold the store while these lines run, so the
+        // outcome is decided first and reported after.
+        let outcome = match self.saved_store() {
+            Some(store) => store.remove(name).map_err(|error| error.to_string()),
+            None => Err(self
+                .saved_store_error
+                .clone()
+                .unwrap_or_else(|| "the saved-search file could not be opened".to_string())),
         };
-        match index.delete_collection(name) {
-            Ok(()) => {
+        match outcome {
+            Ok(true) => {
                 // If the deleted one is on screen, its rows stay until the user
                 // moves on: the grid is the answer to a query that has already
                 // run, and pulling the floor out from under a selection would
@@ -1117,8 +1162,14 @@ impl BridgeApp {
                 self.refresh_collections();
                 self.status = format!("Deleted collection “{name}”. No files were touched.");
             }
-            Err(error) => {
-                self.status = format!("Could not delete “{name}”: {error}");
+            Ok(false) => {
+                // The list the user clicked was stale, so re-read it rather
+                // than let them click a name that no longer exists again.
+                self.refresh_collections();
+                self.status = format!("“{name}” was already gone; the list has been re-read.");
+            }
+            Err(reason) => {
+                self.status = format!("Could not delete “{name}”: {reason}");
                 self.refresh_collections();
             }
         }
@@ -5441,7 +5492,7 @@ mod tests {
         stores: &std::sync::MutexGuard<'static, ()>,
     ) -> BridgeApp {
         isolated_env(isolated, stores);
-        BridgeApp::new(ctx, Some(root.display().to_string()), None)
+        BridgeApp::new(ctx, Some(root.display().to_string()))
     }
 
     fn png(dir: &Path, name: &str) -> PathBuf {
@@ -5818,14 +5869,12 @@ mod tests {
     }
 
     #[test]
-    fn a_damaged_collection_stays_in_the_list_and_explains_why_it_cannot_run() {
-        // Two halves, tested where each belongs. That a stored definition can
-        // arrive unreadable is proven against the real database in
-        // `bc-core`'s `an_unreadable_definition_is_reported_rather_than_dropped`
-        // — bc-ui has no SQLite dependency and is not getting one to corrupt a
-        // row from a test. What is tested here is the interface's half: the
-        // entry stays visible, says what is wrong, and running it changes
-        // nothing on screen.
+    fn an_unreadable_saved_search_file_is_reported_and_never_overwritten() {
+        // This is the reason the definitions live in their own file instead of
+        // in the metadata index. The index is a cache: losing rows in it costs
+        // a re-scan. This file holds only what the user named, so a store that
+        // cannot be read has to be said out loud, refuse to save over itself,
+        // and leave the file exactly as it was for someone to repair.
         let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempfile::tempdir().unwrap();
         let data = temp.path().join("data");
@@ -5839,48 +5888,36 @@ mod tests {
         app.search_text = "one".to_string();
         app.request_search();
         finish_search(&mut app, &ctx);
-        let running_before = result_names(&app);
 
-        // Enter the tab and let its refresh run first, then install the
-        // damaged row: refreshing on entry is the design, and it would
-        // otherwise wipe the very state this test is about.
+        let file = data
+            .join("data")
+            .join("BridgeCraft")
+            .join("saved-searches.json");
+        std::fs::write(&file, b"{ this is not json").unwrap();
+        let before = std::fs::read(&file).unwrap();
+
+        // Enter the tab, which is where the store is read.
         app.sidebar_tab = SidebarTab::Collections;
-        let _ = sidebar_text(&mut app, &ctx);
-        app.collections = vec![bc_core::LoadedCollection {
-            name: "broken".to_string(),
-            version: bc_core::COLLECTION_DOCUMENT_VERSION,
-            definition: Err("the stored definition could not be read: expected value".to_string()),
-        }];
-
-        assert_eq!(app.collections[0].summary(), "unreadable definition");
-        app.run_collection("broken");
+        let drawn = sidebar_text(&mut app, &ctx);
+        let texts: Vec<&str> = drawn.iter().map(|(t, _)| t.as_str()).collect();
         assert!(
-            app.status.contains("cannot run"),
-            "running a damaged collection must say why: {}",
+            texts.iter().any(|t| t.contains("could not be read")),
+            "the panel hid an unreadable saved-search file: {texts:?}"
+        );
+
+        // A save must not turn one bad byte into an empty file.
+        app.collection_name = "doomed".to_string();
+        app.save_current_collection();
+        assert!(
+            app.status.contains("could not be read")
+                && app.status.contains(&file.display().to_string()),
+            "saving into an unreadable store must refuse and name the file: {}",
             app.status
         );
         assert_eq!(
-            result_names(&app),
-            running_before,
-            "a failed run changed the grid anyway"
-        );
-
-        // And the panel shows it rather than hiding the row. The panel has to
-        // be on that tab first; `sidebar_text` draws what the state says.
-        app.sidebar_tab = SidebarTab::Collections;
-        let drawn: Vec<String> = sidebar_text(&mut app, &ctx)
-            .into_iter()
-            .map(|(text, _)| text)
-            .collect();
-        assert!(
-            drawn.iter().any(|t| t == "broken"),
-            "the damaged collection was left out of the list: {drawn:?}"
-        );
-        assert!(
-            drawn
-                .iter()
-                .any(|t| t.contains("definition cannot be read")),
-            "the list gave no reason: {drawn:?}"
+            std::fs::read(&file).unwrap(),
+            before,
+            "a refused save still overwrote the user's saved searches"
         );
     }
 
@@ -7340,7 +7377,7 @@ mod tests {
         std::env::set_var("XDG_DATA_HOME", &blocker);
 
         let ctx = egui::Context::default();
-        let app = BridgeApp::new(&ctx, Some(root.display().to_string()), None);
+        let app = BridgeApp::new(&ctx, Some(root.display().to_string()));
         assert!(
             app.index_error.is_some(),
             "a database that could not be opened must be recorded"

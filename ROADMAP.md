@@ -107,7 +107,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
   - [ ] Evaluate reuse of LightCraft's Rust RAW decoding through a documented, compatible library boundary; current BridgeCraft decoding remains unchanged
 
 ## Phase 6 — Polish, Packaging & 1:1 Parity (Weeks 36–52)
-- [~] Move the thumbnail cache out of the current working directory: `main.rs` opens `.bridgecraft-thumbs.db` beside the CWD, which is not writable for a bundled `.app`, a per-user Windows install, or an AppImage run from a read-only location. The single `bc-core::paths` helper this item called for now exists (`paths::user_data_root`/`user_config_root`/`data_file`/`config_file`), the two divergent copies of the platform env-var logic are gone, and the metadata index moved from the config directory to the data directory with a one-time move of any existing database. Remaining: `bc-ui/src/main.rs` still derives that path from the CWD, and `AutoProcessor::open_default`'s fallback for a missing path points at `thumbnails.sqlite` in the *config* directory, so the two resolve to the same file only while `current_dir()` succeeds
+- [x] Move the thumbnail cache out of the current working directory: it is now `thumbnails.sqlite` in the per-user data directory, resolved by one helper (`bc_core::paths::thumbnail_cache_path`) that the browser worker, the watched-folder fallback and `--rebuild-cache` all call — previously `main.rs` derived it from `current_dir()` and `AutoProcessor::open_default`'s fallback pointed at the *config* directory, so the two only agreed while `current_dir()` happened to succeed. `BridgeApp::new` no longer takes a cache path at all: a parameter that a caller could fill with a working-directory guess was the bug, and an unresolvable data directory now simply means no cache, which costs regeneration and nothing else. Verified with the release binary launched from a scratch directory: the launch directory stays empty, the cache appears in the data directory holding its 3 warmed entries, and `--rebuild-cache` with no file argument writes the same file the GUI opens (proved by deleting it, rebuilding, and finding it recreated with 3 rows)
 - [ ] Keyboard shortcut parity + custom shortcut editor. Current coverage is the viewer and grid basics only: Ctrl/Cmd+A, F5, Ctrl/Cmd+O, Enter (path field / open preview from list rows), Esc, ←/→, +, -, 0, 1 and Shift+arrows. Missing: Delete/Backspace, F2 or Enter to rename, arrow navigation and Enter-to-open in the thumbnail grid, Tab focus traversal, Ctrl+F to focus the filter, Home/End, Ctrl+Z
 - [ ] Workspaces (customizable panel layouts)
 - [ ] Preferences dialog parity audit
@@ -140,7 +140,7 @@ What is left on the critical path, in the order that unblocks the most:
 1. **Index-backed tags.** Done for sorting and filtering, which is where the index was the only way to do the job at all: ordering a folder by stars needs every file's rating, and reading every file costs 14.9 µs each against 1.3 µs each for one indexed range query. What this slice measured and then *rejected* was the plan I wrote in the previous commit — "the grid and details overlays stat and parse a sidecar plus a packet for every visible row each frame; that belongs in `metadata_index`". The overlays cache on the file's own mtime, so a frame costs 2.3 µs per visible row and can never show a stale tag, while a per-file index lookup costs 98 µs — 6.6× slower than parsing the file, and permitted to lag it. Per-row display stays as it is; the remaining per-file work here is cross-library keyword suggestions and the panel's full layer read, both of which need more than the four tag columns the index holds.
 2. **A rule editor for saved collections.** What shipped is the whole loop a user can reach today: save the search on screen under a name, see the list in the sidebar, run it, delete it. What is missing is authorship beyond words — the stored document holds an arbitrary `Query` and running it honours whatever is in it, but the only way to build one through the interface is the search box, so "rated 3 or more, unflagged" cannot be saved because it cannot be made. The collapse and the second implementation this item originally assumed would have to be reconciled first turned out not to exist: `bc-metadata::search` is a projection with no query language, and no stored collection had ever been written by anything, so the six predicate containers and fourteen aliases were deleted rather than migrated or bridged.
 3. **Contact sheets, publish presets, metadata templates and version stacks** wired into the UI: all implemented, tested and unreachable.
-4. **The data-path cleanup** before Phase 6 packaging, because bundle layouts break the current CWD-based thumbnail cache.
+4. ~~The data-path cleanup~~ — done: the thumbnail cache moved into the data directory and the CWD is no longer written to. Atomic persistence for `favorites.json` and `recents.json` is the remaining sibling of that work, listed under Tech debt rather than here.
 5. **Tags for PNG and WebP exports, and IPTC-IIM written back into TIFF.** Each needs a container writer that does not exist yet; until then the export dialog says plainly that these formats carry no tags.
 
 M1's remaining items are the two surfacing defects (failed-versus-pending thumbnails, folder-open errors only in the status bar) plus outbound OS drag, which needs an eframe upgrade.
@@ -154,7 +154,8 @@ M1's remaining items are the two surfacing defects (failed-versus-pending thumbn
 - **Sidecar files are listed and indexed like any other file, and library search returns them.** Confirmed against a database written by the release binary rather than reasoned about: searching `blue` over a folder of four sidecar-tagged JPEGs matched eight rows, because each `.xmp` is a file with its own row carrying the same tags as the photo beside it. The remedy is not a special case in search — it is the pre-existing "Thumbnails only" toggle, which filters whatever the browser is showing, and `thumbnails_only_hides_sidecar_files_from_search_results_too` now pins that it reaches result sets as well as folder listings. What is still undecided is whether a sidecar should ever have had a row: excluding them at index time would make counts and coverage honest for photo libraries, and that is a listing-policy call worth making deliberately rather than by accretion.
 - **Staleness depends on a clock that is coarser than an edit.** Measured on this machine: 149 of 400 same-size tag edits reused the previous write's modification timestamp, because the kernel serves a cached timestamp across a stretch of writes. Since `set_rating(0)` *removes* the property rather than writing zero, such an edit changes neither size nor timestamp, and `is_current` then calls the file current forever — the row keeps the old rating, and a rating sort or tag filter serves it. Two things follow, both in force: saving tags re-indexes **explicitly** (`indexer::reindex`) instead of asking, and a folder pass keeps the skip because it cannot afford to re-read every file. The gap that remains is an edit made by *another* application within one timestamp tick of the last indexing, which no pass will notice until the file changes size or the extractor version moves. The durable fix is a content signature on the row, which costs a read to compute and so has to be weighed against simply not skipping.
 - **`TagWrite::Replace` and `TagWrite::Merge` are one bit of intent every tag writer must state.** Absence of a tag property in a metadata means either "the user cleared it" or "this save does not touch tags", and the two need opposite results. The panel and export use `Replace`; a partial update uses `Merge`. Nothing can tell them apart from the data, so the parameter is mandatory rather than defaulted — the default is exactly what made clearing silently fail for embedded packets.
-- **Saved collections live in the metadata index, which is otherwise a throwaway cache.** `smart_collections` is a table in `metadata.sqlite`, so deleting that file — a normal thing to do to an index, and the thing `EXTRACTOR_VERSION` bumps are designed to make unnecessary-but-cheap — now destroys the user's saved searches too. This was tolerable while nothing could write a collection; it is not tolerable now that a button does. The fix is to move them beside favourites, recents and the trash state (their own JSON or SQLite file in the data directory, kept out of anything rebuildable), and until that happens a "rebuild the index" affordance must say what it costs. The document shape is versioned (`COLLECTION_DOCUMENT_VERSION`, written into the `version` column that used to be a hardcoded `1` nothing read), so the move can carry the definitions across without a rewrite.
+- **Saved searches now have their own file, and two neighbouring stores still do not.** They moved out of `metadata.sqlite` into `saved-searches.json` in the data directory (`bc_core::SavedSearches`), written through the same `write_atomic` that watched-folder state uses, because the index is a cache that may be rebuilt at any moment and nothing else holds a saved search. Two leftovers follow. First, a database created by an earlier build keeps an orphan `smart_collections` table; the new code never reads or writes it, and an old file was verified to open and index normally around it — no migration, because the table-reading feature shipped in the same unreleased session that removed it and no build anyone could run ever wrote a row. Second, `favorites.json` and `recents.json` are still persisted with a plain `fs::write`: a crash or a full disk mid-write leaves a truncated file, and this crate's own reader treats unparseable JSON as an error rather than a cache miss, so favourites and recents are lost rather than rebuilt. `write_atomic` is now shared and one line to adopt there; this slice did not, because it is not what the task was, and that is precisely the kind of "obviously fine, someone will do it later" note this file has a habit of leaving behind.
+
 - **Collections can only be saved from what the search box can express.** The storage holds an arbitrary `Query`, and running one honours whatever rules are in it — but the only way to *build* one through the interface is typing words. So a user cannot save "rated 3 or more, unflagged" without the rule editor, and that editor is the remaining half of this feature rather than an unmentioned gap.
 - **Duplicate query spellings removed, not normalised.** `bc-core::metadata_index` used to accept several field and operator spellings (`Field::Make`/`CameraMake`, `Operator::Eq`/`Equals`, and `Query`'s `predicates`/`conditions`/`clauses`/`and`/`or`/`expr`) and reconcile them at match time, with the rule that they had to be kept because they were serialised into stored smart-collection rows. The premise was checked before it was dropped: nothing in the repository has ever called `save_smart_collection`, so no such row exists on any disk, and `matches` was quietly giving different answers depending on which synonym a query happened to use. There is now one predicate container, one combinator, and one spelling per field and operator; the `a_stored_query_round_trips_through_the_shape_that_is_saved` test asserts the serialised form contains none of the old containers, so the shape cannot regrow unnoticed.
 - **Synonym API removed 2026-11-15.** Duplicate public aliases (`bc_core::search`/`index`/`metadata_search`/`versions` module re-exports, `bc_metadata::extract`/`projection`/`searchable`, `PublishPipeline`/`PublishJob`/`run`/`run_pipeline`, `ScriptEngine`/`AutomationHost`/`ScriptRunner`, the contact-sheet `generate_*`/`create_*`/`build_*` set, and the metadata-index `add`/`insert`/`upsert_file`/`put`/`scan*`/`lookup`/`cleanup` family) were deleted: they had no callers, no behavior, and inflated the apparent API surface of modules that are in fact unwired.
@@ -477,6 +478,66 @@ reported wrongly.
   collection, not tolerable now that a button does. Named in Tech debt with the
   fix (their own store beside favourites and recents) and with the version field
   that makes the move a copy rather than a rewrite.
+
+### Where the app writes: thumbnail cache, and saved searches out of the cache (slice 11, shipped 2026-11-17)
+
+The item on the critical path said the thumbnail cache had to leave the working
+directory because bundle layouts break it. It also quietly said nothing about
+where saved searches lived, and the previous slice had put them in the one file
+this project treats as disposable. Both are fixed here, and both were verified
+against the release binary rather than only against `cargo test`.
+
+- **One path definition, three callers.** `paths::thumbnail_cache_path` is now
+  the only place that answer exists: the browser worker, the watched-folder
+  fallback and `--rebuild-cache` all use it. The old arrangement had `main.rs`
+  building the path from `current_dir()` and `AutoProcessor::open_default`
+  guessing at the *config* directory when handed `None` — so they only opened
+  the same file while `current_dir()` succeeded, which is not a property anyone
+  would have thought to test. `BridgeApp::new` no longer accepts a cache path at
+  all: the parameter was the mechanism by which a working-directory guess could
+  reach the worker.
+- **Two of my own verification mistakes, both worth recording.** First, a
+  "cache file missing" result was an artifact of my own check: the empty
+  `thumbnails.sqlite` I found had been created by the `sqlite3` query I ran to
+  look for it, which is exactly how a probe becomes the observation. Re-run into
+  a fresh home with no post-hoc queries, the file is there with its WAL. Second,
+  I ran the legacy-database check against a release binary built *before* the
+  collections change, and concluded from its output that the schema edit had not
+  worked; the source was right and the artifact was stale. Both mistakes had the
+  same shape — trusting a result without asking which build produced it — and
+  both were caught by re-running after a rebuild, not by reasoning harder.
+- **A dangling `);` that only the tests could tell me about.** Cutting the
+  `smart_collections` `CREATE TABLE` out of the schema batch left its closing
+  parenthesis behind, producing SQL that failed at `init()` and lit up 16 tests
+  at once. The failure message named the syntax and the offset; the fix was one
+  line. It is worth noting that the change was a deletion of *nothing the code
+  still used* — which is exactly the kind of edit that a green type check would
+  not have caught.
+- **The panel was lying, and my new test caught it before anything shipped.**
+  An unreadable `saved-searches.json` produced "No saved searches yet. Run one,
+  then name it above." — the file still held the user's collections; the panel
+  simply could not read them. The cause was a field left over from the database
+  version (`collections_error`) that the panel still displayed and nothing still
+  set. Fixed by reading the live error, naming the file, and disabling the save
+  control with a reason, because the worst available outcome is a save that
+  appears to work and turns one bad byte into an empty file.
+- **A guarantee worth more than the feature.** The store refuses to overwrite a
+  file it cannot parse, and `an_unreadable_saved_search_file_is_reported_and_never_overwritten`
+  asserts the bytes are unchanged afterwards. That behaviour only matters
+  because this data is not rebuildable — which is the entire reason it moved.
+- **The scope decision, argued rather than assumed.** Saving a search no longer
+  needs the metadata index at all, so the panel's old preamble ("Collections are
+  stored in the metadata index, which is offline…") is gone: an offline index
+  costs *running* a search, not keeping one, and the list and the save control
+  stay available. `run_collection` now says so specifically when the index is
+  unavailable, in a sentence that distinguishes it from the store being
+  unreadable — two failures that used to share one message.
+- **Still open, recorded rather than quietly deferred:** `favorites.json` and
+  `recents.json` persist with a plain `fs::write`, so a crash mid-write costs
+  the user's favourites, and this crate's readers treat unparseable JSON as an
+  error rather than a miss. The atomic writer is now shared and one line to
+  adopt; it was not this slice's job, and the temptation to fix adjacent files
+  while in the neighbourhood is how slices stop being reviewable.
 
 ### Documentation corrected against the code on `main` (no behavior changes)
 

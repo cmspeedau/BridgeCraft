@@ -265,10 +265,19 @@ impl AutoProcessor {
     /// Open using BridgeCraft's normal per-user config and data directories.
     pub fn open_default(cache_path: Option<PathBuf>) -> Result<Self> {
         let config_path = default_config_path()?;
+        // The journal sits beside the rules, which is configuration-shaped and
+        // stays there. The cache, if the caller did not name one, is resolved
+        // from the same helper the browser uses: the previous fallback pointed
+        // at `thumbnails.sqlite` inside the *config* directory, so a launch
+        // where `current_dir()` failed gave the two writers different files
+        // for one cache.
+        let cache_path = match cache_path {
+            Some(path) => path,
+            None => crate::paths::thumbnail_cache_path()?,
+        };
         let data_dir = config_path
             .parent()
             .ok_or_else(|| CoreError::InvalidOperation("auto config has no parent".into()))?;
-        let cache_path = cache_path.unwrap_or_else(|| data_dir.join("thumbnails.sqlite"));
         let journal_path = data_dir.join("last-rename.json");
         Self::open(&config_path, cache_path, journal_path)
     }
@@ -644,7 +653,7 @@ fn run_actions(shared: &Shared, rule: &AutoRule, path: &Path) -> std::result::Re
                     Path::exists,
                 )
                 .ok_or_else(|| "no available export filename".to_string())?;
-                write_atomic(&target, &output).map_err(|error| error.to_string())?;
+                crate::paths::write_atomic(&target, &output).map_err(|error| error.to_string())?;
                 if let Some(output_fingerprint) = fingerprint(&target) {
                     lock(&shared.state)
                         .suppressed_outputs
@@ -696,36 +705,6 @@ fn run_actions(shared: &Shared, rule: &AutoRule, path: &Path) -> std::result::Re
                 let _ = index.index_path(&current_path);
             }
         }
-    }
-    Ok(())
-}
-
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let unique = format!(
-        ".{name}.bridgecraft-tmp-{}-{}",
-        std::process::id(),
-        std::thread::current().name().unwrap_or("worker")
-    );
-    let temporary = parent.join(unique);
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)?;
-    use std::io::Write as _;
-    let write_result = (|| {
-        file.write_all(bytes)?;
-        file.sync_all()
-    })();
-    drop(file);
-    if let Err(error) = write_result {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(error);
-    }
-    if let Err(error) = std::fs::rename(&temporary, path) {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(error);
     }
     Ok(())
 }
@@ -903,7 +882,7 @@ fn save_config(path: &Path, config: &AutoConfig) -> Result<()> {
     })?;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)?;
-    write_atomic(path, &json)?;
+    crate::paths::write_atomic(path, &json)?;
     Ok(())
 }
 

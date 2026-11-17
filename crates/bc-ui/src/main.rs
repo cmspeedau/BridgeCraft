@@ -19,9 +19,14 @@ fn main() -> anyhow::Result<()> {
         let folder = args.next().ok_or_else(|| {
             anyhow::anyhow!("usage: bridgecraft --rebuild-cache <folder> [cache-file]")
         })?;
+        // An explicit path still wins, because warming a cache for a library
+        // before it is ever opened is exactly the case where naming the file is
+        // useful. Without one, the same file the GUI will use is the default --
+        // warming a cache beside the working directory and then having the
+        // application open a different one is not a warm-up at all.
         let cache_path = match args.next() {
             Some(path) => PathBuf::from(path),
-            None => std::env::current_dir()?.join(".bridgecraft-thumbs.db"),
+            None => bc_core::paths::thumbnail_cache_path()?,
         };
         if args.next().is_some() {
             anyhow::bail!("usage: bridgecraft --rebuild-cache <folder> [cache-file]");
@@ -59,11 +64,6 @@ fn main() -> anyhow::Result<()> {
 
     let root = std::env::args().nth(1);
 
-    // Thumbnail cache lives next to the CWD; the worker thread owns it.
-    let cache_path = std::env::current_dir()
-        .ok()
-        .map(|d| d.join(".bridgecraft-thumbs.db"));
-
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
@@ -74,7 +74,7 @@ fn main() -> anyhow::Result<()> {
     eframe::run_native(
         "BridgeCraft",
         options,
-        Box::new(|cc| Box::new(app::BridgeApp::new(&cc.egui_ctx, root, cache_path))),
+        Box::new(|cc| Box::new(app::BridgeApp::new(&cc.egui_ctx, root))),
     )
     .map_err(|e| anyhow::anyhow!("eframe exited with an error: {e}"))?;
     Ok(())

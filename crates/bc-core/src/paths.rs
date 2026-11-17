@@ -14,7 +14,7 @@
 //! [`app_data_dir`], never inside the root lookups.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::{CoreError, Result};
 
@@ -95,6 +95,57 @@ fn platform_root(
         unix.or(unix_fallback)
     };
     root.ok_or_else(|| CoreError::InvalidOperation(message.to_string()))
+}
+
+/// Write `bytes` so a reader never sees a half-written file.
+///
+/// Shared because more than one store needs it and the mistakes are the same:
+/// `create_new` so a stale temp from a killed run can never be clobbered into
+/// the real file, `sync_all` so a crash leaves the old content rather than an
+/// empty one, and cleanup on every failure path. Lifting it out of
+/// `auto_process` is what lets saved searches persist without copying the rule
+/// a second time.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let unique = format!(
+        ".{name}.bridgecraft-tmp-{}-{}",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("worker")
+    );
+    let temporary = parent.join(unique);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    use std::io::Write as _;
+    let write_result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()
+    })();
+    drop(file);
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// The thumbnail cache database.
+///
+/// This used to be derived from the current working directory by `bc-ui`, which
+/// is a reasonable choice only until the app ships as a bundled `.app`, a
+/// per-user Windows install, or an AppImage mounted read-only: none of those
+/// have a writable working directory the application should be filling with a
+/// cache that can grow to a gigabyte. It lives in the data directory like every
+/// other store now, from one definition, so the browser and the watched-folder
+/// action cannot disagree about which file is the cache.
+pub fn thumbnail_cache_path() -> Result<PathBuf> {
+    data_file("thumbnails.sqlite")
 }
 
 /// The metadata search index database, in the data directory.
@@ -201,6 +252,29 @@ mod tests {
             path.to_string_lossy().matches(APP_FOLDER).count(),
             1,
             "the app folder appears twice in {path:?}: a double-append"
+        );
+    }
+
+    #[test]
+    fn the_thumbnail_cache_is_asked_for_in_the_data_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = scoped(temp.path());
+        let path = thumbnail_cache_path().unwrap();
+        assert_eq!(
+            path,
+            expected_root("DATA")
+                .join(APP_FOLDER)
+                .join("thumbnails.sqlite")
+        );
+        // The point of the move, as an assertion: nothing about this path
+        // depends on where the process was started. A bundled `.app`, a
+        // per-user Windows install and a read-only AppImage mount each have a
+        // working directory that must not end up holding a cache that can grow
+        // to a gigabyte.
+        let cwd = std::env::current_dir().unwrap();
+        assert!(
+            !path.starts_with(&cwd) || cwd == temp.path(),
+            "the cache path is derived from the working directory ({cwd:?}): {path:?}"
         );
     }
 
