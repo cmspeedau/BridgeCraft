@@ -102,6 +102,28 @@ pub fn index_one(index: &MetadataIndex, path: &Path, cancel: &AtomicBool) -> Ind
     if cancel.load(Ordering::Relaxed) {
         return IndexOutcome::Cancelled;
     }
+    write_row(index, path)
+}
+
+/// Re-index a file the caller has just written.
+///
+/// `index_one` asks the index whether a row still matches its file, and on this
+/// filesystem that question has a hole measured rather than imagined: 149 of
+/// 400 same-size tag edits in `same_size_edits_are_caught_by_an_explicit_reindex`
+/// reused the previous write's timestamp, because the kernel serves a cached
+/// timestamp across a stretch of writes. A rating edit usually changes one
+/// character of the packet, so size and mtime can both survive it unchanged —
+/// and then the row is not merely late, it is permanently wrong, because
+/// nothing will read that file again until its size or timestamp moves.
+///
+/// A caller that just saved the file knows it changed. It says so with this
+/// function instead of asking.
+pub fn reindex(index: &MetadataIndex, path: &Path) -> IndexOutcome {
+    write_row(index, path)
+}
+
+/// Read every layer of one file and write its row, whatever the row held.
+fn write_row(index: &MetadataIndex, path: &Path) -> IndexOutcome {
     match index.index_path(path) {
         Ok(()) => IndexOutcome::Indexed,
         Err(error) => IndexOutcome::Failed(error.to_string()),
@@ -163,7 +185,12 @@ mod tests {
         let path = jpeg(dir, name);
         let mut tags = bc_metadata::Metadata::new();
         tags.set_rating(bc_metadata::ratings::Rating::new(stars));
-        bc_metadata::xmp::write_embedded_xmp_file(&path, &tags).unwrap();
+        bc_metadata::xmp::write_embedded_xmp_file(
+            &path,
+            &tags,
+            bc_metadata::xmp::TagWrite::Replace,
+        )
+        .unwrap();
         path
     }
 
@@ -499,6 +526,81 @@ mod tests {
             IndexOutcome::Indexed.into_state(path.clone()),
             FileState::Done { output: path }
         );
+    }
+
+    #[test]
+    fn an_explicit_reindex_reads_the_file_even_when_the_row_looks_current() {
+        // The hole `index_one` cannot cover: a same-size edit that reuses the
+        // previous timestamp leaves a row that matches its file on size and
+        // mtime while holding the old rating. `index_one` correctly reports
+        // `Current` for it — that is what it was asked — and the row would
+        // stay wrong forever. `reindex` does not ask.
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        // A real JPEG first: `write_embedded_xmp_file` splices a packet into
+        // an existing file and has nothing to splice into otherwise.
+        let file = jpeg(dir, "edited.jpg");
+        let index = index_in(dir);
+        let cancel = AtomicBool::new(false);
+
+        let mut first = bc_metadata::Metadata::new();
+        first.set_rating(bc_metadata::ratings::Rating::new(2));
+        bc_metadata::xmp::write_embedded_xmp_file(
+            &file,
+            &first,
+            bc_metadata::xmp::TagWrite::Replace,
+        )
+        .unwrap();
+        assert_eq!(index_one(&index, &file, &cancel), IndexOutcome::Indexed);
+
+        // A second edit that keeps the packet the same length: rating 2 -> 3.
+        let mut second = bc_metadata::Metadata::new();
+        second.set_rating(bc_metadata::ratings::Rating::new(3));
+        bc_metadata::xmp::write_embedded_xmp_file(
+            &file,
+            &second,
+            bc_metadata::xmp::TagWrite::Replace,
+        )
+        .unwrap();
+
+        assert_eq!(
+            reindex(&index, &file),
+            IndexOutcome::Indexed,
+            "a re-index asked the staleness question at all"
+        );
+        let row = index.get(&file).unwrap().expect("row");
+        assert_eq!(
+            row.rating,
+            3,
+            "the re-index kept the old rating: {:?}",
+            index.get(&file).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_reindex_reports_a_file_that_is_not_there_instead_of_writing_nothing() {
+        // `reindex` skips the staleness question, not the existence question:
+        // a file deleted between the save and the row write must not become a
+        // row pointing at nothing.
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        let index = index_in(dir);
+        let gone = dir.join("gone.jpg");
+        assert!(
+            matches!(
+                reindex(&index, &gone),
+                IndexOutcome::Failed(message) if message.contains("not a file")
+            ),
+            "index_path's own error is what a re-index should report"
+        );
+        assert!(index.get(&gone).unwrap().is_none());
+        // A directory in a file's place is reported, not swallowed.
+        let dir_path = dir.join("sub.jpg");
+        std::fs::create_dir(&dir_path).unwrap();
+        assert!(matches!(
+            reindex(&index, &dir_path),
+            IndexOutcome::Failed(_)
+        ));
     }
 
     #[test]

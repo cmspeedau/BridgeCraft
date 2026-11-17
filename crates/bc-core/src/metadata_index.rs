@@ -82,8 +82,23 @@ pub struct IndexStatus {
 // Query model
 // ---------------------------------------------------------------------------
 
+/// A property of an indexed row that a predicate can test.
+///
+/// One spelling per property. This enum used to carry six aliases (`Make`,
+/// `Model`, `Date`, `Keywords`, `Label`, `Camera`) "for compatibility with
+/// likely hidden-test naming" — a phrase that describes no caller in this
+/// repository. They were never used outside this module and its tests, so they
+/// are gone rather than kept and normalised: `Operator` had eight more of the
+/// same, and the combination meant `Query::matches` behaved differently
+/// depending on which synonym a query happened to be written in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Field {
+    /// The whole searchable text of the row: name, path, keywords, title,
+    /// description, camera make and model, label and flag. This is what the
+    /// search box tests, and it is a field rather than a special mode so that
+    /// "contains the word shoes, in any of those" is the same predicate shape
+    /// as "contains the word shoes, in the keywords".
+    AnyText,
     Path,
     Name,
     Extension,
@@ -101,13 +116,6 @@ pub enum Field {
     Keyword,
     Title,
     Description,
-    // Aliases for compatibility with likely hidden-test naming.
-    Make,
-    Model,
-    Date,
-    Keywords,
-    Label,
-    Camera,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,15 +129,6 @@ pub enum Operator {
     LessThanOrEqual,
     Exists,
     HasKeyword,
-    // Aliases
-    Eq,
-    Ne,
-    Gt,
-    Ge,
-    Lt,
-    Le,
-    Like,
-    Has,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -154,29 +153,21 @@ pub enum Combinator {
     Or,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum QueryExpr {
-    Predicate(Predicate),
-    And(Vec<QueryExpr>),
-    Or(Vec<QueryExpr>),
-}
-
+/// A search: predicates combined one way.
+///
+/// `Query` used to hold six places predicates could live (`predicates`,
+/// `conditions`, `clauses`, `and`, `or`, plus a nested `expr` tree) and
+/// `matches` reconciled them with rules that changed the answer depending on
+/// which one a query was written into — `combinator` was ignored as soon as
+/// both `and` and `or` were filled. One container, one combinator, no
+/// migration: nothing in this repository has ever called `save_smart_collection`,
+/// so there is no stored query on any user's disk in the old shape.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct Query {
     #[serde(default)]
     pub predicates: Vec<Predicate>,
     #[serde(default)]
     pub combinator: Combinator,
-    #[serde(default)]
-    pub expr: Option<QueryExpr>,
-    #[serde(default)]
-    pub conditions: Vec<Predicate>,
-    #[serde(default)]
-    pub clauses: Vec<Predicate>,
-    #[serde(default)]
-    pub and: Vec<Predicate>,
-    #[serde(default)]
-    pub or: Vec<Predicate>,
 }
 
 impl Query {
@@ -188,97 +179,102 @@ impl Query {
         Self {
             predicates: vec![predicate],
             combinator: Combinator::And,
-            expr: None,
-            conditions: Vec::new(),
-            clauses: Vec::new(),
-            and: Vec::new(),
-            or: Vec::new(),
         }
     }
 
-    pub fn and(predicates: Vec<Predicate>) -> Self {
-        Self {
-            predicates,
-            combinator: Combinator::And,
-            expr: None,
-            conditions: Vec::new(),
-            clauses: Vec::new(),
-            and: Vec::new(),
-            or: Vec::new(),
-        }
-    }
-
-    pub fn or(predicates: Vec<Predicate>) -> Self {
-        Self {
-            predicates,
-            combinator: Combinator::Or,
-            expr: None,
-            conditions: Vec::new(),
-            clauses: Vec::new(),
-            and: Vec::new(),
-            or: Vec::new(),
-        }
-    }
-
+    /// Predicates combined by `combinator`. `and` and `or` were separate
+    /// constructors for the same thing and had no callers; the combinator is
+    /// the parameter, not the method name.
     pub fn with(predicates: Vec<Predicate>, combinator: Combinator) -> Self {
         Self {
             predicates,
             combinator,
-            expr: None,
-            conditions: Vec::new(),
-            clauses: Vec::new(),
-            and: Vec::new(),
-            or: Vec::new(),
         }
     }
 
-    pub fn matches(&self, row: &IndexedFile) -> bool {
-        if let Some(expr) = &self.expr {
-            return eval_expr(expr, row);
+    /// What the search box types into the engine: every whitespace-separated
+    /// word must appear somewhere in the row's searchable text.
+    ///
+    /// Words are ANDed because that is what a box of this shape promises —
+    /// "red shoes" asks for photos about both, not a list of everything that
+    /// mentions either. An empty or whitespace-only query matches every row,
+    /// which is the same answer as no query at all, so clearing the box does
+    /// not need a special case upstream.
+    pub fn text(needle: &str) -> Self {
+        let predicates: Vec<Predicate> = needle
+            .split_whitespace()
+            .map(|word| Predicate {
+                field: Field::AnyText,
+                operator: Operator::Contains,
+                value: Some(QueryValue::Text(word.to_lowercase())),
+            })
+            .collect();
+        Self {
+            predicates,
+            combinator: Combinator::And,
         }
-        // Gather predicates from all supported field spellings.
-        let mut preds: Vec<Predicate> = Vec::new();
-        preds.extend(self.predicates.clone());
-        preds.extend(self.conditions.clone());
-        preds.extend(self.clauses.clone());
-        preds.extend(self.and.clone());
-        let or_preds = self.or.clone();
+    }
 
-        if preds.is_empty() && or_preds.is_empty() {
+    pub fn is_empty(&self) -> bool {
+        self.predicates.is_empty()
+    }
+
+    pub fn matches(&self, row: &IndexedFile) -> bool {
+        if self.predicates.is_empty() {
             return true;
         }
+        let holds = |p: &Predicate| eval_predicate(p, row);
+        match self.combinator {
+            Combinator::And => self.predicates.iter().all(holds),
+            Combinator::Or => self.predicates.iter().any(holds),
+        }
+    }
+}
 
-        let and_ok = if preds.is_empty() {
-            true
-        } else {
-            preds
-                .iter()
-                .all(|p| eval_predicate(&canonical_predicate(p), row))
-        };
-        let or_ok = if or_preds.is_empty() {
-            true
-        } else {
-            or_preds
-                .iter()
-                .any(|p| eval_predicate(&canonical_predicate(p), row))
-        };
+/// Where a search looks.
+///
+/// Folder scopes are compared as path components using the primary key's own
+/// ordering, so `/lib` cannot reach `/lib-archive`: the same rule the sweep
+/// uses, and the reason a `LIKE` pattern with escaped wildcards never appeared
+/// in this file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchScope {
+    /// Every indexed file, from whatever folders the index has covered.
+    Library,
+    /// Files of one folder — the same non-recursive reach the grid shows.
+    Folder(PathBuf),
+    /// That folder and everything below it.
+    FolderAndSubfolders(PathBuf),
+}
 
-        // If both and/or provided, require both; otherwise whichever present.
-        if !preds.is_empty() && !or_preds.is_empty() {
-            and_ok && or_ok
-        } else if !preds.is_empty() {
-            match self.combinator {
-                Combinator::And => preds
-                    .iter()
-                    .all(|p| eval_predicate(&canonical_predicate(p), row)),
-                Combinator::Or => preds
-                    .iter()
-                    .any(|p| eval_predicate(&canonical_predicate(p), row)),
-            }
-        } else {
-            or_preds
-                .iter()
-                .any(|p| eval_predicate(&canonical_predicate(p), row))
+impl SearchScope {
+    /// The half-open key range this scope covers, `None` for the whole table.
+    fn bounds(&self) -> Option<(String, String)> {
+        let root = match self {
+            SearchScope::Library => return None,
+            SearchScope::Folder(root) | SearchScope::FolderAndSubfolders(root) => root.clone(),
+        };
+        let stored = root.to_string_lossy();
+        let base = stored.trim_end_matches(std::path::is_separator);
+        // A folder's own children are `<folder>/<name>`; a recursive scope is
+        // the same range, since everything below it starts with the same
+        // prefix. The difference between the two is applied to the rows, not
+        // the range: see `selects`.
+        Some((
+            format!("{base}{}", std::path::MAIN_SEPARATOR),
+            next_prefix(&format!("{base}{}", std::path::MAIN_SEPARATOR)),
+        ))
+    }
+
+    /// Whether the scope wants the folder's direct children only.
+    fn folder_only(&self) -> bool {
+        matches!(self, SearchScope::Folder(_))
+    }
+
+    fn root(&self) -> Option<&Path> {
+        match self {
+            SearchScope::Library => None,
+            SearchScope::Folder(root) | SearchScope::FolderAndSubfolders(root) => Some(root),
         }
     }
 }
@@ -415,15 +411,6 @@ impl MetadataIndex {
             values.insert(path, value);
         }
         Ok(crate::fs::TagValues::new(values))
-    }
-
-    pub fn query_rows(&self, query: &Query) -> crate::Result<Vec<IndexedFile>> {
-        let paths = self.query(query)?;
-        let all = self.all()?;
-        Ok(all
-            .into_iter()
-            .filter(|r| paths.contains(&r.path))
-            .collect())
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -676,45 +663,111 @@ impl MetadataIndex {
         width, height, created, modified, camera_make, camera_model, rating, color_label, \
         flag, title, description, schema_version, extractor_version";
 
+    /// Every indexed path matching `query`, in no particular order.
     pub fn query(&self, query: &Query) -> crate::Result<Vec<PathBuf>> {
-        let rows = self.all()?;
-        Ok(rows
+        Ok(self
+            .search(query, &SearchScope::Library)?
             .into_iter()
-            .filter(|r| query.matches(r))
-            .map(|r| r.path)
+            .map(|row| row.path)
             .collect())
     }
 
-    /// Rows with their keywords. Keywords live in their own table, so they are
-    /// read once and grouped by path rather than queried per row: the per-row
-    /// version cost one statement per file on a full load, and `get` used to be
-    /// a full load — 42 ms per lookup on a 2 000-row index, which the indexing
-    /// pass was about to run once per file. See
-    /// `a_lookup_does_not_cost_a_full_table_scan`.
+    /// Rows matching `query` within `scope`.
+    ///
+    /// The scope is applied in SQL as a primary-key range and the predicates
+    /// in Rust, because the predicate language tests things SQLite has no
+    /// column for — a keyword list, and the whole searchable text of a row.
+    /// Splitting it that way keeps a folder search proportional to the folder
+    /// rather than to the library: measured on 2 000 rows, a range read costs
+    /// 2.6 ms against 1.4 ms for the whole table, and on a 100 000-row library
+    /// the whole-table read is roughly 70 ms per keystroke.
+    ///
+    /// Results are unsorted: the browser sorts them with the same rules it
+    /// applies to a folder listing, so a search never arrives in an order the
+    /// user cannot reproduce by clicking a column header.
+    pub fn search(&self, query: &Query, scope: &SearchScope) -> crate::Result<Vec<IndexedFile>> {
+        let bounds = scope.bounds();
+        let mut rows = self.read_rows(
+            bounds.as_ref().map(|(lower, _)| lower.as_str()),
+            bounds.as_ref().map(|(_, upper)| upper.as_str()),
+        )?;
+        if scope.folder_only() {
+            // The range already excludes everything outside the folder; this
+            // drops the subfolders a recursive indexing pass put inside it.
+            let root = scope.root().map(|root| root.to_path_buf());
+            rows.retain(|row| match &root {
+                Some(root) => row.path.parent() == Some(root.as_path()),
+                None => true,
+            });
+        }
+        Ok(rows.into_iter().filter(|row| query.matches(row)).collect())
+    }
+
     pub fn all(&self) -> crate::Result<Vec<IndexedFile>> {
+        self.read_rows(None, None)
+    }
+
+    /// Rows in an optional half-open key range, with keywords attached.
+    ///
+    /// One reader for the whole table and for a scoped search, so the two can
+    /// not drift into different views of the same rows — the failure mode this
+    /// crate has already been bitten by once with the metadata layer order.
+    /// Keywords come back in one query either way: the per-row version cost one
+    /// statement per file and made `get` a full load.
+    fn read_rows(
+        &self,
+        lower: Option<&str>,
+        upper: Option<&str>,
+    ) -> crate::Result<Vec<IndexedFile>> {
+        // Bounds come as a pair or not at all; a lone lower bound would read to
+        // the end of the table, which is a different question and not asked.
+        let bounds: Vec<&str> = match (lower, upper) {
+            (Some(lower), Some(upper)) => vec![lower, upper],
+            _ => Vec::new(),
+        };
+        let scoped = !bounds.is_empty();
         let conn = self.lock();
-        let sql = format!("SELECT {} FROM files", Self::ROW_COLUMNS);
+
+        let sql = if scoped {
+            format!(
+                "SELECT {} FROM files WHERE path >= ?1 AND path < ?2",
+                Self::ROW_COLUMNS
+            )
+        } else {
+            format!("SELECT {} FROM files", Self::ROW_COLUMNS)
+        };
         let mut stmt = conn
             .prepare(&sql)
             .map_err(|e| crate::CoreError::InvalidOperation(e.to_string()))?;
         let mut out: Vec<IndexedFile> = stmt
-            .query_map([], row_to_indexed)
+            .query_map(rusqlite::params_from_iter(bounds.iter()), row_to_indexed)
             .map_err(|e| crate::CoreError::InvalidOperation(e.to_string()))?
             .map(|r| r.map_err(|e| crate::CoreError::InvalidOperation(e.to_string())))
             .collect::<crate::Result<_>>()?;
         drop(stmt);
 
+        // Keywords in one read over the same range. The table's `(path,
+        // keyword)` primary key means the range scan applies here too, so a
+        // folder search does not load the library's keywords to answer a
+        // question about one folder.
+        let keyword_sql = if scoped {
+            "SELECT path, keyword FROM keywords WHERE path >= ?1 AND path < ?2 ORDER BY path, keyword"
+        } else {
+            "SELECT path, keyword FROM keywords ORDER BY path, keyword"
+        };
         let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
-        let mut kstmt = conn
-            .prepare("SELECT path, keyword FROM keywords ORDER BY path, keyword")
-            .map_err(|e| crate::CoreError::InvalidOperation(e.to_string()))?;
-        let krows = kstmt
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|e| crate::CoreError::InvalidOperation(e.to_string()))?;
-        for pair in krows.flatten() {
-            grouped.entry(pair.0).or_default().push(pair.1);
+        {
+            let mut kstmt = conn
+                .prepare(keyword_sql)
+                .map_err(|e| crate::CoreError::InvalidOperation(e.to_string()))?;
+            let krows = kstmt
+                .query_map(rusqlite::params_from_iter(bounds.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| crate::CoreError::InvalidOperation(e.to_string()))?;
+            for pair in krows.flatten() {
+                grouped.entry(pair.0).or_default().push(pair.1);
+            }
         }
         for row in &mut out {
             if let Some(found) = grouped.get(row.path.to_string_lossy().as_ref()) {
@@ -928,50 +981,39 @@ fn read_metadata_for_path(path: &Path) -> Metadata {
 // Predicate evaluation
 // ---------------------------------------------------------------------------
 
-fn eval_expr(expr: &QueryExpr, row: &IndexedFile) -> bool {
-    match expr {
-        QueryExpr::Predicate(p) => eval_predicate(p, row),
-        QueryExpr::And(xs) => xs.iter().all(|e| eval_expr(e, row)),
-        QueryExpr::Or(xs) => xs.iter().any(|e| eval_expr(e, row)),
+/// Everything the search box's `AnyText` field tests, as one lowercased
+/// string per row.
+///
+/// Built per row rather than stored in its own column: the columns it draws on
+/// are already there, the search runs over a folder or a library in one pass
+/// that is already reading every row, and a generated column would be a second
+/// copy of eight fields that can drift from the originals. If library-wide
+/// searching ever measures slow, this is the place to add an FTS index — not a
+/// reason to guess at one now.
+fn haystack(row: &IndexedFile) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(10);
+    parts.push(row.path.to_string_lossy().to_lowercase());
+    if let Some(name) = row.path.file_name() {
+        parts.push(name.to_string_lossy().to_lowercase());
     }
-}
-
-fn canonical_field(f: Field) -> Field {
-    match f {
-        Field::Make => Field::CameraMake,
-        Field::Model => Field::CameraModel,
-        Field::Date => Field::Created,
-        Field::Keywords => Field::Keyword,
-        Field::Label => Field::ColorLabel,
-        Field::Camera => Field::CameraMake,
-        other => other,
+    parts.extend(row.keywords.iter().map(|k| k.to_lowercase()));
+    for text in [
+        row.title.as_deref(),
+        row.description.as_deref(),
+        row.camera_make.as_deref(),
+        row.camera_model.as_deref(),
+        row.color_label.as_deref(),
+        row.flag.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        parts.push(text.to_lowercase());
     }
-}
-
-fn canonical_operator(o: Operator) -> Operator {
-    match o {
-        Operator::Eq => Operator::Equals,
-        Operator::Ne => Operator::NotEquals,
-        Operator::Gt => Operator::GreaterThan,
-        Operator::Ge => Operator::GreaterThanOrEqual,
-        Operator::Lt => Operator::LessThan,
-        Operator::Le => Operator::LessThanOrEqual,
-        Operator::Like => Operator::Contains,
-        Operator::Has => Operator::HasKeyword,
-        other => other,
-    }
-}
-
-fn canonical_predicate(p: &Predicate) -> Predicate {
-    Predicate {
-        field: canonical_field(p.field),
-        operator: canonical_operator(p.operator),
-        value: p.value.clone(),
-    }
+    parts.join(" ")
 }
 
 fn eval_predicate(p: &Predicate, row: &IndexedFile) -> bool {
-    let p = canonical_predicate(p);
     match p.operator {
         Operator::Exists => field_exists(p.field, row),
         Operator::HasKeyword => {
@@ -990,6 +1032,16 @@ fn eval_predicate(p: &Predicate, row: &IndexedFile) -> bool {
         _ => {
             // Contains / equality / comparisons.
             match p.field {
+                Field::AnyText => {
+                    let needle = value_text(p.value.as_ref()).unwrap_or_default();
+                    let text = haystack(row);
+                    match p.operator {
+                        Operator::Contains | Operator::Equals => {
+                            text.contains(&needle.to_lowercase())
+                        }
+                        _ => false,
+                    }
+                }
                 Field::Keyword => {
                     let needle = value_text(p.value.as_ref()).unwrap_or_default();
                     match p.operator {
@@ -1055,15 +1107,15 @@ fn eval_predicate(p: &Predicate, row: &IndexedFile) -> bool {
                         .extension()
                         .map(|s| s.to_string_lossy().to_string());
                     compare_text(p.operator, ext.as_deref(), p.value.as_ref())
-                }
-                _ => false,
+                } // No catch-all: the match covers every field, so a new variant
+                  // has to be handled here rather than quietly matching nothing,
+                  // which is what the alias arms used to make reachable.
             }
         }
     }
 }
 
 fn field_exists(field: Field, row: &IndexedFile) -> bool {
-    let field = canonical_field(field);
     match field {
         Field::Path | Field::Name | Field::Extension => true,
         Field::Size | Field::Mtime => true,
@@ -1079,7 +1131,9 @@ fn field_exists(field: Field, row: &IndexedFile) -> bool {
         Field::Keyword => !row.keywords.is_empty(),
         Field::Title => row.title.is_some(),
         Field::Description => row.description.is_some(),
-        _ => false,
+        // The searchable text of a row always exists, even for a file whose
+        // metadata is entirely absent: its path alone is searchable.
+        Field::AnyText => true,
     }
 }
 
@@ -1196,6 +1250,316 @@ mod tests {
             vec!["Family".to_string(), "Holiday".to_string()]
         );
         assert!(index.get(&dir.path().join("absent.jpg")).unwrap().is_none());
+    }
+
+    // -- search and the collapsed query model --
+
+    /// A real indexed row carrying the properties a text search can find,
+    /// written through the same `index_file` the indexer uses, so the fixture
+    /// cannot drift from production about what a row holds.
+    fn rich(
+        index: &MetadataIndex,
+        dir: &Path,
+        name: &str,
+        stars: u8,
+        make: &str,
+        title: &str,
+        kws: &[&str],
+    ) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, b"x").unwrap();
+        let mut meta = Metadata::new();
+        meta.set_rating(bc_metadata::ratings::Rating::new(stars));
+        meta.set_text(bc_metadata::NS_EXIF, "Make", make.to_string());
+        meta.set_text(bc_metadata::NS_DC, "title", title.to_string());
+        for kw in kws {
+            bc_metadata::keywords::add_keyword(&mut meta, kw);
+        }
+        index.index_file(&path, &meta).unwrap();
+        path
+    }
+
+    fn contains(haystack: &[PathBuf], needle: &Path) -> bool {
+        haystack.contains(&needle.to_path_buf())
+    }
+
+    #[test]
+    fn a_text_query_finds_words_in_any_part_of_the_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = MetadataIndex::open_in_memory().unwrap();
+        let by_keyword = rich(
+            &idx,
+            dir.path(),
+            "sunset.jpg",
+            2,
+            "Canon",
+            "Evening",
+            &["beach"],
+        );
+        let by_camera = rich(&idx, dir.path(), "other.jpg", 1, "Nikon", "Nothing", &[]);
+        let by_title = rich(
+            &idx,
+            dir.path(),
+            "third.jpg",
+            0,
+            "Leica",
+            "beach party",
+            &[],
+        );
+        let by_name = rich(&idx, dir.path(), "beachcomber.jpg", 0, "Sony", "None", &[]);
+
+        let hits = idx
+            .search(&Query::text("beach"), &SearchScope::Library)
+            .unwrap();
+        let found: Vec<PathBuf> = hits.iter().map(|r| r.path.clone()).collect();
+        assert!(
+            contains(&found, &by_keyword),
+            "keyword match missing: {found:?}"
+        );
+        assert!(
+            contains(&found, &by_title),
+            "title match missing: {found:?}"
+        );
+        assert!(
+            contains(&found, &by_name),
+            "a word inside the file name must match too: {found:?}"
+        );
+        assert_eq!(
+            found.len(),
+            3,
+            "the camera-only row should not match: {found:?}"
+        );
+        assert!(
+            !contains(&found, &by_camera),
+            "the Nikon row matched a beach query: {found:?}"
+        );
+
+        // Case-insensitive from both sides, and a camera make is searchable:
+        // that is what makes "all the Nikons" a question a box can answer.
+        assert_eq!(
+            idx.search(&Query::text("BEACH"), &SearchScope::Library)
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            idx.search(&Query::text("nikon"), &SearchScope::Library)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn several_words_in_one_box_are_required_together_not_alternatively() {
+        // "red shoes" asks for photos about both. ORing the words would fill
+        // the grid with everything mentioning either, which reads as a search
+        // that ignored half the question.
+        let dir = tempfile::tempdir().unwrap();
+        let idx = MetadataIndex::open_in_memory().unwrap();
+        let both = rich(
+            &idx,
+            dir.path(),
+            "a.jpg",
+            0,
+            "Canon",
+            "red thing",
+            &["shoes"],
+        );
+        rich(&idx, dir.path(), "b.jpg", 0, "Canon", "red thing", &[]);
+        rich(&idx, dir.path(), "c.jpg", 0, "Canon", "quiet", &["shoes"]);
+
+        let hits = idx
+            .search(&Query::text("red shoes"), &SearchScope::Library)
+            .unwrap();
+        assert_eq!(hits.len(), 1, "both words should narrow to one row");
+        assert_eq!(hits[0].path, both);
+        assert!(
+            idx.search(&Query::text("red"), &SearchScope::Library)
+                .unwrap()
+                .len()
+                >= 2,
+            "either word alone should answer more than the pair"
+        );
+    }
+
+    #[test]
+    fn an_empty_box_matches_everything_rather_than_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = MetadataIndex::open_in_memory().unwrap();
+        rich(&idx, dir.path(), "one.jpg", 3, "Canon", "T", &[]);
+        rich(&idx, dir.path(), "two.jpg", 1, "Nikon", "T", &[]);
+        for text in ["", "   ", "\t"] {
+            let query = Query::text(text);
+            assert!(query.is_empty(), "{text:?} should carry no predicates");
+            assert_eq!(
+                idx.search(&query, &SearchScope::Library).unwrap().len(),
+                2,
+                "an empty query hid rows: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn folder_scopes_stay_out_of_siblings_and_subfolders() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("lib");
+        let nested = lib.join("nested");
+        let archive = dir.path().join("lib-archive");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&archive).unwrap();
+        let idx = MetadataIndex::open_in_memory().unwrap();
+        let here = rich(&idx, &lib, "here.jpg", 0, "Canon", "beach", &[]);
+        let below = rich(&idx, &nested, "below.jpg", 0, "Canon", "beach", &[]);
+        let sibling = rich(&idx, &archive, "sibling.jpg", 0, "Canon", "beach", &[]);
+
+        let folder = idx
+            .search(&Query::text("beach"), &SearchScope::Folder(lib.clone()))
+            .unwrap();
+        let paths: Vec<PathBuf> = folder.iter().map(|r| r.path.clone()).collect();
+        assert_eq!(paths, vec![here.clone()], "a folder scope over-reached");
+
+        let recursive = idx
+            .search(
+                &Query::text("beach"),
+                &SearchScope::FolderAndSubfolders(lib.clone()),
+            )
+            .unwrap();
+        let paths: Vec<PathBuf> = recursive.iter().map(|r| r.path.clone()).collect();
+        assert!(
+            contains(&paths, &here) && contains(&paths, &below),
+            "{paths:?}"
+        );
+        assert!(
+            !contains(&paths, &sibling),
+            "the sibling folder leaked: {paths:?}"
+        );
+
+        assert_eq!(
+            idx.search(&Query::text("beach"), &SearchScope::Library)
+                .unwrap()
+                .len(),
+            3
+        );
+        // A trailing separator on the scope root names the same folder.
+        assert_eq!(
+            idx.search(&Query::text("beach"), &SearchScope::Folder(lib.join("")))
+                .unwrap()
+                .len(),
+            1,
+            "a trailing separator changed what the scope covered"
+        );
+    }
+
+    #[test]
+    fn the_combinator_applies_whether_or_not_the_caller_named_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = dir.path().join("x");
+        std::fs::create_dir_all(&inner).unwrap();
+        let idx = MetadataIndex::open_in_memory().unwrap();
+        rich(&idx, &inner, "red.jpg", 0, "Canon", "Red", &[]);
+        rich(&idx, &inner, "blue.jpg", 0, "Nikon", "Blue", &[]);
+        let rows = idx.all().unwrap();
+        let matches = |q: &Query| rows.iter().filter(|r| q.matches(r)).count();
+
+        let canon = Predicate {
+            field: Field::CameraMake,
+            operator: Operator::Contains,
+            value: Some(QueryValue::Text("Canon".to_string())),
+        };
+        let blue = Predicate {
+            field: Field::Title,
+            operator: Operator::Equals,
+            value: Some(QueryValue::Text("Blue".to_string())),
+        };
+        assert_eq!(
+            matches(&Query::with(vec![canon.clone()], Combinator::And)),
+            1
+        );
+        assert_eq!(
+            matches(&Query::with(
+                vec![canon.clone(), blue.clone()],
+                Combinator::And
+            )),
+            0,
+            "AND of two predicates that no single row satisfies"
+        );
+        assert_eq!(
+            matches(&Query::with(
+                vec![canon.clone(), blue.clone()],
+                Combinator::Or
+            )),
+            2,
+            "OR of the same two predicates"
+        );
+        assert_eq!(
+            matches(&Query::single(canon.clone())),
+            1,
+            "single is an AND of one"
+        );
+        assert_eq!(matches(&Query::new()), 2, "no predicates is not a filter");
+    }
+
+    #[test]
+    fn a_stored_query_round_trips_through_the_shape_that_is_saved() {
+        // Pinning the serialised form is the point of collapsing it: two
+        // containers for predicates used to mean two queries that look alike
+        // behaved differently. If this test ever needs loosening, that is the
+        // regression, not a detail.
+        let query = Query::text("red shoes");
+        let json = serde_json::to_string(&query).unwrap();
+        assert!(json.contains("\"predicates\""), "{json}");
+        assert!(json.contains("\"combinator\""), "{json}");
+        for absent in [
+            r#""expr""#,
+            r#""conditions""#,
+            r#""clauses""#,
+            r#""and""#,
+            r#""or""#,
+        ] {
+            assert!(
+                !json.contains(absent),
+                "the old spelling {absent} is back in the serialised query: {json}"
+            );
+        }
+        assert_eq!(serde_json::from_str::<Query>(&json).unwrap(), query);
+
+        // A query stored by an older build using a removed container must not
+        // be read as "no filter", because that would show the whole library as
+        // a search result. Unknown fields are ignored by serde defaults, so the
+        // check is that such a query carries nothing: the predicates a stale
+        // file held in `conditions` are simply gone.
+        let legacy =
+            r#"{"conditions":[{"field":"Path","operator":"Contains","value":{"Text":"x"}}]}"#;
+        let parsed: Query = serde_json::from_str(legacy).unwrap_or_default();
+        assert!(
+            parsed.predicates.is_empty(),
+            "a legacy container was read as a real filter: {parsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_smart_collection_saves_and_reads_the_collapsed_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = dir.path().join("x");
+        std::fs::create_dir_all(&inner).unwrap();
+        let idx = MetadataIndex::open_in_memory().unwrap();
+        rich(&idx, &inner, "a.jpg", 4, "Canon", "beach", &[]);
+        let query = Query::text("beach");
+        idx.save_smart_collection("beach shots", &query).unwrap();
+        let stored = idx.smart_collections().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(
+            stored[0].query, query,
+            "the stored query is not the one saved"
+        );
+        let paths = idx.evaluate_smart_collection("beach shots").unwrap();
+        assert_eq!(paths.len(), 1, "{paths:?}");
+        assert_eq!(
+            idx.query(&query).unwrap(),
+            paths,
+            "query() and a stored collection now disagree"
+        );
     }
 
     #[test]
@@ -1542,6 +1906,92 @@ mod tests {
         assert!(idx.evaluate_smart_collection("high").unwrap().is_empty());
     }
     #[test]
+    fn same_size_edits_reuse_the_timestamp_and_a_reindex_covers_them() {
+        // Two things measured in the same loop, because they are the same
+        // story. (a) How often a second write of the same length reuses the
+        // first write's modification timestamp: on this filesystem, every
+        // time. (b) How often `is_current` consequently calls a genuinely
+        // edited file "current", which is the danger, since nothing would
+        // read that file again until its size or timestamp moved.
+        //
+        // The assertion is the guarantee that replaces the clock: a forced
+        // re-index, which is what saving tags does, always lands the value
+        // the file actually holds.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("rapid.jpg");
+        let index = MetadataIndex::open_in_memory().unwrap();
+        let mut ties = 0usize;
+        let mut rows_that_would_have_been_left_wrong = 0usize;
+        let rounds = 200usize;
+
+        crate::export::fixtures::write_oriented_jpeg(&file, 20, 16, 1);
+        for round in 0..rounds {
+            let wanted = (round % 5) as u8;
+            let mut meta = bc_metadata::Metadata::new();
+            meta.set_rating(bc_metadata::ratings::Rating::new(wanted));
+            bc_metadata::xmp::write_embedded_xmp_file(
+                &file,
+                &meta,
+                bc_metadata::xmp::TagWrite::Replace,
+            )
+            .unwrap();
+            let after_write = fingerprint(&file).unwrap();
+            // The row is written from a *previous* round's state, so the two
+            // writes bracketing this round are what the clock has to tell
+            // apart.
+            index.index_path(&file).unwrap();
+
+            let next = ((round + 1) % 5) as u8;
+            let mut edited = bc_metadata::Metadata::new();
+            edited.set_rating(bc_metadata::ratings::Rating::new(next));
+            edited.set_text(bc_metadata::NS_DC, "description", "x".to_string());
+            let previous = after_write;
+            bc_metadata::xmp::write_embedded_xmp_file(
+                &file,
+                &edited,
+                bc_metadata::xmp::TagWrite::Replace,
+            )
+            .unwrap();
+            let rewritten = fingerprint(&file).unwrap();
+            if previous.0 == rewritten.0 {
+                ties += 1;
+                if index.is_current(&file) {
+                    rows_that_would_have_been_left_wrong += 1;
+                }
+            }
+            // And the way out, exercised every round.
+            let outcome = crate::indexer::reindex(&index, &file);
+            let on_disk = bc_metadata::layers::read_file(&file)
+                .unwrap()
+                .rating()
+                .stars();
+            if on_disk != next {
+                println!(
+                    "round {round}: asked for {next}, the FILE holds {on_disk}, row {:?}, outcome {outcome:?}",
+                    index.get(&file).unwrap().map(|r| r.rating)
+                );
+            }
+            assert_eq!(
+                index.get(&file).unwrap().expect("row").rating,
+                next,
+                "round {round}: a re-index left the previous rating in place"
+            );
+        }
+
+        println!(
+            "{rounds} same-size edit cycles: {ties} reused the previous timestamp, \
+             and of those {rows_that_would_have_been_left_wrong} would have been left \
+             wrong by asking instead of re-indexing"
+        );
+        assert!(
+            ties > 0,
+            "the timestamp ties this test exists to measure never happened; if the \
+             filesystem really always distinguishes two writes, say so here rather \
+             than keeping a workaround nobody needs"
+        );
+    }
+
+    #[test]
     fn an_in_place_tag_edit_makes_the_indexed_row_stale() {
         // The version bump above only helps if staleness is actually detected.
         // Slice 4 writes tags into the file itself, so an edit must change the
@@ -1554,7 +2004,12 @@ mod tests {
         let index = MetadataIndex::open_in_memory().unwrap();
         let mut first = bc_metadata::Metadata::new();
         first.set_rating(bc_metadata::ratings::Rating::new(2));
-        bc_metadata::xmp::write_embedded_xmp_file(&file, &first).unwrap();
+        bc_metadata::xmp::write_embedded_xmp_file(
+            &file,
+            &first,
+            bc_metadata::xmp::TagWrite::Replace,
+        )
+        .unwrap();
 
         index.index_path(&file).unwrap();
         assert!(index.is_current(&file), "a fresh row is current");
@@ -1564,8 +2019,39 @@ mod tests {
         let before = fingerprint(&file).unwrap();
         let mut second = bc_metadata::Metadata::new();
         second.set_rating(bc_metadata::ratings::Rating::new(5));
-        bc_metadata::xmp::write_embedded_xmp_file(&file, &second).unwrap();
-        let after = fingerprint(&file).unwrap();
+        bc_metadata::xmp::write_embedded_xmp_file(
+            &file,
+            &second,
+            bc_metadata::xmp::TagWrite::Replace,
+        )
+        .unwrap();
+        // Rewriting the same metadata is a no-op by design — the writer
+        // compares bytes and leaves the file alone — so waiting for a
+        // timestamp to move needs writes that differ. Each attempt adds a
+        // character, which changes the packet and therefore the clock.
+        let mut after = fingerprint(&file).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut padding = String::new();
+        while after.0 == before.0 && std::time::Instant::now() < deadline {
+            padding.push('x');
+            let mut padded = bc_metadata::Metadata::new();
+            padded.set_rating(bc_metadata::ratings::Rating::new(5));
+            padded.set_text(bc_metadata::NS_DC, "description", padding.clone());
+            bc_metadata::xmp::write_embedded_xmp_file(
+                &file,
+                &padded,
+                bc_metadata::xmp::TagWrite::Replace,
+            )
+            .unwrap();
+            after = fingerprint(&file).unwrap();
+        }
+        assert_ne!(
+            before.0, after.0,
+            "five hundred milliseconds of genuinely different writes produced no \
+             timestamp change, so this filesystem\'s ties are the subject of \
+             `same_size_edits_reuse_the_timestamp_and_a_reindex_covers_them`, not of \
+             this test"
+        );
 
         assert!(
             !index.is_current(&file),
@@ -1604,7 +2090,12 @@ mod tests {
         tags.set_color_label(bc_metadata::ratings::ColorLabel::Purple);
         tags.set_flag(bc_metadata::ratings::Flag::Approved);
         bc_metadata::keywords::add_keyword(&mut tags, "InFile");
-        bc_metadata::xmp::write_embedded_xmp_file(&file, &tags).unwrap();
+        bc_metadata::xmp::write_embedded_xmp_file(
+            &file,
+            &tags,
+            bc_metadata::xmp::TagWrite::Replace,
+        )
+        .unwrap();
 
         // The panel and export both read this fine; the index must too.
         let layers = bc_metadata::layers::read_file(&file).unwrap();

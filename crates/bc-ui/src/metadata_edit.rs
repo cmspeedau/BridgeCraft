@@ -421,13 +421,18 @@ pub fn save_tags(path: &Path, tags: &TagState) -> std::result::Result<TagTarget,
     let mut meta = Metadata::new();
     tags.apply_to(&mut meta);
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-    let written = bc_metadata::xmp::write_embedded_xmp(&bytes, &meta).map_err(|error| {
-        if wrote_sidecar {
-            format!("{error} (the sidecar was updated, the file was not)")
-        } else {
-            error.to_string()
-        }
-    })?;
+    // `Replace`, because this is the whole tag state the panel is showing:
+    // a star rating the user cleared is absent on purpose, and absence has to
+    // reach the file rather than merge into what was already there.
+    let written =
+        bc_metadata::xmp::write_embedded_xmp(&bytes, &meta, bc_metadata::xmp::TagWrite::Replace)
+            .map_err(|error| {
+                if wrote_sidecar {
+                    format!("{error} (the sidecar was updated, the file was not)")
+                } else {
+                    error.to_string()
+                }
+            })?;
     if written != bytes {
         write_bytes_atomically(path, &written).map_err(|error| {
             if wrote_sidecar {
@@ -1313,6 +1318,57 @@ mod tests {
             std::fs::read(&image).unwrap(),
             png,
             "PNG bytes must be untouched while there is no in-place writer"
+        );
+    }
+
+    #[test]
+    fn clearing_a_star_through_the_panel_path_removes_it_from_the_file() {
+        // The interaction slice 2 shipped: clicking the current rating again
+        // clears it. Until `TagWrite` existed, that clear reached the session
+        // and the sidecar but merged into the packet as a no-op, so the JPEG
+        // still said four stars — and the panel would show it again on reopen.
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("asset.jpg");
+        std::fs::write(&image, real_jpeg()).unwrap();
+
+        let rated = TagState {
+            stars: 4,
+            label: "Blue".to_string(),
+            flag: Flag::Rejected,
+            keywords: vec!["Keep".to_string()],
+        };
+        save_tags(&image, &rated).unwrap();
+        assert_eq!(
+            TagState::from_metadata(&read_panel_metadata(&image)).stars,
+            4
+        );
+
+        let cleared = TagState {
+            stars: 0,
+            label: String::new(),
+            flag: Flag::None,
+            keywords: vec![],
+        };
+        assert_eq!(
+            save_tags(&image, &cleared),
+            Ok(TagTarget::Embedded),
+            "a JPEG still has no reason to grow a sidecar"
+        );
+        let after = TagState::from_metadata(&read_panel_metadata(&image));
+        assert_eq!(after.stars, 0, "the cleared rating is still in the file");
+        assert!(
+            after.label.is_empty(),
+            "the cleared label is still in the file"
+        );
+        assert_eq!(
+            after.flag,
+            Flag::None,
+            "the cleared flag is still in the file"
+        );
+        assert!(
+            after.keywords.is_empty(),
+            "the cleared keywords are still in the file: {:?}",
+            after.keywords
         );
     }
 

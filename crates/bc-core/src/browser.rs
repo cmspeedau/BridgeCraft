@@ -1,7 +1,8 @@
 //! Browser state: the content list for the current root plus selection and sort.
 
 use crate::entry::Entry;
-use crate::fs::{sort_entries, SortDir, SortKey, TagFilter, TagValues};
+use crate::fs::{sort_entries, SortDir, SortKey, TagFilter, TagValue, TagValues};
+use crate::metadata_index::{IndexedFile, SearchScope};
 use crate::selection::Selection;
 use crate::{CoreError, Result};
 
@@ -23,6 +24,31 @@ pub struct BrowserState {
     pub tags: TagValues,
     /// Rating, label and flag filter. Empty means every file passes.
     pub tag_filter: TagFilter,
+    /// What the panel is currently showing. A search replaces the folder's
+    /// own listing with the rows the index returned, and everything that
+    /// follows from that — the breadcrumb, what `refresh` does, whether a
+    /// drag may move a file — is decided here rather than inferred from the
+    /// entries looking odd.
+    pub listing: Listing,
+    /// Paths that were selected when the panel last held real rows, kept so
+    /// narrowing with the search box does not throw away a selection the user
+    /// made in the folder. The name filter already behaves this way; a search
+    /// that cleared it would be the odd one, and selecting five photos then
+    /// typing a word to find a sixth is the ordinary case.
+    pending_selection: Vec<std::path::PathBuf>,
+}
+
+/// Whether the content panel is showing a folder or the answer to a query.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Listing {
+    /// The direct children of `root`.
+    #[default]
+    Folder,
+    /// Rows the metadata index returned for `text` within `scope`. Kept
+    /// because the interface has to show what produced the grid: a box that
+    /// says one thing over a grid that came from another is worse than no
+    /// search at all.
+    Search { text: String, scope: SearchScope },
 }
 
 impl BrowserState {
@@ -38,12 +64,22 @@ impl BrowserState {
 
     /// Re-list the current root, preserving sort and filter settings.
     /// Selection is preserved by path for entries that still exist.
+    ///
+    /// Producing a folder listing also ends a search: whatever asked for this
+    /// (a watcher settling, a manual refresh, navigation) has the folder's
+    /// contents in hand afterwards, and leaving `listing` saying `Search` would
+    /// describe rows that are no longer on screen.
     pub fn refresh(&mut self) -> Result<()> {
         let root = self
             .root
             .as_ref()
             .ok_or_else(|| CoreError::PathNotFound("<no root open>".to_string()))?;
         self.entries = crate::fs::list_dir(root)?;
+        // A folder listing is the end of a search, and with it the selection
+        // the search was carrying: keeping it would resurrect files from a
+        // query the user has left.
+        self.pending_selection.clear();
+        self.listing = Listing::Folder;
         sort_entries(&mut self.entries, self.sort_key, self.sort_dir, &self.tags);
         Ok(())
     }
@@ -111,6 +147,99 @@ impl BrowserState {
             })
             .map(|(i, _)| i)
             .collect()
+    }
+
+    /// Mark the panel as showing the answer to `text` within `scope`, and drop
+    /// the folder's rows so nothing is displayed as a result that isn't one.
+    ///
+    /// The entries go empty rather than staying put: the query runs on another
+    /// thread, and between asking and answering the honest grid is an empty
+    /// one with a "searching…" state, not the previous folder pretending to be
+    /// the result.
+    pub fn enter_search(&mut self, text: &str, scope: SearchScope) {
+        self.listing = Listing::Search {
+            text: text.to_string(),
+            scope,
+        };
+        self.pending_selection = self
+            .selection
+            .indices()
+            .filter_map(|i| self.entries.get(i).map(|e| e.path.clone()))
+            .collect();
+        self.entries.clear();
+        self.selection.clear();
+        self.tags.clear();
+    }
+
+    /// Replace the panel's contents with rows from the index.
+    ///
+    /// Size and modification time come from the row, not from the disk: one
+    /// read of the table is what made this whole feature affordable, and
+    /// re-stating every result to be pedantically fresh would put the cost
+    /// back. The tag values arrive with the rows, so a result set sorts by
+    /// rating without a second query.
+    pub fn set_search_results(&mut self, rows: Vec<IndexedFile>) {
+        // A batch of results replaces the last one, so the paths still asked
+        // for are either what the user selected before the search or what the
+        // previous batch had kept.
+        let mut selected = std::mem::take(&mut self.pending_selection);
+        if selected.is_empty() {
+            selected = self
+                .selection
+                .indices()
+                .filter_map(|i| self.entries.get(i).map(|e| e.path.clone()))
+                .collect();
+        }
+        self.pending_selection = selected.clone();
+        let mut tags = crate::fs::TagValues::default();
+        let mut entries = Vec::with_capacity(rows.len());
+        for row in rows {
+            tags.insert(
+                row.path.clone(),
+                TagValue {
+                    rating: row.rating,
+                    label: row.color_label,
+                    flag: row.flag,
+                },
+            );
+            entries.push(Entry {
+                path: row.path.clone(),
+                is_dir: false,
+                size: row.size,
+                // The index stores nanoseconds since the epoch; a negative or
+                // absurd value from a damaged row becomes "unknown date" rather
+                // than a panic or a year-1 timestamp in the grid.
+                modified: if row.mtime_ns >= 0 {
+                    std::time::UNIX_EPOCH
+                        .checked_add(std::time::Duration::from_nanos(row.mtime_ns as u64))
+                } else {
+                    None
+                },
+            });
+        }
+        self.entries = entries;
+        self.tags = tags;
+        sort_entries(&mut self.entries, self.sort_key, self.sort_dir, &self.tags);
+        self.selection.clear();
+        for (idx, entry) in self.entries.iter().enumerate() {
+            if selected.contains(&entry.path) {
+                self.selection.toggle(idx);
+            }
+        }
+    }
+
+    /// Whether the grid is showing search results.
+    pub fn is_searching(&self) -> bool {
+        matches!(self.listing, Listing::Search { .. })
+    }
+
+    /// The query that produced the current grid, for the breadcrumb and the
+    /// status line.
+    pub fn search(&self) -> Option<(&str, &SearchScope)> {
+        match &self.listing {
+            Listing::Search { text, scope } => Some((text.as_str(), scope)),
+            Listing::Folder => None,
+        }
     }
 
     /// Change the sort order and re-sort without re-reading the directory.
@@ -201,6 +330,153 @@ impl BrowserState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(
+        path: &std::path::Path,
+        size: u64,
+        mtime_ns: i64,
+        rating: u8,
+        label: &str,
+    ) -> IndexedFile {
+        IndexedFile {
+            path: path.to_path_buf(),
+            root: path.parent().map(|p| p.to_path_buf()),
+            size,
+            mtime_ns,
+            sidecar_mtime_ns: None,
+            width: None,
+            height: None,
+            created: None,
+            modified: None,
+            camera_make: None,
+            camera_model: None,
+            rating,
+            color_label: (!label.is_empty()).then(|| label.to_string()),
+            flag: None,
+            keywords: vec![],
+            title: None,
+            description: None,
+            schema_version: 1,
+            extractor_version: 2,
+        }
+    }
+
+    #[test]
+    fn entering_a_search_empties_the_grid_rather_than_reusing_the_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.jpg"), b"x").unwrap();
+        let mut st = BrowserState::default();
+        st.open(dir.path()).unwrap();
+        assert_eq!(st.len(), 1);
+
+        st.enter_search("beach", SearchScope::Library);
+        assert!(st.is_searching());
+        assert!(st.entries.is_empty(), "the old folder is still on screen");
+        assert!(
+            st.tags.is_empty(),
+            "the old folder's tags are still in hand"
+        );
+        let (text, scope) = st.search().expect("the query is remembered");
+        assert_eq!(text, "beach");
+        assert_eq!(scope, &SearchScope::Library);
+    }
+
+    #[test]
+    fn search_results_become_entries_from_the_index_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = BrowserState::default();
+        let first = dir.path().join("first.jpg");
+        let second = dir.path().join("second.jpg");
+        let mtime = 1_700_000_000_000_000_000_i64;
+        st.enter_search("beach", SearchScope::Library);
+        st.set_search_results(vec![
+            row(&second, 200, mtime, 5, "Red"),
+            row(&first, 100, mtime - 1_000, 1, ""),
+        ]);
+
+        assert_eq!(st.len(), 2);
+        // Size and date come from the row, which is the whole point of asking
+        // the index instead of opening every file again.
+        assert_eq!(st.entries[0].size, 100, "sorted ascending by size");
+        assert_eq!(
+            st.entries[0]
+                .modified
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as i64,
+            mtime - 1_000,
+            "the result's date is not the indexed one"
+        );
+        // The tags that sort and filter read came with the rows.
+        assert_eq!(st.tags.get(&second).unwrap().rating, 5);
+        assert_eq!(st.tags.get(&first).unwrap().label.as_deref(), None);
+
+        st.set_sort(SortKey::Rating, SortDir::Desc);
+        assert_eq!(st.entries[0].path, second, "a rating sort ignored the rows");
+    }
+
+    #[test]
+    fn a_result_row_with_an_impossible_date_shows_no_date_instead_of_panicking() {
+        // The value would come from a damaged database, and the panel must not
+        // read a negative nanosecond count as year 1601 or panic on the frame.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("odd.jpg");
+        let mut st = BrowserState::default();
+        st.enter_search("x", SearchScope::Library);
+        st.set_search_results(vec![row(&path, 1, -5, 0, "")]);
+        assert_eq!(st.len(), 1);
+        assert!(
+            st.entries[0].modified.is_none(),
+            "a negative mtime became a date"
+        );
+    }
+
+    #[test]
+    fn results_keep_the_selection_that_still_appears_in_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let keep = dir.path().join("keep.jpg");
+        let drop = dir.path().join("drop.jpg");
+        let mut st = BrowserState::default();
+        st.enter_search("a", SearchScope::Library);
+        st.set_search_results(vec![
+            row(&keep, 1, 1_000, 0, ""),
+            row(&drop, 1, 1_000, 0, ""),
+        ]);
+        let keep_idx = (0..st.len())
+            .find(|&i| st.entry(i).unwrap().path == keep)
+            .unwrap();
+        st.selection.select_only(keep_idx);
+
+        st.enter_search("ab", SearchScope::Library);
+        st.set_search_results(vec![row(&keep, 1, 1_000, 0, "")]);
+        assert_eq!(st.selection.indices().collect::<Vec<_>>(), vec![0]);
+
+        st.enter_search("abc", SearchScope::Library);
+        st.set_search_results(vec![row(&drop, 1, 1_000, 0, "")]);
+        assert_eq!(
+            st.selection.indices().count(),
+            0,
+            "a file that left the results stayed selected underneath"
+        );
+    }
+
+    #[test]
+    fn re_list_the_folder_ends_the_search_state() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("on-disk.jpg"), b"x").unwrap();
+        let mut st = BrowserState::default();
+        st.open(dir.path()).unwrap();
+        st.enter_search("beach", SearchScope::Folder(dir.path().to_path_buf()));
+        assert!(st.is_searching());
+
+        // A watcher settling re-lists the folder; the panel is then showing
+        // the folder, whatever the last query was.
+        st.refresh().unwrap();
+        assert!(!st.is_searching(), "the panel still claims to be searching");
+        assert!(st.search().is_none());
+        assert_eq!(st.len(), 1);
+    }
 
     #[test]
     fn open_and_sort_and_select() {

@@ -83,6 +83,37 @@ pub fn read_embedded_xmp_file(path: &Path) -> Result<Option<Metadata>, MetadataE
     read_embedded_xmp(&bytes)
 }
 
+/// The properties BridgeCraft owns: the four tag values the panel edits.
+///
+/// `Rating`, `Label` and `Flag` are written by `set_*` helpers that *remove*
+/// the property when the value is cleared, and keywords are `dc:subject`. So a
+/// metadata that lacks one of these does not distinguish "cleared" from "not
+/// touched" — which is what `TagWrite` is for.
+pub const TAG_PROPERTIES: [(&str, &str); 4] = [
+    (crate::NS_XMP, "Rating"),
+    (crate::NS_PHOTOSHOP, "Label"),
+    (crate::NS_BRIDGECRAFT, "Flag"),
+    (crate::NS_DC, "subject"),
+];
+
+/// What a save means to say about the four tag properties.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagWrite {
+    /// The caller's metadata is the whole tag state. A property it does not
+    /// carry was cleared, and comes out of the packet. This is what the panel
+    /// and export do: they load every tag first, so absence is an answer and
+    /// not an omission. Without it, clicking the current stars to clear them
+    /// updated the sidecar and the session but left the old rating inside the
+    /// JPEG or TIFF forever — measured, not assumed: a packet holding rating 4
+    /// and label Red still held both after a save carrying neither.
+    Replace,
+    /// Only the properties the caller carries change; anything else already in
+    /// the packet is left alone. This is what a partial update needs, and is
+    /// what `rewriting_a_packet_preserves_what_the_caller_did_not_change`
+    /// exercises.
+    Merge,
+}
+
 /// Splice a finished packet into a JPEG, replacing the old `APP1` XMP segment
 /// or inserting a new one.
 fn splice_jpeg_xmp(data: &[u8], packet: &[u8]) -> Result<Vec<u8>, MetadataError> {
@@ -141,10 +172,14 @@ fn existing_packet(data: &[u8]) -> Result<Metadata, MetadataError> {
 /// Containers that cannot carry a packet here (PNG, GIF, WebP, camera RAW)
 /// return `UnsupportedWriteTarget`: the caller then uses a sidecar, which is
 /// the same rule the EXIF writer already follows.
-pub fn write_embedded_xmp(data: &[u8], metadata: &Metadata) -> Result<Vec<u8>, MetadataError> {
+pub fn write_embedded_xmp(
+    data: &[u8],
+    metadata: &Metadata,
+    tags: TagWrite,
+) -> Result<Vec<u8>, MetadataError> {
     if crate::embedded::is_jpeg(data) {
         let mut merged = existing_packet(data)?;
-        apply_properties(&mut merged, metadata);
+        apply_properties(&mut merged, metadata, tags);
         if merged.is_empty() {
             // Nothing to store: drop the packet instead of writing an empty one.
             return match crate::embedded::find_jpeg_xmp_segment_range(data) {
@@ -163,7 +198,7 @@ pub fn write_embedded_xmp(data: &[u8], metadata: &Metadata) -> Result<Vec<u8>, M
 
     if crate::embedded::is_tiff(data) {
         let mut merged = existing_packet(data)?;
-        apply_properties(&mut merged, metadata);
+        apply_properties(&mut merged, metadata, tags);
         let packet = write_xmp(&merged);
         let payload = if merged.is_empty() {
             Vec::new()
@@ -186,16 +221,29 @@ pub fn write_embedded_xmp(data: &[u8], metadata: &Metadata) -> Result<Vec<u8>, M
 }
 
 /// Copy every property of `source` into `target`, replacing same-named ones.
-fn apply_properties(target: &mut Metadata, source: &Metadata) {
+fn apply_properties(target: &mut Metadata, source: &Metadata, tags: TagWrite) {
+    if tags == TagWrite::Replace {
+        // Absence means cleared: take the owned properties out first, then let
+        // whatever the caller did carry overwrite them below.
+        for (namespace, name) in TAG_PROPERTIES {
+            if source.get(namespace, name).is_none() {
+                target.remove(namespace, name);
+            }
+        }
+    }
     for (name, value) in source.properties() {
         target.set(name.namespace.clone(), name.name.clone(), value.clone());
     }
 }
 
 /// Read, update and atomically replace the embedded packet in a file.
-pub fn write_embedded_xmp_file(path: &Path, metadata: &Metadata) -> Result<(), MetadataError> {
+pub fn write_embedded_xmp_file(
+    path: &Path,
+    metadata: &Metadata,
+    tags: TagWrite,
+) -> Result<(), MetadataError> {
     let input = std::fs::read(path)?;
-    let output = write_embedded_xmp(&input, metadata)?;
+    let output = write_embedded_xmp(&input, metadata, tags)?;
     if output == input {
         return Ok(());
     }
@@ -796,7 +844,7 @@ mod tests {
 
         let mut meta = Metadata::new();
         meta.set_text(NS_XMP, "Rating", "4".to_string());
-        let written = write_embedded_xmp(&jpeg, &meta).unwrap();
+        let written = write_embedded_xmp(&jpeg, &meta, TagWrite::Replace).unwrap();
 
         // The packet is readable, and it went in after the EXIF APP1.
         let read = read_embedded_xmp(&written)
@@ -821,6 +869,70 @@ mod tests {
     }
 
     #[test]
+    fn a_cleared_star_and_label_leave_the_packet_rather_than_staying_in_it() {
+        // The bug this replaces: `set_rating(Rating::new(0))` removes the
+        // property instead of writing zero, so a save that meant to clear a
+        // rating carried no `xmp:Rating` at all — indistinguishable from a save
+        // that did not touch ratings. Merging then left the old value inside
+        // the JPEG forever while the sidecar beside it said something
+        // different, so the two layers disagreed about a property the user had
+        // just set.
+        let jpeg = jpeg_fixture();
+        let mut rated = Metadata::new();
+        rated.set_rating(crate::ratings::Rating::new(4));
+        rated.set_color_label(crate::ratings::ColorLabel::Red);
+        crate::keywords::add_keyword(&mut rated, "Keep");
+        rated.set_text(crate::NS_XMP, "CreatorTool", "Some Other App".to_string());
+        let with_tags = write_embedded_xmp(&jpeg, &rated, TagWrite::Replace).unwrap();
+        assert_eq!(
+            read_embedded_xmp(&with_tags)
+                .unwrap()
+                .unwrap()
+                .rating()
+                .stars(),
+            4,
+            "the fixture did not start tagged"
+        );
+
+        // The clear: the same authoritative state, now carrying neither stars,
+        // nor a label, nor keywords.
+        let mut cleared = Metadata::new();
+        cleared.set_text(crate::NS_XMP, "CreatorTool", "Some Other App".to_string());
+        let after = write_embedded_xmp(&with_tags, &cleared, TagWrite::Replace).unwrap();
+
+        let read = read_embedded_xmp(&after).unwrap().expect("packet kept");
+        assert_eq!(
+            read.rating().stars(),
+            0,
+            "the cleared rating is still in the file"
+        );
+        assert_eq!(
+            read.color_label(),
+            crate::ratings::ColorLabel::None,
+            "the cleared label is still in the file"
+        );
+        assert!(
+            crate::keywords::subjects(&read).is_empty(),
+            "the cleared keywords are still in the file"
+        );
+        // Outside the four owned properties, a replace is still additive:
+        // another application's packet contents are not BridgeCraft's to clear.
+        assert_eq!(
+            read.text(crate::NS_XMP, "CreatorTool"),
+            Some("Some Other App"),
+            "Replace reached past the tag properties"
+        );
+    }
+
+    /// A JPEG the packet splicer accepts: SOI, a start-of-scan marker and EOI.
+    fn jpeg_fixture() -> Vec<u8> {
+        let mut out = vec![0xFF, 0xD8];
+        out.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 0x00, 0x01, 0x00, 0x00]);
+        out.extend_from_slice(&[0xFF, 0xD9]);
+        out
+    }
+
+    #[test]
     fn rewriting_a_packet_preserves_what_the_caller_did_not_change() {
         // A packet that already carries keywords and another tool's namespace.
         let original = concat!(
@@ -841,10 +953,13 @@ mod tests {
         jpeg.extend_from_slice(&body);
         jpeg.extend_from_slice(&[0xFF, 0xD9]);
 
-        // Change only the rating.
+        // Change only the rating. `Merge`, because this caller carries one
+        // property and has nothing to say about the others — the case that
+        // must stay additive, and the reason `Replace` is stated rather than
+        // inferred from what a metadata happens to omit.
         let mut change = Metadata::new();
         change.set_text(NS_XMP, "Rating", "5".to_string());
-        let written = write_embedded_xmp(&jpeg, &change).unwrap();
+        let written = write_embedded_xmp(&jpeg, &change, TagWrite::Merge).unwrap();
         let meta = read_embedded_xmp(&written)
             .unwrap()
             .expect("packet readable");
@@ -881,7 +996,7 @@ mod tests {
         let huge = "x".repeat(70_000);
         meta.set_text(NS_DC, "description", huge);
         let jpeg = vec![0xFF, 0xD8, 0xFF, 0xD9];
-        let error = write_embedded_xmp(&jpeg, &meta).unwrap_err();
+        let error = write_embedded_xmp(&jpeg, &meta, TagWrite::Replace).unwrap_err();
         assert!(
             matches!(error, MetadataError::UnsupportedWriteTarget(_)),
             "{error:?}"
@@ -898,7 +1013,7 @@ mod tests {
         let png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
         let mut meta = Metadata::new();
         meta.set_text(NS_XMP, "Rating", "3".to_string());
-        let error = write_embedded_xmp(&png, &meta).unwrap_err();
+        let error = write_embedded_xmp(&png, &meta, TagWrite::Replace).unwrap_err();
         assert!(
             matches!(error, MetadataError::UnsupportedWriteTarget(_)),
             "PNG must say it cannot take a packet, not silently do nothing"
@@ -924,13 +1039,15 @@ mod tests {
 
         let mut change = Metadata::new();
         change.set_text(NS_XMP, "Rating", "5".to_string());
-        let error = write_embedded_xmp(&jpeg, &change).unwrap_err();
+        let error = write_embedded_xmp(&jpeg, &change, TagWrite::Replace).unwrap_err();
         assert!(
             matches!(error, MetadataError::MalformedPacket(_)),
             "expected a refusal, got {error:?}"
         );
         assert_eq!(
-            write_embedded_xmp(&jpeg, &change).unwrap_err().to_string(),
+            write_embedded_xmp(&jpeg, &change, TagWrite::Replace)
+                .unwrap_err()
+                .to_string(),
             error.to_string(),
             "the refusal must be stable, not a partial write the first time"
         );
@@ -942,7 +1059,7 @@ mod tests {
         let jpeg = vec![0xFF, 0xD8, 0xFF, 0xDA, 0x04, 0x00, 0x01, 0xFF, 0xD9];
         let mut meta = Metadata::new();
         meta.set_text(NS_XMP, "Rating", "1".to_string());
-        let written = write_embedded_xmp(&jpeg, &meta).unwrap();
+        let written = write_embedded_xmp(&jpeg, &meta, TagWrite::Replace).unwrap();
         assert_eq!(
             read_embedded_xmp(&written)
                 .unwrap()
@@ -969,7 +1086,7 @@ mod tests {
 
         let mut change = Metadata::new();
         change.set_text(NS_XMP, "Rating", "5".to_string());
-        let written = write_embedded_xmp(&input, &change).unwrap();
+        let written = write_embedded_xmp(&input, &change, TagWrite::Merge).unwrap();
         std::fs::write(path, &written).unwrap();
 
         let after = read_embedded_xmp(&written)

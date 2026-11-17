@@ -45,6 +45,10 @@ const GRID_SPACING: f32 = 8.0;
 const THUMB_MAX_EDGE: u32 = 256;
 /// Coalesce watcher event bursts into a single refresh.
 const WATCHER_DEBOUNCE: Duration = Duration::from_millis(300);
+/// How long the search box waits after the last keystroke. Longer than the
+/// watcher debounce on purpose: the watcher re-reads a directory, a search
+/// scans the whole index.
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(450);
 const LIST_ROW_HEIGHT: f32 = 28.0;
 /// Sidebar "Recent" section cap.
 const SIDEBAR_RECENTS: usize = 6;
@@ -122,10 +126,103 @@ struct ThumbJob {
     cached: bool,
 }
 
+/// What the search box searches. Two of the three need the folder that is
+/// open, so this is an interface choice resolved against the browser rather
+/// than the `bc_core::SearchScope` itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SearchScopeChoice {
+    /// The folder on screen. The default, because it is what the user is
+    /// looking at when they start typing.
+    #[default]
+    Folder,
+    FolderAndSubfolders,
+    Library,
+}
+
+impl SearchScopeChoice {
+    const ALL: [SearchScopeChoice; 3] = [
+        SearchScopeChoice::Folder,
+        SearchScopeChoice::FolderAndSubfolders,
+        SearchScopeChoice::Library,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            SearchScopeChoice::Folder => "this folder",
+            SearchScopeChoice::FolderAndSubfolders => "this folder and subfolders",
+            SearchScopeChoice::Library => "the whole library",
+        }
+    }
+
+    /// Resolve against the folder actually open. With nothing open, a folder
+    /// scope means the library — searching "nothing" and returning an empty
+    /// grid would read as a broken search.
+    fn scope(self, root: Option<&Path>) -> bc_core::SearchScope {
+        match (self, root) {
+            (SearchScopeChoice::Library, _) | (_, None) => bc_core::SearchScope::Library,
+            (SearchScopeChoice::Folder, Some(root)) => {
+                bc_core::SearchScope::Folder(root.to_path_buf())
+            }
+            (SearchScopeChoice::FolderAndSubfolders, Some(root)) => {
+                bc_core::SearchScope::FolderAndSubfolders(root.to_path_buf())
+            }
+        }
+    }
+}
+
 struct ThumbResult {
     path: PathBuf,
     max_edge: u32,
     thumb: Option<Thumbnail>,
+}
+
+/// One library-search request. The database handle travels with it rather
+/// than living in the worker: the app opens the index lazily on the first
+/// folder that needs it, and a worker spawned at startup would have to be
+/// re-spawned or polled for that handle otherwise.
+struct SearchQuery {
+    seq: u64,
+    text: String,
+    scope: bc_core::SearchScope,
+    index: Arc<bc_core::MetadataIndex>,
+}
+
+struct SearchAnswer {
+    seq: u64,
+    rows: Result<Vec<bc_core::IndexedFile>, String>,
+}
+
+/// The library search runs on its own thread, like the thumbnails.
+///
+/// A whole-library query is a table scan: measured at about 1.4 ms per 2 000
+/// rows, which is ~70 ms per keystroke on a 100 000-row index. That belongs
+/// off the paint thread, and answers carry the sequence number of the request
+/// they came from so a reply to a word the user has already finished typing is
+/// discarded instead of replacing the grid with an older answer.
+fn spawn_search_worker(rx: Receiver<SearchQuery>, tx: Sender<SearchAnswer>) {
+    let handle = std::thread::Builder::new()
+        .name("search".into())
+        .spawn(move || {
+            for job in rx {
+                let query = bc_core::Query::text(&job.text);
+                let rows = job
+                    .index
+                    .search(&query, &job.scope)
+                    .map_err(|error| error.to_string());
+                if let Err(error) = tx.send(SearchAnswer { seq: job.seq, rows }) {
+                    tracing::debug!("search answer dropped: {error}");
+                }
+            }
+        });
+    match handle {
+        Ok(_) => {}
+        Err(error) => {
+            // No worker means no answers ever arrive, so the box has to say so
+            // rather than sit on "searching…". The app notices through the
+            // send error below and reports it as a search failure.
+            tracing::warn!("search worker unavailable: {error}");
+        }
+    }
 }
 
 fn mtime_ns(modified: Option<std::time::SystemTime>) -> i64 {
@@ -282,6 +379,27 @@ pub struct BridgeApp {
     bulk_keyword: String,
     /// Keyword typed into the bulk remove field.
     bulk_keyword_remove: String,
+
+    /// The library search box. Separate from `browser.filter`, which narrows
+    /// the listing already on screen: this asks the index for rows, which may
+    /// come from anywhere in scope.
+    search_text: String,
+    search_scope: SearchScopeChoice,
+    search_tx: Sender<SearchQuery>,
+    search_rx: Receiver<SearchAnswer>,
+    /// Counters so an answer can be matched to the request it answers, and a
+    /// superseded one thrown away.
+    search_seq: u64,
+    search_waiting: Option<u64>,
+    /// When to fire the query after the last keystroke.
+    search_due: Option<Instant>,
+    /// Why the last search could not run, if it could not.
+    search_error: Option<String>,
+    /// The folder's own file count when a folder-scoped search was asked for,
+    /// and how many of those the index has never read. Nothing else can answer
+    /// that, and an empty result grid needs the difference stated.
+    search_scope_total: usize,
+    search_scope_unindexed: usize,
     bulk_rating_enabled: bool,
     bulk_label_enabled: bool,
     bulk_flag_enabled: bool,
@@ -329,6 +447,12 @@ impl BridgeApp {
         let (job_tx, job_rx) = channel::<ThumbJob>();
         let (res_tx, res_rx) = channel::<ThumbResult>();
         spawn_thumb_worker(cache_path.clone(), job_rx, res_tx);
+        // Requests go out on `query_tx`; answers come back on `answer_rx`.
+        // The field holding the receiver is `search_rx` because that is what
+        // the frame drains, but the two channels are deliberately not the same.
+        let (query_tx, query_rx) = channel::<SearchQuery>();
+        let (answer_tx, answer_rx) = channel::<SearchAnswer>();
+        spawn_search_worker(query_rx, answer_tx);
 
         let (favorites, favorites_error) = match Favorites::open_default() {
             Ok(store) => (Some(store), None),
@@ -393,6 +517,16 @@ impl BridgeApp {
             bulk_tags: metadata_edit::TagStamp::default(),
             bulk_keyword: String::new(),
             bulk_keyword_remove: String::new(),
+            search_text: String::new(),
+            search_scope: SearchScopeChoice::default(),
+            search_tx: query_tx,
+            search_rx: answer_rx,
+            search_seq: 0,
+            search_waiting: None,
+            search_due: None,
+            search_error: None,
+            search_scope_total: 0,
+            search_scope_unindexed: 0,
             bulk_rating_enabled: false,
             bulk_label_enabled: false,
             bulk_flag_enabled: false,
@@ -465,6 +599,10 @@ impl BridgeApp {
                 // Keep the tree anchored on the folder the user is in.
                 self.expanded.insert(root.to_path_buf());
                 self.attach_watcher(root);
+                // Navigation ends a search, so the box has to empty with it:
+                // a field showing last folder's query above this folder's
+                // listing would look like a filter that silently did nothing.
+                self.forget_search();
                 // Values already in the index are available before the pass
                 // starts, so a folder visited once sorts by rating immediately
                 // rather than after this visit's pass has finished.
@@ -592,9 +730,12 @@ impl BridgeApp {
         let Some(index) = self.index.clone() else {
             return;
         };
-        let cancel = std::sync::atomic::AtomicBool::new(false);
+        // `reindex`, not `index_one`: this process has just written the file,
+        // so asking the index whether the row still matches it can answer
+        // "yes" to a file whose rating just changed. On this filesystem that
+        // tie is common, not exotic, and the row would then stay wrong forever.
         if let bc_core::indexer::IndexOutcome::Failed(message) =
-            bc_core::indexer::index_one(&index, path, &cancel)
+            bc_core::indexer::reindex(&index, path)
         {
             // The file itself is saved; only the index row is behind, and the
             // next pass will pick it up. Say so rather than stay silent,
@@ -618,6 +759,165 @@ impl BridgeApp {
             Ok(None) => self.browser.tags.remove(path),
             Err(error) => tracing::warn!("reading back the row for {}: {error}", path.display()),
         }
+    }
+
+    /// Ask the search worker for the current box contents.
+    ///
+    /// Every call supersedes the one before it by sequence number rather than
+    /// by cancelling: the worker is single-threaded and one query is a table
+    /// scan, so the useful thing to drop is the *answer* to a question nobody
+    /// asked any more, not the work already underway.
+    fn request_search(&mut self) {
+        let text = self.search_text.trim().to_string();
+        if text.is_empty() {
+            self.clear_search();
+            return;
+        }
+        let Some(index) = self.open_index() else {
+            // Reachable, and it needs saying here rather than leaving a grid
+            // that quietly shows nothing.
+            self.search_error = self.index_error.clone();
+            self.status = format!(
+                "Search unavailable: {}",
+                self.index_error.as_deref().unwrap_or("no reason recorded")
+            );
+            return;
+        };
+        let scope_choice = self.search_scope;
+        let scope = scope_choice.scope(self.browser.root.as_deref());
+        // Coverage numbers have to be taken from the folder listing *before*
+        // it is replaced: once the grid holds results, the files that are not
+        // in the index are exactly the ones that are not on screen.
+        let (total, unindexed) = match scope_choice {
+            SearchScopeChoice::Folder => {
+                let files: Vec<&Path> = self
+                    .browser
+                    .entries
+                    .iter()
+                    .filter(|e| !e.is_dir)
+                    .map(|e| e.path.as_path())
+                    .collect();
+                (
+                    files.len(),
+                    self.browser.tags.missing_among(files.into_iter()),
+                )
+            }
+            _ => (0, 0),
+        };
+        self.search_scope_total = total;
+        self.search_scope_unindexed = unindexed;
+
+        self.search_seq += 1;
+        let seq = self.search_seq;
+        self.browser.enter_search(&text, scope.clone());
+        self.search_waiting = Some(seq);
+        self.search_error = None;
+        self.status = format!("Searching for “{text}”…");
+        let job = SearchQuery {
+            seq,
+            text,
+            scope,
+            index,
+        };
+        if self.search_tx.send(job).is_err() {
+            self.search_waiting = None;
+            self.search_error = Some("the search worker is not running".to_string());
+            self.status = "Search unavailable: the background search thread is gone".to_string();
+        }
+    }
+
+    /// Take answers that have arrived. Only the newest request is answered to;
+    /// anything older is dropped on the floor.
+    fn poll_search(&mut self, ctx: &egui::Context) {
+        let mut latest: Option<SearchAnswer> = None;
+        while let Ok(answer) = self.search_rx.try_recv() {
+            if Some(answer.seq) == self.search_waiting {
+                latest = Some(answer);
+            }
+        }
+        let Some(answer) = latest else {
+            if self.search_waiting.is_some() {
+                // Keep the frame clock running so the answer is taken as soon
+                // as it lands, without repainting at 60 Hz while idle.
+                ctx.request_repaint_after(Duration::from_millis(60));
+            }
+            return;
+        };
+        self.search_waiting = None;
+        match answer.rows {
+            Ok(rows) => {
+                let count = rows.len();
+                self.browser.set_search_results(rows);
+                self.status = self.search_status(count);
+            }
+            Err(error) => {
+                self.search_error = Some(error.clone());
+                self.status = format!("Search failed: {error}");
+                // The grid is empty because the query errored, not because the
+                // library is empty: leave the search state rather than showing
+                // the folder as if nothing had been asked.
+            }
+        }
+    }
+
+    /// Drop every trace of a search from the interface state.
+    ///
+    /// Separate from `clear_search`, which *re-lists* the folder: navigation
+    /// has already replaced the listing, and refreshing again would throw away
+    /// the selection the new folder is about to make.
+    fn forget_search(&mut self) {
+        self.search_text.clear();
+        self.search_due = None;
+        self.search_waiting = None;
+        self.search_error = None;
+        self.search_scope_total = 0;
+        self.search_scope_unindexed = 0;
+    }
+
+    /// Leave the search and show the folder again.
+    fn clear_search(&mut self) {
+        if !self.browser.is_searching() {
+            self.search_error = None;
+            return;
+        }
+        self.search_waiting = None;
+        self.search_error = None;
+        let root = self.browser.root.clone();
+        match self.browser.refresh() {
+            Ok(()) => {
+                self.status = match root.as_deref() {
+                    Some(root) => {
+                        format!("Back to {} ({} items)", root.display(), self.browser.len())
+                    }
+                    None => "Back to the folder".to_string(),
+                };
+            }
+            Err(error) => self.status = format!("Could not re-list the folder: {error}"),
+        }
+    }
+
+    /// The line that explains a result grid. The count is not the whole story:
+    /// a folder-scope search has to say how many of its files the index has
+    /// never read, because those cannot appear however the box is worded.
+    fn search_status(&self, count: usize) -> String {
+        let Some((text, scope)) = self.browser.search() else {
+            return format!("{} items", self.browser.len());
+        };
+        let scope_words = match scope {
+            bc_core::SearchScope::Library => "the whole library".to_string(),
+            bc_core::SearchScope::Folder(root) => format!("this folder ({})", root.display()),
+            bc_core::SearchScope::FolderAndSubfolders(root) => {
+                format!("this folder and subfolders ({})", root.display())
+            }
+        };
+        let mut line = format!("Search “{text}”: {count} file(s) in {scope_words}");
+        if self.search_scope_unindexed > 0 {
+            line.push_str(&format!(
+                " · {} of {} files here are not indexed yet and cannot match",
+                self.search_scope_unindexed, self.search_scope_total
+            ));
+        }
+        line
     }
 
     /// Which end of the sort comes first, in words that fit the button, plus
@@ -824,6 +1124,11 @@ impl BridgeApp {
                         self.failed.clear();
                         self.tree_children.clear();
                         self.status = format!("Refreshed ({} items)", self.browser.len());
+                        // …and a grid showing an answer needs that answer
+                        // re-derived, not the folder listed underneath it.
+                        if self.browser.is_searching() {
+                            self.request_search();
+                        }
                         // …and their index rows may be stale. A settled watcher
                         // event is the only signal that something changed
                         // outside BridgeCraft, so re-run the pass over the
@@ -3982,6 +4287,49 @@ impl BridgeApp {
                         let shown = self.browser.set_tag_filter(self.browser.tag_filter.clone());
                         self.status = self.tag_filter_status(shown);
                     }
+                    // Library search. Kept apart from the name filter on
+                    // purpose: the filter narrows what is on screen from this
+                    // folder, the search asks the index for rows that may come
+                    // from anywhere in scope, and conflating them would make it
+                    // impossible to say which one emptied the grid.
+                    let before_text = self.search_text.clone();
+                    let search_field = ui.add_sized(
+                        [220.0, 20.0],
+                        egui::TextEdit::singleline(&mut self.search_text)
+                            .hint_text("search tags, names, cameras…"),
+                    );
+                    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if search_field.changed()
+                        || !before_text.is_empty() && self.search_text.is_empty()
+                    {
+                        if self.search_text.trim().is_empty() {
+                            self.search_due = None;
+                            self.clear_search();
+                        } else {
+                            // Debounced, because every keystroke is a table
+                            // scan: ~70 ms per 100 000 rows is not something to
+                            // spend on a half-typed word.
+                            self.search_due = Some(Instant::now() + SEARCH_DEBOUNCE);
+                        }
+                    }
+                    if enter && !self.search_text.trim().is_empty() {
+                        self.search_due = None;
+                        self.request_search();
+                    }
+                    if self.search_text.trim().is_empty() {
+                        ui.label("Search:");
+                    } else if ui.button("✕").on_hover_text("Clear the search").clicked() {
+                        self.search_text.clear();
+                        self.search_due = None;
+                        self.clear_search();
+                    }
+                    egui::ComboBox::from_id_source("search_scope")
+                        .selected_text(self.search_scope.label())
+                        .show_ui(ui, |ui| {
+                            for choice in SearchScopeChoice::ALL {
+                                ui.selectable_value(&mut self.search_scope, choice, choice.label());
+                            }
+                        });
                     let before = self.browser.filter.clone();
                     let resp = ui.add_sized(
                         [200.0, 20.0],
@@ -4047,6 +4395,74 @@ impl BridgeApp {
                 }
             });
         });
+    }
+
+    /// Files dragged in from the desktop (a file manager, a terminal) are
+    /// copied into the folder under the pointer, or the open folder when
+    /// nothing was hovered. Copy, never move: pulling a file into a folder
+    /// should not delete it from where it came from.
+    ///
+    /// The hover is last frame's, which is where the pointer sits while the
+    /// drop event arrives; egui reports native drops without a widget. It is a
+    /// method rather than a stretch of `update` so the refusal below — and the
+    /// unnamed-file counting — can be driven with synthetic dropped files.
+    fn handle_os_drops(&mut self, ctx: &egui::Context) {
+        // Files dragged in from the desktop (a file manager, a terminal) are
+        // copied into the folder under the pointer, or the open folder when
+        // nothing was hovered. Copy, never move: pulling a file into a folder
+        // should not delete it from where it came from.
+        // The hover is last frame's, which is where the pointer sits while the
+        // drop event arrives; egui reports native drops without a widget.
+        let (os_drops, unnamed) = ctx.input(|i| os_drop_paths(&i.raw.dropped_files));
+        if !os_drops.is_empty() {
+            let target =
+                os_drop_target(self.hovered_folder.as_deref(), self.browser.root.as_deref());
+            match target {
+                Some(folder) if self.browser.is_searching() => {
+                    // The drop target would be the folder the search started
+                    // from, which is no longer what is on screen. Copying files
+                    // into a folder the user cannot see, and then showing them
+                    // only if they happen to match the query, is the kind of
+                    // surprise that loses files; say what to do instead.
+                    let _ = folder;
+                    self.status =
+                        "Clear the search (Esc or ✕) before dropping files into a folder."
+                            .to_string();
+                }
+                Some(folder) => {
+                    let mut status = apply_transfer(&os_drops, &folder, TransferMode::Copy);
+                    if unnamed > 0 {
+                        status +=
+                            &format!("; {unnamed} item(s) arrived without a path and were skipped");
+                    }
+                    self.status = status;
+                    self.refresh_after_drop();
+                }
+                None => self.status = "Open a folder before dropping files.".into(),
+            }
+        } else if unnamed > 0 {
+            self.status =
+                format!("{unnamed} dropped item(s) had no readable path; nothing was copied.");
+        }
+    }
+
+    /// Esc with the cursor not in a text field clears a search. With the
+    /// cursor *in* a field, the key belongs to that field and clearing still
+    /// needs the ✕ — a search box that swallowed Esc would fight with every
+    /// other use of the key in this app.
+    ///
+    /// This reads egui's widget focus, not `RawInput::focused`: the latter
+    /// means "the window is focused" and is true in almost every real frame,
+    /// so a guard built on it would leave the shortcut dead on screen while
+    /// still passing a test that defaulted it the other way.
+    fn handle_search_shortcuts(&mut self, ctx: &egui::Context) {
+        let typing = ctx.memory(|m| m.focused().is_some());
+        if !typing && ctx.input(|i| i.key_pressed(egui::Key::Escape)) && self.browser.is_searching()
+        {
+            self.search_text.clear();
+            self.search_due = None;
+            self.clear_search();
+        }
     }
 
     fn status_bar(&mut self, ctx: &egui::Context) {
@@ -4375,35 +4791,22 @@ impl eframe::App for BridgeApp {
             }
         }
         self.poll_jobs(ctx);
+        self.poll_search(ctx);
+        self.handle_search_shortcuts(ctx);
+        // A debounced search fires on the clock, not on an event: nothing
+        // happens 450 ms after the last keystroke except this check.
+        if let Some(due) = self.search_due {
+            if Instant::now() >= due {
+                self.search_due = None;
+                self.request_search();
+            } else {
+                ctx.request_repaint_after(due.saturating_duration_since(Instant::now()));
+            }
+        }
         self.poll_watcher();
         self.prune_preview_textures();
 
-        // Files dragged in from the desktop (a file manager, a terminal) are
-        // copied into the folder under the pointer, or the open folder when
-        // nothing was hovered. Copy, never move: pulling a file into a folder
-        // should not delete it from where it came from.
-        // The hover is last frame's, which is where the pointer sits while the
-        // drop event arrives; egui reports native drops without a widget.
-        let (os_drops, unnamed) = ctx.input(|i| os_drop_paths(&i.raw.dropped_files));
-        if !os_drops.is_empty() {
-            let target =
-                os_drop_target(self.hovered_folder.as_deref(), self.browser.root.as_deref());
-            match target {
-                Some(folder) => {
-                    let mut status = apply_transfer(&os_drops, &folder, TransferMode::Copy);
-                    if unnamed > 0 {
-                        status +=
-                            &format!("; {unnamed} item(s) arrived without a path and were skipped");
-                    }
-                    self.status = status;
-                    self.refresh_after_drop();
-                }
-                None => self.status = "Open a folder before dropping files.".into(),
-            }
-        } else if unnamed > 0 {
-            self.status =
-                format!("{unnamed} dropped item(s) had no readable path; nothing was copied.");
-        }
+        self.handle_os_drops(ctx);
         // A drag that no folder claimed does nothing, matching Explorer and
         // Bridge: releasing items on the background of the folder they are
         // already in would only report a meaningless "skipped" count.
@@ -4492,7 +4895,16 @@ impl eframe::App for BridgeApp {
                 });
             } else if self.browser.visible_len() == 0 {
                 ui.centered_and_justified(|ui| {
-                    if self.browser.is_empty() {
+                    if self.browser.is_searching() {
+                        // The distinction the user needs: an empty result grid
+                        // says nothing about the folder.
+                        let line = match &self.search_error {
+                            Some(reason) => format!("Search unavailable: {reason}"),
+                            None if self.search_waiting.is_some() => "Searching…".to_string(),
+                            None => self.search_status(0),
+                        };
+                        ui.weak(line);
+                    } else if self.browser.is_empty() {
                         ui.weak("This folder is empty.");
                     } else {
                         ui.weak(format!("No items match filter “{}”.", self.browser.filter));
@@ -4799,26 +5211,43 @@ mod tests {
         texts
     }
 
-    /// Move to `at`, then press and release there in one frame.
+    /// Drive one toolbar frame with `events`, resting the pointer at `at`
+    /// first so that menus and text fields behave the way they do under a real
+    /// cursor.
+    fn drive_toolbar(
+        app: &mut BridgeApp,
+        ctx: &egui::Context,
+        at: egui::Pos2,
+        events: Vec<egui::Event>,
+    ) {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1400.0, 900.0),
+            )),
+            events: {
+                let mut queued = vec![egui::Event::PointerMoved(at)];
+                queued.extend(events);
+                queued
+            },
+            // The window is focused in these tests, as it is for a user who is
+            // typing in it. `handle_search_shortcuts` deliberately ignores keys
+            // when a widget has focus, and widget focus is a different signal
+            // from this one.
+            focused: true,
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, |ctx| app.top_bar(ctx));
+    }
+
+    /// Press and release at `at` in a single frame.
     ///
     /// The batching matters: a `menu_button` opens on the press, so delivering
     /// the release as a second frame hands it a second click on an already open
     /// menu and it closes again. A real window delivers both in one frame's
     /// event list, which is what this does.
     fn click_toolbar(app: &mut BridgeApp, ctx: &egui::Context, at: egui::Pos2) {
-        let raw = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::pos2(0.0, 0.0),
-                egui::vec2(1400.0, 900.0),
-            )),
-            events: vec![
-                egui::Event::PointerMoved(at),
-                button(at, true),
-                button(at, false),
-            ],
-            ..Default::default()
-        };
-        let _ = ctx.run(raw, |ctx| app.top_bar(ctx));
+        drive_toolbar(app, ctx, at, vec![button(at, true), button(at, false)]);
     }
 
     /// Where the toolbar drew the given text, or a failure listing what it did
@@ -5188,6 +5617,389 @@ mod tests {
         assert_eq!(
             sort_direction_label(SortKey::Size, SortDir::Desc).0,
             "largest"
+        );
+    }
+
+    /// Answers the search worker for the current request, without the frame
+    /// clock: `poll_search` is what a running window calls every frame.
+    fn finish_search(app: &mut BridgeApp, ctx: &egui::Context) {
+        for _ in 0..400 {
+            app.poll_search(ctx);
+            if app.search_waiting.is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        panic!("the search never answered");
+    }
+
+    fn result_names(app: &BridgeApp) -> Vec<String> {
+        app.browser
+            .entries
+            .iter()
+            .map(|e| e.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn the_search_box_is_drawn_and_taking_typed_characters() {
+        // Reachability, the way the sort menu was proven: a field that exists
+        // in the struct is not a feature. The box has to be drawn, take focus
+        // on a click, accept characters, and schedule the query its keystrokes
+        // implied.
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let target = png(&root, "beachwalk.png");
+        // A row for it, so the answer is a match rather than an explanation of
+        // why there is none.
+        seed_index(&data, &[(target.clone(), 3)], &_stores);
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data, &_stores);
+
+        let drawn = toolbar_text(&mut app, &ctx);
+        let hint = "search tags, names, cameras…";
+        let (_, rect) = drawn
+            .iter()
+            .find(|(text, _)| text == hint)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the search box was not drawn; the bar drew {:?}",
+                    drawn.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>()
+                )
+            });
+        // The scope control belongs next to it, or the user cannot tell what
+        // the word will be matched against.
+        toolbar_rect(&mut app, &ctx, "this folder");
+
+        drive_toolbar(
+            &mut app,
+            &ctx,
+            rect.center(),
+            vec![button(rect.center(), true), button(rect.center(), false)],
+        );
+        for letter in "beach".chars() {
+            drive_toolbar(
+                &mut app,
+                &ctx,
+                rect.center(),
+                vec![egui::Event::Text(letter.to_string())],
+            );
+        }
+        assert_eq!(app.search_text, "beach", "the box did not take the typing");
+        assert!(
+            app.search_due.is_some(),
+            "a keystroke did not schedule the query"
+        );
+        // Enter runs it now rather than waiting out the debounce.
+        drive_toolbar(
+            &mut app,
+            &ctx,
+            rect.center(),
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        assert_eq!(app.search_due, None, "Enter should fire immediately");
+        finish_search(&mut app, &ctx);
+        assert!(app.browser.is_searching());
+        assert!(
+            app.status.contains("1 file(s)"),
+            "the answer should be counted: {}",
+            app.status
+        );
+        assert!(
+            !app.status.contains("not indexed yet"),
+            "a covered folder should not carry the coverage warning: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn a_typed_word_replaces_the_grid_with_the_files_the_index_agrees_with() {
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let beach = png(&root, "sunset.png");
+        let forest = png(&root, "pines.png");
+        let by_name = png(&root, "beachcomber.png");
+        seed_index(
+            &data,
+            &[
+                (beach.clone(), 0),
+                (forest.clone(), 0),
+                (by_name.clone(), 0),
+            ],
+            &_stores,
+        );
+
+        // Give two of them something to be found by, through the same
+        // projection the indexer writes.
+        let db = bc_core::paths::metadata_index_path().unwrap();
+        let index = bc_core::MetadataIndex::open(&db).unwrap();
+        for (path, title) in [(&beach, "beach evening"), (&forest, "pines morning")] {
+            let mut meta = bc_metadata::Metadata::new();
+            meta.set_text(bc_metadata::NS_DC, "title", title.to_string());
+            index.index_file(path, &meta).unwrap();
+        }
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data, &_stores);
+        assert_eq!(
+            result_names(&app).len(),
+            3,
+            "the folder should be listed first"
+        );
+
+        app.search_text = "beach".to_string();
+        app.request_search();
+        assert!(
+            app.browser.entries.is_empty(),
+            "the grid kept the folder while the answer was pending"
+        );
+        finish_search(&mut app, &ctx);
+
+        assert!(app.browser.is_searching());
+        let names = result_names(&app);
+        assert_eq!(
+            names,
+            vec!["beachcomber.png".to_string(), "sunset.png".to_string()],
+            "the search answered with the wrong files: {names:?}"
+        );
+        assert!(
+            app.status.contains("2 file(s)"),
+            "the status should count what the query found: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn thumbnails_only_hides_sidecar_files_from_search_results_too() {
+        // Searching the index returns sidecars, because a `.xmp` is a file and
+        // its row carries the same tags as the photo beside it. The remedy is
+        // not a special case in search: it is the pre-existing "Thumbnails
+        // only" toggle, which filters whatever the browser is showing. This
+        // test pins that the toggle still applies when what is showing is a
+        // result set, because the two features were built in different slices
+        // and nothing else connects them.
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let photo = png(&root, "photo.png");
+        let sidecar = {
+            let p = root.join("photo.xmp");
+            std::fs::write(
+                &p,
+                b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='x'></rdf:RDF></x:xmpmeta>",
+            )
+            .unwrap();
+            p
+        };
+        seed_index(&data, &[(photo.clone(), 0), (sidecar.clone(), 0)], &_stores);
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data, &_stores);
+        app.search_text = "photo".to_string();
+        app.request_search();
+        finish_search(&mut app, &ctx);
+        assert_eq!(
+            app.browser.entries.len(),
+            2,
+            "both files should answer the query: {:?}",
+            result_names(&app)
+        );
+
+        app.thumbs_only = true;
+        let shown = app.display_indices().len();
+        assert_eq!(
+            shown, 1,
+            "the toggle did not reach the results, only folder listings"
+        );
+
+        app.thumbs_only = false;
+        assert_eq!(app.display_indices().len(), 2, "the toggle is not one-way");
+    }
+
+    #[test]
+    fn an_unmatched_search_says_the_query_found_nothing_not_that_the_folder_is_empty() {
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        png(&root, "a.png");
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data, &_stores);
+        app.search_text = "nothingmatches".to_string();
+        app.request_search();
+        finish_search(&mut app, &ctx);
+
+        assert!(app.browser.entries.is_empty());
+        assert!(app.status.contains("0 file(s)"), "{}", app.status);
+        assert!(
+            !app.status.contains("This folder is empty"),
+            "an empty result must not be reported as an empty folder: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn a_folder_scope_search_tells_you_what_the_index_has_never_seen() {
+        // The number a user needs when a search comes back short: files that
+        // have no row cannot match anything, and that is a fact about the
+        // index, not about their contents.
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let seen = png(&root, "seen.png");
+        let unseen = png(&root, "unseen.png");
+        seed_index(&data, &[(seen.clone(), 2)], &_stores);
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data, &_stores);
+        app.search_scope = SearchScopeChoice::Folder;
+        app.search_text = "anything".to_string();
+        app.request_search();
+        finish_search(&mut app, &ctx);
+        assert!(
+            app.status.contains("1 of 2 files here are not indexed yet"),
+            "{}",
+            app.status
+        );
+
+        // And once everything has a row, the warning goes away rather than
+        // staying as permanent noise.
+        let db = bc_core::paths::metadata_index_path().unwrap();
+        let index = bc_core::MetadataIndex::open(&db).unwrap();
+        index.index_path(&unseen).unwrap();
+        app.request_search();
+        finish_search(&mut app, &ctx);
+        assert!(
+            !app.status.contains("not indexed yet"),
+            "the coverage warning outlived the gap: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn navigating_to_another_folder_ends_the_search_and_empties_the_box() {
+        // The browser exits search mode on its own when it re-lists; this
+        // checks the field agrees, because a stale word in the box next to an
+        // unrelated folder reads as a filter nobody applied.
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        png(&first, "beach.png");
+        png(&second, "mountain.png");
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &first, &data, &_stores);
+        app.search_text = "beach".to_string();
+        app.request_search();
+        finish_search(&mut app, &ctx);
+        assert!(app.browser.is_searching());
+
+        app.open_root(&second);
+        assert!(!app.browser.is_searching());
+        assert!(app.search_text.is_empty(), "the box kept the old query");
+        assert_eq!(result_names(&app), vec!["mountain.png".to_string()]);
+    }
+
+    #[test]
+    fn escaping_a_search_brings_the_folder_back() {
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        png(&root, "one.png");
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data, &_stores);
+        app.search_text = "one".to_string();
+        app.request_search();
+        finish_search(&mut app, &ctx);
+        assert!(app.browser.is_searching());
+
+        // No widget focused, which is the state in which Esc belongs to the
+        // application rather than to a text field. The key has to arrive as an
+        // event: `key_pressed` reads the frame's input, not a call.
+        let raw = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, |ctx| app.handle_search_shortcuts(ctx));
+        assert!(!app.browser.is_searching(), "Esc left the search running");
+        assert!(app.search_text.is_empty(), "the box kept the cleared word");
+        assert_eq!(result_names(&app), vec!["one.png".to_string()]);
+    }
+
+    #[test]
+    fn dropping_files_while_searching_says_no_and_copies_nothing() {
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        png(&root, "here.png");
+        let outsider = temp.path().join("outsider.png");
+        std::fs::write(&outsider, b"payload").unwrap();
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data, &_stores);
+        app.search_text = "here".to_string();
+        app.request_search();
+        finish_search(&mut app, &ctx);
+
+        let raw = egui::RawInput {
+            dropped_files: vec![egui::DroppedFile {
+                path: Some(outsider.clone()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, |ctx| app.handle_os_drops(ctx));
+
+        assert!(
+            app.status.contains("Clear the search"),
+            "the refusal is what has to be visible: {}",
+            app.status
+        );
+        assert!(
+            !root.join("outsider.png").exists(),
+            "files were copied into a folder that was not on screen"
         );
     }
 

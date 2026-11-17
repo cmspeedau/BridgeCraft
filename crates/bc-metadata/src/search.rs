@@ -104,10 +104,6 @@ fn dc_text(meta: &Metadata, name: &str) -> Option<String> {
     }
 }
 
-pub fn searchable(meta: &Metadata) -> SearchableMetadata {
-    extract(meta)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

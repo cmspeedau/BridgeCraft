@@ -1000,7 +1000,12 @@ mod tests {
         tags.set_rating(bc_metadata::ratings::Rating::new(3));
         tags.set_flag(bc_metadata::ratings::Flag::Rejected);
         bc_metadata::keywords::add_keyword(&mut tags, "Pipeline");
-        bc_metadata::xmp::write_embedded_xmp_file(&source, &tags).unwrap();
+        bc_metadata::xmp::write_embedded_xmp_file(
+            &source,
+            &tags,
+            bc_metadata::xmp::TagWrite::Replace,
+        )
+        .unwrap();
 
         let queue = JobQueue::new(1);
         let job = queue

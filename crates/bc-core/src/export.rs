@@ -248,7 +248,14 @@ pub fn carry_tags(source: &Path, encoded: Vec<u8>, format: ExportFormat) -> Vec<
         return encoded;
     }
 
-    match bc_metadata::xmp::write_embedded_xmp(&encoded, &carried) {
+    // Replace: the exported file is meant to carry exactly the tags the
+    // source had, no more. Nothing is in the packet yet, so this is a formality
+    // today, but it says which of the two meanings the call has.
+    match bc_metadata::xmp::write_embedded_xmp(
+        &encoded,
+        &carried,
+        bc_metadata::xmp::TagWrite::Replace,
+    ) {
         Ok(with_packet) => with_packet,
         Err(error) => {
             tracing::warn!(
@@ -606,7 +613,12 @@ mod tests {
         tags.set_flag(bc_metadata::ratings::Flag::Approved);
         bc_metadata::keywords::add_keyword(&mut tags, "Clients|ACME");
         bc_metadata::keywords::add_keyword(&mut tags, "Selected");
-        bc_metadata::xmp::write_embedded_xmp_file(&source, &tags).unwrap();
+        bc_metadata::xmp::write_embedded_xmp_file(
+            &source,
+            &tags,
+            bc_metadata::xmp::TagWrite::Replace,
+        )
+        .unwrap();
         assert_eq!(
             bc_metadata::layers::read_file(&source)
                 .unwrap()
@@ -744,7 +756,12 @@ mod tests {
         tags.set_text(bc_metadata::NS_EXIF, "Model", "R5");
         tags.set_text(bc_metadata::NS_XMP, "CreatorTool", "Some Camera App");
         tags.set_rating(bc_metadata::ratings::Rating::new(2));
-        bc_metadata::xmp::write_embedded_xmp_file(&source, &tags).unwrap();
+        bc_metadata::xmp::write_embedded_xmp_file(
+            &source,
+            &tags,
+            bc_metadata::xmp::TagWrite::Replace,
+        )
+        .unwrap();
 
         let image = decode_for_export(&source, 16).unwrap();
         let bytes = encode_image(&image, ExportFormat::Jpeg { quality: 80 }).unwrap();
