@@ -39,17 +39,32 @@ pub struct BrowserState {
 }
 
 /// Whether the content panel is showing a folder or the answer to a query.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum Listing {
-    /// The direct children of `root`.
+    /// The direct children of `root`. The default: the panel opens on a folder,
+    /// and `Query` carries an `f64` in its values, so this enum is `PartialEq`
+    /// rather than `Eq`.
     #[default]
     Folder,
-    /// Rows the metadata index returned for `text` within `scope`. Kept
-    /// because the interface has to show what produced the grid: a box that
-    /// says one thing over a grid that came from another is worse than no
-    /// search at all.
-    Search { text: String, scope: SearchScope },
+    /// Rows the metadata index returned. `query` is what was actually run, and
+    /// is not always derived from `text`: a saved collection carries its own
+    /// rules, which may be richer than the words in the box — and may be none.
+    /// Keeping both, rather than re-deriving one from the other, is what lets
+    /// the interface say honestly which of the two the grid is showing.
+    Search {
+        /// The search box contents, empty when the grid came from a collection.
+        text: String,
+        /// The rules that were run, as stored or as typed.
+        query: crate::metadata_index::Query,
+        scope: SearchScope,
+        /// The saved collection on screen, if any. `None` means an ad hoc
+        /// search, which is the state "Save this search" starts from.
+        collection: Option<String>,
+    },
 }
+
+/// A saved search, ready to run: the rules and the scope they were saved with.
+pub type SavedSearch = crate::metadata_index::SavedSearch;
 
 impl BrowserState {
     /// Open a new root: scan its direct children and apply the current sort.
@@ -157,9 +172,40 @@ impl BrowserState {
     /// one with a "searching…" state, not the previous folder pretending to be
     /// the result.
     pub fn enter_search(&mut self, text: &str, scope: SearchScope) {
+        let query = crate::metadata_index::Query::text(text);
+        self.enter_query(text, query, scope, None);
+    }
+
+    /// Show the rows a saved collection produced.
+    ///
+    /// The box is filled with the collection's words only when the saved rules
+    /// really are those words; a collection holding a rating rule shows an
+    /// empty box, because putting a number in a text field that did not produce
+    /// these results would be the interface lying about what it did.
+    pub fn enter_collection(&mut self, name: &str, search: &SavedSearch) {
+        // The same rule the sidebar uses, from the definition itself: words if
+        // the rules are only words, nothing if they are more.
+        let text = search.box_text();
+        self.enter_query(
+            &text,
+            search.query.clone(),
+            search.scope.clone(),
+            Some(name.to_string()),
+        );
+    }
+
+    pub fn enter_query(
+        &mut self,
+        text: &str,
+        query: crate::metadata_index::Query,
+        scope: SearchScope,
+        collection: Option<String>,
+    ) {
         self.listing = Listing::Search {
             text: text.to_string(),
+            query,
             scope,
+            collection,
         };
         self.pending_selection = self
             .selection
@@ -228,16 +274,38 @@ impl BrowserState {
         }
     }
 
+    /// Label the search on screen as a saved collection, without re-running it.
+    ///
+    /// Saving must not disturb the grid: re-entering the query would empty the
+    /// entries on the theory that a new answer is pending, which is right when
+    /// the user asked for a different answer and wrong when they only gave this
+    /// one a name.
+    pub fn name_collection(&mut self, name: &str) {
+        if let Listing::Search { collection, .. } = &mut self.listing {
+            *collection = Some(name.to_string());
+        }
+    }
+
     /// Whether the grid is showing search results.
     pub fn is_searching(&self) -> bool {
         matches!(self.listing, Listing::Search { .. })
     }
 
-    /// The query that produced the current grid, for the breadcrumb and the
-    /// status line.
-    pub fn search(&self) -> Option<(&str, &SearchScope)> {
+    /// The query that produced the current grid, for the status line and the
+    /// save-this-search affordance.
+    pub fn search(&self) -> Option<(&str, &crate::metadata_index::Query, &SearchScope)> {
         match &self.listing {
-            Listing::Search { text, scope } => Some((text.as_str(), scope)),
+            Listing::Search {
+                text, query, scope, ..
+            } => Some((text.as_str(), query, scope)),
+            Listing::Folder => None,
+        }
+    }
+
+    /// The saved collection on screen, if the grid came from one.
+    pub fn collection(&self) -> Option<&str> {
+        match &self.listing {
+            Listing::Search { collection, .. } => collection.as_deref(),
             Listing::Folder => None,
         }
     }
@@ -376,9 +444,19 @@ mod tests {
             st.tags.is_empty(),
             "the old folder's tags are still in hand"
         );
-        let (text, scope) = st.search().expect("the query is remembered");
+        let (text, query, scope) = st.search().expect("the query is remembered");
         assert_eq!(text, "beach");
         assert_eq!(scope, &SearchScope::Library);
+        assert_eq!(
+            query,
+            &crate::metadata_index::Query::text("beach"),
+            "the typed words were not what got run"
+        );
+        assert_eq!(
+            st.collection(),
+            None,
+            "an ad hoc search claims a collection"
+        );
     }
 
     #[test]

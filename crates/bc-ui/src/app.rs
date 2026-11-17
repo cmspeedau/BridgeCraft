@@ -74,6 +74,10 @@ enum SidebarTab {
     #[default]
     Favorites,
     Folders,
+    /// Saved searches. A third tab rather than a section under the other two,
+    /// because clicking one of these replaces the grid the way a folder does,
+    /// and the panel that lists folders is not where that belongs.
+    Collections,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -182,7 +186,10 @@ struct ThumbResult {
 /// re-spawned or polled for that handle otherwise.
 struct SearchQuery {
     seq: u64,
-    text: String,
+    /// Rules to run, already built: from the search box, or from a saved
+    /// collection. The worker does not know how to read the box, and should
+    /// not have to — one place turns intent into a `Query`.
+    query: bc_core::Query,
     scope: bc_core::SearchScope,
     index: Arc<bc_core::MetadataIndex>,
 }
@@ -204,10 +211,9 @@ fn spawn_search_worker(rx: Receiver<SearchQuery>, tx: Sender<SearchAnswer>) {
         .name("search".into())
         .spawn(move || {
             for job in rx {
-                let query = bc_core::Query::text(&job.text);
                 let rows = job
                     .index
-                    .search(&query, &job.scope)
+                    .search(&job.query, &job.scope)
                     .map_err(|error| error.to_string());
                 if let Err(error) = tx.send(SearchAnswer { seq: job.seq, rows }) {
                     tracing::debug!("search answer dropped: {error}");
@@ -400,6 +406,16 @@ pub struct BridgeApp {
     /// that, and an empty result grid needs the difference stated.
     search_scope_total: usize,
     search_scope_unindexed: usize,
+    /// Saved searches, as last read from the index. Refreshed when the tab is
+    /// opened and after every save or delete, so the list cannot show a
+    /// collection that no longer exists — or hide one that does.
+    collections: Vec<bc_core::LoadedCollection>,
+    /// Which tab the last drawn sidebar showed, so entering Collections is an
+    /// event that can be detected instead of a query to repeat every frame.
+    sidebar_tab_shown: SidebarTab,
+    collections_error: Option<String>,
+    /// The name being typed in the Collections panel.
+    collection_name: String,
     bulk_rating_enabled: bool,
     bulk_label_enabled: bool,
     bulk_flag_enabled: bool,
@@ -527,6 +543,10 @@ impl BridgeApp {
             search_error: None,
             search_scope_total: 0,
             search_scope_unindexed: 0,
+            collections: Vec::new(),
+            sidebar_tab_shown: SidebarTab::default(),
+            collections_error: None,
+            collection_name: String::new(),
             bulk_rating_enabled: false,
             bulk_label_enabled: false,
             bulk_flag_enabled: false,
@@ -815,7 +835,7 @@ impl BridgeApp {
         self.status = format!("Searching for “{text}”…");
         let job = SearchQuery {
             seq,
-            text,
+            query: bc_core::Query::text(&text),
             scope,
             index,
         };
@@ -860,6 +880,250 @@ impl BridgeApp {
         }
     }
 
+    /// Saved searches: list, run, delete, and save what is on screen.
+    fn collections_panel(&mut self, ui: &mut egui::Ui) {
+        if self.index.is_none() && self.index_error.is_some() {
+            ui.weak(
+                "Collections are stored in the metadata index, which is offline. Fix that \
+                 first: saving a search that cannot be read back is not a feature.",
+            );
+            return;
+        }
+        if self.index.is_none() {
+            ui.weak("Open a folder to start the index.");
+            return;
+        }
+
+        // Save what the grid is currently showing.
+        let showing = self.browser.search().is_some();
+        ui.group(|ui| {
+            ui.add(
+                egui::Label::new(egui::RichText::new("Save this search").weak().small())
+                    .selectable(false),
+            );
+            let name_field = ui.add_sized(
+                [ui.available_width().max(80.0), 20.0],
+                egui::TextEdit::singleline(&mut self.collection_name).hint_text("name…"),
+            );
+            let typed = self.collection_name.trim();
+            let replaces = self
+                .collections
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(typed) && !typed.is_empty());
+            let button_label = if replaces {
+                format!("Replace “{typed}”")
+            } else {
+                "Save".to_string()
+            };
+            // A disabled control still has to say why, or the only hint that a
+            // collection cannot be saved right now is a greyed-out button.
+            let hover = if replaces {
+                "This overwrites the existing collection's rules rather than adding a second \
+                 one with the same name."
+            } else if !showing {
+                "Run a search or open a collection first — there is nothing to save yet."
+            } else {
+                "Store these rules and this scope under the name above."
+            };
+            let entered = name_field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let clicked = ui
+                .add_enabled_ui(showing && !typed.is_empty(), |ui| {
+                    ui.button(&button_label).on_hover_text(hover).clicked()
+                })
+                .inner;
+            if clicked || (entered && showing && !typed.is_empty()) {
+                self.save_current_collection();
+            }
+            if !showing {
+                ui.weak("Nothing to save: the grid is showing a folder.");
+            }
+        });
+        ui.separator();
+
+        if let Some(error) = &self.collections_error {
+            ui.colored_label(
+                egui::Color32::from_rgb(220, 120, 120),
+                format!("Collections unavailable: {error}"),
+            );
+            return;
+        }
+        if self.collections.is_empty() {
+            ui.weak("No saved searches yet. Run one, then name it above.");
+            return;
+        }
+
+        let entries = self.collections.clone();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for entry in entries {
+                let running = self.browser.collection() == Some(entry.name.as_str());
+                let name = entry.name.clone();
+                ui.horizontal(|ui| {
+                    let hover = if running {
+                        "This is the collection on screen.".to_string()
+                    } else {
+                        format!("Run: {}", entry.summary())
+                    };
+                    if ui
+                        .selectable_label(running, &entry.name)
+                        .on_hover_text(hover)
+                        .clicked()
+                    {
+                        self.run_collection(&name);
+                    }
+                    if ui
+                        .small_button("✕")
+                        .on_hover_text("Delete this saved search. No files are touched.")
+                        .clicked()
+                    {
+                        self.delete_collection(&name);
+                    }
+                });
+                ui.add(
+                    egui::Label::new(egui::RichText::new(entry.summary()).weak().small())
+                        .selectable(false)
+                        .truncate(true),
+                );
+                if entry.definition.is_err() {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(
+                                "This definition cannot be read; running it will explain why.",
+                            )
+                            .weak()
+                            .small(),
+                        )
+                        .selectable(false),
+                    );
+                }
+            }
+        });
+    }
+
+    /// Re-read the saved collections. Failures here are shown, never swallowed:
+    /// a panel that silently listed nothing would look like the user's
+    /// collections had gone.
+    fn refresh_collections(&mut self) {
+        let Some(index) = self.index.as_ref() else {
+            self.collections.clear();
+            return;
+        };
+        match index.collections() {
+            Ok(listed) => {
+                self.collections = listed;
+                self.collections_error = None;
+            }
+            Err(error) => {
+                self.collections_error = Some(error.to_string());
+                self.collections.clear();
+            }
+        }
+    }
+
+    /// Store the rules and scope the grid is showing under a name.
+    fn save_current_collection(&mut self) {
+        // Taken as owned values up front: the rest of this function mutates
+        // the browser, and `search()` is a view into it.
+        // Only the rules and the scope are needed; the box text stays where it
+        // is, because saving does not re-run anything.
+        let Some((query, scope)) = self
+            .browser
+            .search()
+            .map(|(_, query, scope)| (query.clone(), scope.clone()))
+        else {
+            self.status = "Nothing to save: the grid is showing a folder.".to_string();
+            return;
+        };
+        let name = self.collection_name.trim().to_string();
+        if name.is_empty() {
+            self.status = "A collection needs a name.".to_string();
+            return;
+        }
+        let Some(index) = self.index.clone() else {
+            self.status = "Collections need the metadata index, which is offline.".to_string();
+            return;
+        };
+        let search = bc_core::SavedSearch {
+            query: query.clone(),
+            scope: scope.clone(),
+        };
+        match index.save_collection(&name, &search) {
+            Ok(()) => {
+                self.refresh_collections();
+                self.collection_name.clear();
+                // Nothing is re-run and no rows are dropped: the grid already
+                // shows this collection's answer, so the listing is only
+                // labelled. A second save then offers to replace it, and the
+                // status line can name what the user is looking at.
+                self.browser.name_collection(&name);
+                self.status = format!("Saved collection “{name}” ({})", search.summary());
+            }
+            Err(error) => self.status = format!("Could not save “{name}”: {error}"),
+        }
+    }
+
+    /// Run a saved collection through the same worker a typed search uses.
+    fn run_collection(&mut self, name: &str) {
+        let Some(entry) = self.collections.iter().find(|c| c.name == name) else {
+            self.status = format!("“{name}” is no longer in the list.");
+            self.refresh_collections();
+            return;
+        };
+        let Ok(search) = entry.definition.clone() else {
+            let reason = entry
+                .definition
+                .as_ref()
+                .err()
+                .cloned()
+                .unwrap_or_else(|| "unreadable".to_string());
+            self.status = format!("Collection “{name}” cannot run: {reason}");
+            return;
+        };
+        let Some(index) = self.index.clone() else {
+            self.status = "Collections need the metadata index, which is offline.".to_string();
+            return;
+        };
+        // The box mirrors the collection's words when it can, so what the user
+        // reads in the field matches what produced the grid.
+        self.search_text = search.box_text();
+        self.search_seq += 1;
+        let seq = self.search_seq;
+        self.browser.enter_collection(name, &search);
+        self.search_waiting = Some(seq);
+        self.search_error = None;
+        self.status = format!("Running collection “{name}”…");
+        let job = SearchQuery {
+            seq,
+            query: search.query.clone(),
+            scope: search.scope.clone(),
+            index,
+        };
+        if self.search_tx.send(job).is_err() {
+            self.search_waiting = None;
+            self.status = "Search unavailable: the background search thread is gone".to_string();
+        }
+    }
+
+    fn delete_collection(&mut self, name: &str) {
+        let Some(index) = self.index.clone() else {
+            self.status = "Collections need the metadata index, which is offline.".to_string();
+            return;
+        };
+        match index.delete_collection(name) {
+            Ok(()) => {
+                // If the deleted one is on screen, its rows stay until the user
+                // moves on: the grid is the answer to a query that has already
+                // run, and pulling the floor out from under a selection would
+                // be worse than a title that no longer matches a list entry.
+                self.refresh_collections();
+                self.status = format!("Deleted collection “{name}”. No files were touched.");
+            }
+            Err(error) => {
+                self.status = format!("Could not delete “{name}”: {error}");
+                self.refresh_collections();
+            }
+        }
+    }
+
     /// Drop every trace of a search from the interface state.
     ///
     /// Separate from `clear_search`, which *re-lists* the folder: navigation
@@ -900,9 +1164,23 @@ impl BridgeApp {
     /// a folder-scope search has to say how many of its files the index has
     /// never read, because those cannot appear however the box is worded.
     fn search_status(&self, count: usize) -> String {
-        let Some((text, scope)) = self.browser.search() else {
+        let Some((text, _query, scope)) = self.browser.search() else {
             return format!("{} items", self.browser.len());
         };
+        if let Some(name) = self.browser.collection() {
+            // A collection is not a typed search: the line has to say which of
+            // the two the grid is, or "Search “”" would be the honest reading
+            // of a saved rule set and that reads like a bug.
+            let mut line = format!("Collection “{name}”: {count} file(s)");
+            if self.search_scope_unindexed > 0 {
+                line.push_str(&format!(
+                    " · {} of {} files here are not indexed yet and cannot match",
+                    self.search_scope_unindexed, self.search_scope_total
+                ));
+            }
+            return line;
+        }
+        let _ = text;
         let scope_words = match scope {
             bc_core::SearchScope::Library => "the whole library".to_string(),
             bc_core::SearchScope::Folder(root) => format!("this folder ({})", root.display()),
@@ -1327,6 +1605,11 @@ impl BridgeApp {
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Favorites, "★ Favorites");
             ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Folders, "📁 Folders");
+            ui.selectable_value(
+                &mut self.sidebar_tab,
+                SidebarTab::Collections,
+                "◎ Collections",
+            );
         });
         ui.separator();
 
@@ -1364,7 +1647,21 @@ impl BridgeApp {
             }
         });
 
+        // Read the collections when the tab is *entered*, not on every frame:
+        // the panel redraws constantly, and re-reading per redraw would put a
+        // database query in the paint path. Leaving and coming back is the
+        // refresh, alongside the explicit ones after a save or a delete.
+        if self.sidebar_tab != self.sidebar_tab_shown {
+            self.sidebar_tab_shown = self.sidebar_tab;
+            if self.sidebar_tab == SidebarTab::Collections {
+                self.refresh_collections();
+            }
+        }
+
         match self.sidebar_tab {
+            SidebarTab::Collections => {
+                self.collections_panel(ui);
+            }
             SidebarTab::Favorites => {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     if let Some(error) = &self.favorites_error {
@@ -4323,13 +4620,39 @@ impl BridgeApp {
                         self.search_due = None;
                         self.clear_search();
                     }
-                    egui::ComboBox::from_id_source("search_scope")
-                        .selected_text(self.search_scope.label())
-                        .show_ui(ui, |ui| {
+                    // One question decides the control: is the grid showing a
+                    // saved collection? If so its scope is the one in force, and
+                    // the popup says so without offering choices that would
+                    // change nothing.
+                    let (scope_label, scope_editable) = match self.browser.search() {
+                        Some((_, _, scope)) if self.browser.collection().is_some() => (
+                            match scope {
+                                bc_core::SearchScope::Library => "the whole library".to_string(),
+                                bc_core::SearchScope::Folder(root) => {
+                                    format!("saved scope: {}", root.display())
+                                }
+                                bc_core::SearchScope::FolderAndSubfolders(root) => {
+                                    format!("saved scope: {} and below", root.display())
+                                }
+                            },
+                            false,
+                        ),
+                        _ => (self.search_scope.label().to_string(), true),
+                    };
+                    let mut combo = egui::ComboBox::from_id_source("search_scope");
+                    combo = combo.selected_text(&scope_label);
+                    if scope_editable {
+                        combo.show_ui(ui, |ui| {
                             for choice in SearchScopeChoice::ALL {
                                 ui.selectable_value(&mut self.search_scope, choice, choice.label());
                             }
                         });
+                    } else {
+                        combo.show_ui(ui, |ui| {
+                            ui.weak("A saved collection carries its own scope.");
+                        });
+                    }
+
                     let before = self.browser.filter.clone();
                     let resp = ui.add_sized(
                         [200.0, 20.0],
@@ -5211,6 +5534,38 @@ mod tests {
         texts
     }
 
+    /// Drive one sidebar frame and return the text it drew, with the rect each
+    /// piece was drawn in. Same reasoning as `toolbar_text`: a test clicks what
+    /// it can read.
+    fn sidebar_text(app: &mut BridgeApp, ctx: &egui::Context) -> Vec<(String, egui::Rect)> {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1400.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run(raw, |ctx| {
+            egui::SidePanel::left("sidebar").show(ctx, |ui| app.sidebar(ui));
+        });
+        let mut texts = Vec::new();
+        for clipped in &out.shapes {
+            if let egui::Shape::Text(text) = &clipped.shape {
+                texts.push((
+                    text.galley.text().to_string(),
+                    egui::Rect::from_min_size(text.pos, text.galley.size()),
+                ));
+            }
+        }
+        texts
+    }
+
+    fn click_sidebar(app: &mut BridgeApp, ctx: &egui::Context, at: egui::Pos2) {
+        click_at(app, ctx, at, |app, ctx| {
+            egui::SidePanel::left("sidebar").show(ctx, |ui| app.sidebar(ui));
+        });
+    }
+
     /// Drive one toolbar frame with `events`, resting the pointer at `at`
     /// first so that menus and text fields behave the way they do under a real
     /// cursor.
@@ -5240,14 +5595,49 @@ mod tests {
         let _ = ctx.run(raw, |ctx| app.top_bar(ctx));
     }
 
-    /// Press and release at `at` in a single frame.
+    /// Move the pointer to `at` in one frame, then press and release there in
+    /// the next.
     ///
-    /// The batching matters: a `menu_button` opens on the press, so delivering
-    /// the release as a second frame hands it a second click on an already open
-    /// menu and it closes again. A real window delivers both in one frame's
-    /// event list, which is what this does.
+    /// Both details are real-window behaviour, and both were learned the slow
+    /// way. The pointer has to be over the widget *before* the press arrives:
+    /// batching move+press+release into one frame leaves egui no frame in which
+    /// the widget was hovered and pressed, and the click is silently not
+    /// registered — a sidebar tab that never opened, in an earlier version of
+    /// these helpers. And press and release must share a frame, because a
+    /// `menu_button` opens on the press and would take the release as a second
+    /// click, closing again.
+    fn click_at(
+        app: &mut BridgeApp,
+        ctx: &egui::Context,
+        at: egui::Pos2,
+        mut draw: impl FnMut(&mut BridgeApp, &egui::Context),
+    ) {
+        draw(app, ctx);
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1400.0, 900.0),
+            )),
+            events: vec![egui::Event::PointerMoved(at)],
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, |ctx| draw(app, ctx));
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1400.0, 900.0),
+            )),
+            events: vec![button(at, true), button(at, false)],
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, |ctx| draw(app, ctx));
+    }
+
     fn click_toolbar(app: &mut BridgeApp, ctx: &egui::Context, at: egui::Pos2) {
-        drive_toolbar(app, ctx, at, vec![button(at, true), button(at, false)]);
+        click_at(app, ctx, at, |app, ctx| {
+            let _ = ctx;
+            app.top_bar(ctx);
+        });
     }
 
     /// Where the toolbar drew the given text, or a failure listing what it did
@@ -5316,6 +5706,269 @@ mod tests {
         assert_eq!(order(&app), ["high.png", "mid.png", "low.png"]);
         app.browser.set_sort(SortKey::Rating, SortDir::Asc);
         assert_eq!(order(&app), ["low.png", "mid.png", "high.png"]);
+    }
+
+    #[test]
+    fn a_saved_collection_puts_its_rows_back_on_screen_after_the_search_is_gone() {
+        // The whole point of a collection: an answer worth coming back to,
+        // without retyping it and without it drifting into a different scope.
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let beach = png(&root, "sunset.png");
+        let pines = png(&root, "pines.png");
+        seed_index(&data, &[(beach.clone(), 0), (pines.clone(), 0)], &_stores);
+        let db = bc_core::paths::metadata_index_path().unwrap();
+        let index = bc_core::MetadataIndex::open(&db).unwrap();
+        for (path, title) in [(&beach, "a beach evening"), (&pines, "pines at dawn")] {
+            let mut meta = bc_metadata::Metadata::new();
+            meta.set_text(bc_metadata::NS_DC, "title", title.to_string());
+            index.index_file(path, &meta).unwrap();
+        }
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data, &_stores);
+        app.search_text = "beach".to_string();
+        app.request_search();
+        finish_search(&mut app, &ctx);
+        assert_eq!(result_names(&app), vec!["sunset.png".to_string()]);
+
+        app.collection_name = "shore things".to_string();
+        app.save_current_collection();
+        assert!(app.status.starts_with("Saved collection"), "{}", app.status);
+        assert_eq!(app.collections.len(), 1, "{:?}", app.collections);
+        assert_eq!(
+            app.browser.collection(),
+            Some("shore things"),
+            "the grid should now be labelled as the collection it came from"
+        );
+
+        // Leave the search entirely, then come back to the collection.
+        app.search_text.clear();
+        app.clear_search();
+        assert!(!app.browser.is_searching(), "clearing left a listing");
+        // Back to the folder's own two files, not the one the search matched.
+        assert_eq!(
+            result_names(&app),
+            vec!["pines.png".to_string(), "sunset.png".to_string()],
+            "clearing a search did not restore the folder listing"
+        );
+
+        app.run_collection("shore things");
+        finish_search(&mut app, &ctx);
+        assert!(app.browser.is_searching());
+        assert_eq!(
+            result_names(&app),
+            vec!["sunset.png".to_string()],
+            "the collection did not reproduce its own answer"
+        );
+        assert_eq!(
+            app.search_text, "beach",
+            "the box should show the collection's words"
+        );
+        assert!(
+            app.status.contains("Collection “shore things”"),
+            "the status should name what is on screen: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn saving_a_name_twice_replaces_the_collection_rather_than_piling_it_up() {
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let sunset = png(&root, "sunset.png");
+        let pines = png(&root, "pines.png");
+        seed_index(&data, &[(sunset.clone(), 0), (pines.clone(), 0)], &_stores);
+        let db = bc_core::paths::metadata_index_path().unwrap();
+        let index = bc_core::MetadataIndex::open(&db).unwrap();
+        for (path, title) in [(&sunset, "sunset glow"), (&pines, "pines ridge")] {
+            let mut meta = bc_metadata::Metadata::new();
+            meta.set_text(bc_metadata::NS_DC, "title", title.to_string());
+            index.index_file(path, &meta).unwrap();
+        }
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data, &_stores);
+
+        app.search_text = "pines".to_string();
+        app.request_search();
+        finish_search(&mut app, &ctx);
+        app.collection_name = "trip".to_string();
+        app.save_current_collection();
+
+        // Same name, different words: the earlier rules are gone, not shadowed.
+        app.search_text = "sunset".to_string();
+        app.request_search();
+        finish_search(&mut app, &ctx);
+        app.collection_name = "trip".to_string();
+        app.save_current_collection();
+
+        assert_eq!(app.collections.len(), 1, "{:?}", app.collections);
+        app.run_collection("trip");
+        finish_search(&mut app, &ctx);
+        assert_eq!(result_names(&app), vec!["sunset.png".to_string()]);
+    }
+
+    #[test]
+    fn a_damaged_collection_stays_in_the_list_and_explains_why_it_cannot_run() {
+        // Two halves, tested where each belongs. That a stored definition can
+        // arrive unreadable is proven against the real database in
+        // `bc-core`'s `an_unreadable_definition_is_reported_rather_than_dropped`
+        // — bc-ui has no SQLite dependency and is not getting one to corrupt a
+        // row from a test. What is tested here is the interface's half: the
+        // entry stays visible, says what is wrong, and running it changes
+        // nothing on screen.
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        png(&root, "one.png");
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data, &_stores);
+        app.search_text = "one".to_string();
+        app.request_search();
+        finish_search(&mut app, &ctx);
+        let running_before = result_names(&app);
+
+        // Enter the tab and let its refresh run first, then install the
+        // damaged row: refreshing on entry is the design, and it would
+        // otherwise wipe the very state this test is about.
+        app.sidebar_tab = SidebarTab::Collections;
+        let _ = sidebar_text(&mut app, &ctx);
+        app.collections = vec![bc_core::LoadedCollection {
+            name: "broken".to_string(),
+            version: bc_core::COLLECTION_DOCUMENT_VERSION,
+            definition: Err("the stored definition could not be read: expected value".to_string()),
+        }];
+
+        assert_eq!(app.collections[0].summary(), "unreadable definition");
+        app.run_collection("broken");
+        assert!(
+            app.status.contains("cannot run"),
+            "running a damaged collection must say why: {}",
+            app.status
+        );
+        assert_eq!(
+            result_names(&app),
+            running_before,
+            "a failed run changed the grid anyway"
+        );
+
+        // And the panel shows it rather than hiding the row. The panel has to
+        // be on that tab first; `sidebar_text` draws what the state says.
+        app.sidebar_tab = SidebarTab::Collections;
+        let drawn: Vec<String> = sidebar_text(&mut app, &ctx)
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect();
+        assert!(
+            drawn.iter().any(|t| t == "broken"),
+            "the damaged collection was left out of the list: {drawn:?}"
+        );
+        assert!(
+            drawn
+                .iter()
+                .any(|t| t.contains("definition cannot be read")),
+            "the list gave no reason: {drawn:?}"
+        );
+    }
+
+    #[test]
+    fn deleting_a_collection_leaves_every_file_where_it_was() {
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let kept = png(&root, "kept.png");
+        // A row, or there is nothing for the search to find. The app's own
+        // pass would also create one, but on its own thread, and a test that
+        // races it is a test that sometimes proves nothing.
+        seed_index(&data, &[(kept.clone(), 0)], &_stores);
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data, &_stores);
+        app.search_text = "kept".to_string();
+        app.request_search();
+        finish_search(&mut app, &ctx);
+        app.collection_name = "throwaway".to_string();
+        app.save_current_collection();
+        assert_eq!(app.collections.len(), 1);
+
+        app.delete_collection("throwaway");
+        assert!(app.collections.is_empty(), "{:?}", app.collections);
+        assert!(
+            app.status.contains("No files were touched"),
+            "deleting a saved search should say what it does not do: {}",
+            app.status
+        );
+        assert!(kept.exists(), "a file disappeared with its collection");
+        assert_eq!(result_names(&app), vec!["kept.png".to_string()]);
+    }
+
+    #[test]
+    fn the_collections_tab_is_reachable_and_offers_to_save_the_current_search() {
+        // Reachability again: a panel that exists in the code but is not wired
+        // into the sidebar is not a feature the user can get to.
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        png(&root, "one.png");
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data, &_stores);
+
+        let drawn = sidebar_text(&mut app, &ctx);
+        let tab = "◎ Collections";
+        let rect = drawn
+            .iter()
+            .find(|(text, _)| text == tab)
+            .map(|(_, r)| *r)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the Collections tab is not in the sidebar; it drew {:?}",
+                    drawn.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>()
+                )
+            });
+
+        click_sidebar(&mut app, &ctx, rect.center());
+        assert_eq!(app.sidebar_tab, SidebarTab::Collections);
+        let panel = sidebar_text(&mut app, &ctx);
+        let texts: Vec<&str> = panel.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(
+            texts.iter().any(|t| t.contains("Save this search")),
+            "the collections panel did not offer to save: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("Nothing to save")),
+            "with a folder on screen it should say there is nothing to save: {texts:?}"
+        );
+
+        // Search, then look again: the save control is enabled.
+        app.search_text = "one".to_string();
+        app.request_search();
+        finish_search(&mut app, &ctx);
+        let after = sidebar_text(&mut app, &ctx);
+        let after_texts: Vec<&str> = after.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(
+            !after_texts.iter().any(|t| t.contains("Nothing to save")),
+            "a live search should not be told there is nothing to save: {after_texts:?}"
+        );
     }
 
     #[test]
