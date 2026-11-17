@@ -22,10 +22,7 @@ pub struct Recents {
 impl Recents {
     /// Open the current user's default BridgeCraft recents store.
     pub fn open_default() -> Result<Self> {
-        Self::open(
-            user_data_dir()?.join("BridgeCraft").join(FILE_NAME),
-            DEFAULT_RECENTS_LIMIT,
-        )
+        Self::open(crate::paths::data_file(FILE_NAME)?, DEFAULT_RECENTS_LIMIT)
     }
 
     /// Open a recents store at `file`, loading any previously persisted paths.
@@ -64,11 +61,15 @@ impl Recents {
             }
         })?;
         let path_string = path.to_string_lossy().into_owned();
-        self.paths
-            .retain(|existing| existing != Path::new(&path_string));
-        self.paths.insert(0, PathBuf::from(path_string));
-        self.paths.truncate(self.limit);
-        self.persist()
+        let mut candidate = self.paths.clone();
+        candidate.retain(|existing| existing != Path::new(&path_string));
+        candidate.insert(0, PathBuf::from(path_string));
+        candidate.truncate(self.limit);
+        // Written before adopted, as in `Favorites`: a failed save should leave
+        // the list unchanged rather than holding an entry nothing recorded.
+        self.persist_list(&candidate)?;
+        self.paths = candidate;
+        Ok(())
     }
 
     /// Return paths ordered from most to least recently accessed.
@@ -78,37 +79,31 @@ impl Recents {
 
     /// Remove a path from recents and persist the updated list.
     pub fn remove(&mut self, path: impl AsRef<Path>) -> Result<()> {
-        self.paths.retain(|existing| existing != path.as_ref());
-        self.persist()
+        let mut candidate = self.paths.clone();
+        candidate.retain(|existing| existing != path.as_ref());
+        self.persist_list(&candidate)?;
+        self.paths = candidate;
+        Ok(())
     }
 
-    fn persist(&self) -> Result<()> {
+    /// Write `paths` as the store's whole content, atomically.
+    fn persist_list(&self, paths: &[PathBuf]) -> Result<()> {
         if let Some(parent) = self.file.parent() {
             fs::create_dir_all(parent)?;
         }
-        let strings: Vec<String> = self
-            .paths
+        let strings: Vec<String> = paths
             .iter()
             .map(|path| path.to_string_lossy().into_owned())
             .collect();
         let bytes = serde_json::to_vec_pretty(&strings).map_err(|error| {
             CoreError::InvalidOperation(format!("could not encode recents: {error}"))
         })?;
-        fs::write(&self.file, bytes)?;
+        // Atomic for the same reason as favourites: the reader errors on a
+        // malformed file, so a half-written recents list would be unavailable
+        // rather than merely short.
+        crate::paths::write_atomic(&self.file, &bytes).map_err(CoreError::Io)?;
         Ok(())
     }
-}
-
-/// Resolve BridgeCraft's per-user data directory without external dependencies.
-///
-/// The rules themselves live in [`crate::paths`]; this stays as a thin alias so
-/// the existing stores keep calling one obvious name. Before that, `recents`
-/// and `auto_process` each carried their own copy of the platform branches and
-/// they had already drifted: one looked in the data directory, the other in the
-/// config directory, which is how the metadata index ended up filed with the
-/// wrong kind of thing.
-pub(crate) fn user_data_dir() -> Result<PathBuf> {
-    crate::paths::user_data_root()
 }
 
 #[cfg(test)]
@@ -133,6 +128,45 @@ mod tests {
         assert_eq!(recents.paths(), &[c.clone(), a.clone()]);
         let loaded = Recents::open(&store, 2).unwrap();
         assert_eq!(loaded.paths(), &[c, a]);
+    }
+
+    /// The same guarantee as favourites: a recents save that cannot be written
+    /// must leave the file and the in-memory order alone. `BridgeApp::open_root`
+    /// records every folder it opens, so a silently-adopted entry would show a
+    /// recents list that the next launch does not have.
+    #[test]
+    #[cfg(unix)]
+    fn a_failed_record_leaves_the_previous_list_intact() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let file = dir.path().join("recents.json");
+
+        let mut recents = Recents::open(&file, 8).unwrap();
+        recents.record_access(&first).unwrap();
+        let saved = std::fs::read(&file).unwrap();
+
+        std::fs::set_permissions(dir.path(), PermissionsExt::from_mode(0o500)).unwrap();
+        let result = recents.record_access(&second);
+        std::fs::set_permissions(dir.path(), PermissionsExt::from_mode(0o700)).unwrap();
+
+        assert!(
+            result.is_err(),
+            "a record into a read-only directory succeeded"
+        );
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            saved,
+            "a failed write still changed the file"
+        );
+        assert_eq!(
+            recents.paths().to_vec(),
+            vec![first],
+            "the failed record reordered the live list"
+        );
     }
 
     #[test]

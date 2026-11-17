@@ -55,15 +55,14 @@ fn rename_contexts(sources: &[PathBuf]) -> Vec<RenameContext> {
         .collect()
 }
 
-/// Persistent undo journal location, following the user's XDG data directory.
+/// Persistent undo journal location.
+///
+/// This used to reimplement the platform rules here, XDG-only, so a macOS or
+/// Windows launch put the journal somewhere else than everywhere else in the
+/// app -- and somewhere the watched-folder action did not write. One call to
+/// the shared helper is the fix.
 pub fn journal_path() -> Result<PathBuf, String> {
-    let data_dir = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("share"))
-        })
-        .ok_or_else(|| "cannot locate a user data directory".to_string())?;
-    Ok(batch_rename::journal_path(&data_dir.join("BridgeCraft")))
+    bc_core::paths::rename_journal_path().map_err(|error| error.to_string())
 }
 
 /// Human-readable relative name for the preview; paths themselves remain
@@ -77,6 +76,21 @@ pub fn display_name(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_undo_journal_resolves_through_the_shared_helper() {
+        // This call site used to reimplement the platform rules, and did so
+        // XDG-only: a macOS or Windows launch put the journal somewhere else
+        // than every other store, and somewhere the watched-folder action did
+        // not write. The fix is that both ask the same function, so what is
+        // asserted is the agreement, not the shape of the path.
+        let expected = bc_core::paths::rename_journal_path().unwrap();
+        assert_eq!(journal_path().unwrap(), expected);
+        assert!(
+            expected.file_name().unwrap() == "last-rename.json",
+            "{expected:?}"
+        );
+    }
 
     #[test]
     fn preview_uses_sequential_names_and_keeps_extensions() {

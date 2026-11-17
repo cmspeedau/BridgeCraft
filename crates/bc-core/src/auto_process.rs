@@ -275,11 +275,16 @@ impl AutoProcessor {
             Some(path) => path,
             None => crate::paths::thumbnail_cache_path()?,
         };
-        let data_dir = config_path
-            .parent()
-            .ok_or_else(|| CoreError::InvalidOperation("auto config has no parent".into()))?;
-        let journal_path = data_dir.join("last-rename.json");
+        let journal_path = crate::paths::rename_journal_path()?;
         Self::open(&config_path, cache_path, journal_path)
+    }
+
+    /// The journal this processor actually writes, for the test that checks the
+    /// two rename-journal writers agree. Not a knob: production resolves the
+    /// path in `open_default`.
+    #[cfg(test)]
+    pub fn journal_path(&self) -> PathBuf {
+        self.shared.journal_path.clone()
     }
 
     /// Open with an explicit settle duration, intended for deterministic tests

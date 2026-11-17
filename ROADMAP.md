@@ -154,7 +154,8 @@ M1's remaining items are the two surfacing defects (failed-versus-pending thumbn
 - **Sidecar files are listed and indexed like any other file, and library search returns them.** Confirmed against a database written by the release binary rather than reasoned about: searching `blue` over a folder of four sidecar-tagged JPEGs matched eight rows, because each `.xmp` is a file with its own row carrying the same tags as the photo beside it. The remedy is not a special case in search — it is the pre-existing "Thumbnails only" toggle, which filters whatever the browser is showing, and `thumbnails_only_hides_sidecar_files_from_search_results_too` now pins that it reaches result sets as well as folder listings. What is still undecided is whether a sidecar should ever have had a row: excluding them at index time would make counts and coverage honest for photo libraries, and that is a listing-policy call worth making deliberately rather than by accretion.
 - **Staleness depends on a clock that is coarser than an edit.** Measured on this machine: 149 of 400 same-size tag edits reused the previous write's modification timestamp, because the kernel serves a cached timestamp across a stretch of writes. Since `set_rating(0)` *removes* the property rather than writing zero, such an edit changes neither size nor timestamp, and `is_current` then calls the file current forever — the row keeps the old rating, and a rating sort or tag filter serves it. Two things follow, both in force: saving tags re-indexes **explicitly** (`indexer::reindex`) instead of asking, and a folder pass keeps the skip because it cannot afford to re-read every file. The gap that remains is an edit made by *another* application within one timestamp tick of the last indexing, which no pass will notice until the file changes size or the extractor version moves. The durable fix is a content signature on the row, which costs a read to compute and so has to be weighed against simply not skipping.
 - **`TagWrite::Replace` and `TagWrite::Merge` are one bit of intent every tag writer must state.** Absence of a tag property in a metadata means either "the user cleared it" or "this save does not touch tags", and the two need opposite results. The panel and export use `Replace`; a partial update uses `Merge`. Nothing can tell them apart from the data, so the parameter is mandatory rather than defaulted — the default is exactly what made clearing silently fail for embedded packets.
-- **Saved searches now have their own file, and two neighbouring stores still do not.** They moved out of `metadata.sqlite` into `saved-searches.json` in the data directory (`bc_core::SavedSearches`), written through the same `write_atomic` that watched-folder state uses, because the index is a cache that may be rebuilt at any moment and nothing else holds a saved search. Two leftovers follow. First, a database created by an earlier build keeps an orphan `smart_collections` table; the new code never reads or writes it, and an old file was verified to open and index normally around it — no migration, because the table-reading feature shipped in the same unreleased session that removed it and no build anyone could run ever wrote a row. Second, `favorites.json` and `recents.json` are still persisted with a plain `fs::write`: a crash or a full disk mid-write leaves a truncated file, and this crate's own reader treats unparseable JSON as an error rather than a cache miss, so favourites and recents are lost rather than rebuilt. `write_atomic` is now shared and one line to adopt there; this slice did not, because it is not what the task was, and that is precisely the kind of "obviously fine, someone will do it later" note this file has a habit of leaving behind.
+- **Persistence is atomic and single-sourced; one store still adopts before it writes.** `favorites.json`, `recents.json`, `saved-searches.json`, the version-stack file and the watched-folder state all write through `bc_core::paths::write_atomic` now (the helper moved out of `auto_process` rather than being copied), and `favorites`/`recents` additionally write the *candidate* list before adopting it, so a save that fails leaves the on-screen list and the file agreeing. Two residuals. `version_stacks` still mutates in memory before persisting at eight call sites — it is atomic, so a crash cannot corrupt the file, but a failed save leaves the session showing a stack that is not on disk; it is listed as deferred not because it is fine but because the feature has no UI at all, so nobody can experience it, and the same argument applied to it eight times is how this file keeps accruing debts.
+- **Two path bugs that only surfaced because the rename journal was drawn twice.** `bc-ui::batch_rename_ui::journal_path` had its own copy of the platform rules and an XDG-only one, so a macOS or Windows launch wrote the undo journal somewhere every other store ignores; and the watched-folder action derived the same journal from the *configuration* directory while the dialog derived it from the *data* directory, so a rename made by a rule could not be undone from the dialog and vice versa. Both now resolve through `paths::rename_journal_path`, and `both_rename_journal_writers_resolve_the_same_file` asserts the agreement through `AutoProcessor::open_default` rather than comparing the helper with itself. Five call sites that hand-appended `"BridgeCraft"` (`favorites`, `recents`, `trash`, `plugins`, `photocraft`, `version_stacks`) were moved onto the helpers, and `recents::user_data_dir` — the alias those sites leaned on — is deleted. One consequence of settling the journal on the data directory: an undo journal a previous build left in the configuration directory is no longer read, so a rename that was waiting to be undone across a restart loses that history. Nothing else about it is affected, the file is left where it is for anyone who wants it, and the journal is a transient record of one dialog action rather than user-authored content — which is why no migration was written for it.
 
 - **Collections can only be saved from what the search box can express.** The storage holds an arbitrary `Query`, and running one honours whatever rules are in it — but the only way to *build* one through the interface is typing words. So a user cannot save "rated 3 or more, unflagged" without the rule editor, and that editor is the remaining half of this feature rather than an unmentioned gap.
 - **Duplicate query spellings removed, not normalised.** `bc-core::metadata_index` used to accept several field and operator spellings (`Field::Make`/`CameraMake`, `Operator::Eq`/`Equals`, and `Query`'s `predicates`/`conditions`/`clauses`/`and`/`or`/`expr`) and reconcile them at match time, with the rule that they had to be kept because they were serialised into stored smart-collection rows. The premise was checked before it was dropped: nothing in the repository has ever called `save_smart_collection`, so no such row exists on any disk, and `matches` was quietly giving different answers depending on which synonym a query happened to use. There is now one predicate container, one combinator, and one spelling per field and operator; the `a_stored_query_round_trips_through_the_shape_that_is_saved` test asserts the serialised form contains none of the old containers, so the shape cannot regrow unnoticed.
@@ -538,6 +539,73 @@ against the release binary rather than only against `cargo test`.
   error rather than a miss. The atomic writer is now shared and one line to
   adopt; it was not this slice's job, and the temptation to fix adjacent files
   while in the neighbourhood is how slices stop being reviewable.
+
+### Durability of the JSON stores, and two path bugs they led me to (slice 12, shipped 2026-11-17)
+
+Last slice I wrote that `favorites.json` and `recents.json` still used a plain
+`fs::write` and that adopting the shared atomic writer would be "one line", in a
+note warning against exactly that kind of "someone will do it later". Doing it
+this slice turned the note into two bug reports, which is the argument for
+fixing a hazard the moment it is named rather than after it has been written
+down twice.
+
+- **The batch-rename journal had a sixth copy of the platform rules — and it was
+  XDG-only.** `bc-ui::batch_rename_ui::journal_path` read `XDG_DATA_HOME`/`HOME`
+  itself, so on macOS and Windows it pointed somewhere none of the other stores
+  live.
+- **Two writers, two journals, one undo history.** The watched-folder action
+  derived the journal from the *configuration* directory; the interactive dialog
+  from the *data* directory. A rename performed by a rule could not be undone
+  from the dialog, and neither side could explain why its history looked empty.
+  One helper now answers for both.
+- **Five sites were still recomposing the app folder by hand**
+  (`user_data_dir()?.join("BridgeCraft")` in favourites, recents, trash, plugins,
+  photocraft and version stacks) even though `paths::data_file` had existed since
+  slice 8 — the double-append trap that helper's own comment describes. All
+  routed through the helpers and the `recents::user_data_dir` alias deleted, so
+  there is one place the app folder name is written.
+- **The cache never opened on a clean profile, and my first verification missed
+  it.** The headline of this slice was a shared thumbnail path, and the first
+  real run I checked showed `thumbnails.sqlite` present — in a home directory an
+  *earlier* run of mine had already created. Testing `CacheStore::open` against a
+  directory that exists is not testing a first launch. The thumbnail crate
+  created the cache file but not its parent, unlike every other store here, so on
+  a genuinely new profile the worker logged "thumbnail cache unavailable" once and
+  then silently re-decoded every image forever. The opener now creates the parent
+  (`opening_a_cache_creates_its_parent_directory`) and names the directory when it
+  cannot (`opening_a_cache_reports_an_impossible_location`, because "File exists
+  (os error 17)" alone identifies nothing). The before/after is observed rather
+  than argued: the same release flow with a clean home produced no cache file at
+  all before this, and three cached thumbnails after. The lesson is about the
+  check, not the code — a verification run on a machine that has been used before
+  can only ever observe the used state.
+
+- **Durability, with the limits of what I could prove stated rather than
+  blurred.** Writes go through temp+`sync_all`+rename; favourites and recents now
+  persist the *candidate* list before adopting it, so a failed save cannot leave
+  the screen showing something the disk never got. What is *not* proven: a torn
+  write cannot be staged honestly in a test — the permission-denied failure
+  happens at open, before either the old or the new code would truncate — so the
+  store-level test says so in its own comment, and the properties that can be
+  pinned (`paths::tests`: no leftover temp, a stale temp does not block the next
+  write, unique names) are pinned there instead.
+- **A stale temp name was an availability bug waiting to be inherited.**
+  `write_atomic` named its temp file `pid`+thread only. A process killed between
+  write and rename leaves that file behind, and a later process with a reused pid
+  then fails `create_new` — permanently, with a message the user cannot act on.
+  I was about to hand that helper to three more stores, so the name now carries a
+  per-call counter as well, the same reasoning the export pool already documents.
+  `every_attempt_gets_its_own_temp_name` and
+  `a_stale_temp_from_a_killed_run_does_not_block_the_next_write` both fail against
+  the previous scheme; I checked that rather than assuming it.
+- **Four mistakes of mine, all caught before committing**: a test I wrote against
+  an assumed filename in `paths.rs` instead of the real one; an anchor I invented
+  rather than grepped, so a patch silently no-op'd; a hand-written config fixture
+  missing `version`, whose failure message told me exactly what was wrong; and —
+  most worth keeping — a first version of the journal test that compared
+  `rename_journal_path()` with itself. It passed, and proved nothing. The rewrite
+  constructs an `AutoProcessor` through the production default and asserts the two
+  writers name the same file.
 
 ### Documentation corrected against the code on `main` (no behavior changes)
 

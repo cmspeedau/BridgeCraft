@@ -191,7 +191,7 @@ impl PluginManager {
     }
 
     pub fn open_default() -> Result<Self> {
-        let root = crate::recents::user_data_dir()?.join("BridgeCraft");
+        let root = crate::paths::app_data_dir()?;
         let plugins_dir = root.join("plugins");
         fs::create_dir_all(&plugins_dir)?;
         let mut manager = Self::with_dir(plugins_dir);

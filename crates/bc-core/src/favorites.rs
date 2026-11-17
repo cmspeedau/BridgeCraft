@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{recents::user_data_dir, CoreError, Result};
+use crate::{CoreError, Result};
 
 const FILE_NAME: &str = "favorites.json";
 
@@ -20,7 +20,7 @@ pub struct Favorites {
 impl Favorites {
     /// Open the current user's default BridgeCraft favorites store.
     pub fn open_default() -> Result<Self> {
-        Self::open(user_data_dir()?.join("BridgeCraft").join(FILE_NAME))
+        Self::open(crate::paths::data_file(FILE_NAME)?)
     }
 
     /// Open a favorites store at `file`, loading any previously persisted paths.
@@ -72,35 +72,45 @@ impl Favorites {
         if self.contains(path) {
             return Ok(false);
         }
-        self.paths.push(path.to_path_buf());
-        self.persist()?;
+        // The candidate is written before it is adopted: if the write fails,
+        // the list a user is looking at must not contain a folder that is not
+        // on disk, because the next reopen would silently drop it.
+        let mut candidate = self.paths.clone();
+        candidate.push(path.to_path_buf());
+        self.persist_list(&candidate)?;
+        self.paths = candidate;
         Ok(true)
     }
 
     /// Remove `path` from the list; reports whether anything was removed.
     pub fn remove(&mut self, path: impl AsRef<Path>) -> Result<bool> {
-        let before = self.paths.len();
-        self.paths.retain(|existing| existing != path.as_ref());
-        let removed = self.paths.len() != before;
+        let mut candidate = self.paths.clone();
+        candidate.retain(|existing| existing != path.as_ref());
+        let removed = candidate.len() != self.paths.len();
         if removed {
-            self.persist()?;
+            self.persist_list(&candidate)?;
+            self.paths = candidate;
         }
         Ok(removed)
     }
 
-    fn persist(&self) -> Result<()> {
+    /// Write `paths` as the store's whole content, atomically.
+    fn persist_list(&self, paths: &[PathBuf]) -> Result<()> {
         if let Some(parent) = self.file.parent() {
             fs::create_dir_all(parent)?;
         }
-        let strings: Vec<String> = self
-            .paths
+        let strings: Vec<String> = paths
             .iter()
             .map(|path| path.to_string_lossy().into_owned())
             .collect();
         let bytes = serde_json::to_vec_pretty(&strings).map_err(|error| {
             CoreError::InvalidOperation(format!("could not encode favorites: {error}"))
         })?;
-        fs::write(&self.file, bytes)?;
+        // Atomic: a crash or a full disk mid-write must leave the previous
+        // favourites intact rather than a truncated file, which this reader
+        // treats as an error rather than a cache miss — so a torn write is the
+        // whole list, gone.
+        crate::paths::write_atomic(&self.file, &bytes).map_err(CoreError::Io)?;
         Ok(())
     }
 }
@@ -145,6 +155,64 @@ mod tests {
             Err(CoreError::InvalidOperation(_))
         ));
         assert!(favorites.paths().is_empty());
+    }
+
+    /// A save that cannot be written must leave the file and the list in front
+    /// of the user agreeing. Two properties, one test: the previous favourites
+    /// still load, and the failed add did not quietly take effect in memory
+    /// only to vanish on the next reopen.
+    ///
+    /// Worth saying plainly what this does *not* prove: it cannot distinguish
+    /// an atomic writer from `fs::write`, because a permission-denied failure
+    /// happens at open, before either would truncate. The torn-write case needs
+    /// a crash or a full disk, which no test here can stage honestly; what pins
+    /// the atomicity itself is `paths::tests`, which can.
+    #[test]
+    #[cfg(unix)]
+    fn a_failed_save_leaves_the_previous_list_intact() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        let file = dir.path().join("favorites.json");
+
+        let mut favorites = Favorites::open(&file).unwrap();
+        favorites.add(&first).unwrap();
+        let saved = fs::read(&file).unwrap();
+
+        // Read-only directory: the file can still be read, no temp can be made.
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o500)).unwrap();
+        let add_result = favorites.add(&second);
+        let remove_result = favorites.remove(&first);
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(
+            add_result.is_err(),
+            "a save into a read-only directory succeeded"
+        );
+        assert!(
+            remove_result.is_err(),
+            "a removal reported a success it could not write"
+        );
+        assert_eq!(
+            fs::read(&file).unwrap(),
+            saved,
+            "a failed write still changed the file"
+        );
+        assert!(
+            !favorites.contains(&second),
+            "the failed add was adopted in memory anyway"
+        );
+        assert!(
+            favorites.contains(&first),
+            "a failed remove dropped an entry it could not save"
+        );
+
+        // And the file is still a list the next open can read.
+        let reopened = Favorites::open(&file).unwrap();
+        assert_eq!(reopened.paths().to_vec(), vec![first]);
     }
 
     #[test]

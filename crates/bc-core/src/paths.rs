@@ -99,21 +99,22 @@ fn platform_root(
 
 /// Write `bytes` so a reader never sees a half-written file.
 ///
-/// Shared because more than one store needs it and the mistakes are the same:
-/// `create_new` so a stale temp from a killed run can never be clobbered into
-/// the real file, `sync_all` so a crash leaves the old content rather than an
-/// empty one, and cleanup on every failure path. Lifting it out of
-/// `auto_process` is what lets saved searches persist without copying the rule
-/// a second time.
-pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// Shared because five stores need it and the mistakes are the same: `sync_all`
+/// so a crash leaves the old content rather than an empty one, rename so a
+/// reader sees either the whole old file or the whole new one, and cleanup on
+/// every failure path.
+///
+/// The temp name carries a per-call counter as well as the process id and
+/// thread name. That is not decoration: with only `pid`+`thread`, a process
+/// killed between the write and the rename leaves a file that *every later
+/// attempt in a recycled-pid process refuses to create* — `create_new` fails,
+/// so the store becomes permanently unwritable and the user sees
+/// "Favorites unavailable" with no way to fix it. The export pool already
+/// names its temp files this way for the same reason.
+pub(crate) fn write_atomic(path: &Path, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
+    let bytes = bytes.as_ref();
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let unique = format!(
-        ".{name}.bridgecraft-tmp-{}-{}",
-        std::process::id(),
-        std::thread::current().name().unwrap_or("worker")
-    );
-    let temporary = parent.join(unique);
+    let temporary = parent.join(temp_name(path));
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -133,6 +134,39 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         return Err(error);
     }
     Ok(())
+}
+
+/// A temp name that cannot collide with another attempt, including one left
+/// behind by a process that was killed mid-write.
+fn temp_name(path: &Path) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    // A coarse clock can repeat within a process, which is why the counter is
+    // here rather than being assumed unnecessary.
+    let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!(
+        ".{name}.bridgecraft-tmp-{}-{}-{nanos}-{sequence}",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("worker"),
+    )
+}
+
+/// The batch-rename undo journal.
+///
+/// Both writers of that journal -- the interactive rename dialog and the
+/// watched-folder action -- resolve it here. They used to derive it
+/// independently, one from the data directory and one from the configuration
+/// directory, which meant a rename undone in the dialog could not see the
+/// journal a watched-folder rule had written, and each side looked like a
+/// history the other had lost.
+pub fn rename_journal_path() -> Result<PathBuf> {
+    data_file("last-rename.json")
 }
 
 /// The thumbnail cache database.
@@ -252,6 +286,124 @@ mod tests {
             path.to_string_lossy().matches(APP_FOLDER).count(),
             1,
             "the app folder appears twice in {path:?}: a double-append"
+        );
+    }
+
+    /// A file left behind by a process killed between write and rename, in the
+    /// shape the naming used to produce: `pid` and thread name only.
+    fn stale_temp_of_the_old_scheme(file: &Path) -> PathBuf {
+        let name = file.file_name().unwrap().to_string_lossy();
+        file.parent().unwrap().join(format!(
+            ".{name}.bridgecraft-tmp-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("main")
+        ))
+    }
+
+    #[test]
+    fn a_stale_temp_from_a_killed_run_does_not_block_the_next_write() {
+        // The failure this guards: with a deterministic temp name, `create_new`
+        // returns AlreadyExists forever after one interrupted write, and the
+        // store becomes permanently unwritable — reported to the user as
+        // "unavailable", with no visible cause.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("state.json");
+        write_atomic(&file, b"first").unwrap();
+
+        let stale = stale_temp_of_the_old_scheme(&file);
+        std::fs::write(&stale, b"interrupted").unwrap();
+        write_atomic(&file, b"second").unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"second");
+
+        // And the leftover is still there for a human to notice, not silently
+        // swallowed: it belongs to a different attempt, not this one.
+        assert!(
+            stale.exists(),
+            "the helper deleted a file it did not create"
+        );
+    }
+
+    #[test]
+    fn every_attempt_gets_its_own_temp_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("state.json");
+        let mut names = std::collections::HashSet::new();
+        for _ in 0..200 {
+            names.insert(temp_name(&file));
+        }
+        assert_eq!(
+            names.len(),
+            200,
+            "temp names repeated, so two writers can collide"
+        );
+    }
+
+    #[test]
+    fn an_atomic_write_leaves_no_temp_file_behind() {
+        // Both the success path (rename consumes it) and the failure path
+        // (cleanup removes it) have to hold, or the data directory slowly fills
+        // with dot-files nobody can explain.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("state.json");
+        write_atomic(&file, b"contents").unwrap();
+        let left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("bridgecraft-tmp"))
+            .collect();
+        assert!(left.is_empty(), "a temp file outlived the write: {left:?}");
+
+        // A parent that cannot hold a temp file fails the write cleanly...
+        let missing = dir.path().join("no-such-dir").join("state.json");
+        assert!(write_atomic(&missing, b"x").is_err());
+        // ...and an unreadable-destination case leaves the previous content.
+        write_atomic(&file, b"kept").unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"kept");
+    }
+
+    #[test]
+    fn both_rename_journal_writers_resolve_the_same_file() {
+        // The watched-folder action and the interactive rename dialog each
+        // derived this path on their own, one from the configuration directory
+        // and one from the data directory, so an undo in one could not see the
+        // journal the other wrote. Both now call this helper; the assertion is
+        // that they agree, not that the path is pretty.
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = scoped(temp.path());
+        let journal = rename_journal_path().unwrap();
+        assert_eq!(
+            journal,
+            expected_root("DATA")
+                .join(APP_FOLDER)
+                .join("last-rename.json")
+        );
+        // Not in the configuration directory, where one of them used to put it.
+        let config = user_config_root().unwrap().join(APP_FOLDER);
+        assert!(
+            !journal.starts_with(&config),
+            "the journal resolved into the config directory: {journal:?}"
+        );
+        // The assertion with teeth: a processor built by `open_default` — the
+        // path production takes — writes to the file the interactive dialog
+        // reads. Comparing the helper with itself would prove nothing.
+        let config = config_file("auto-rules.json").unwrap();
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config,
+            br#"{"version":1,"settleMillis":1,"rules":[],"history":[]}"#,
+        )
+        .unwrap();
+        let processor = crate::auto_process::AutoProcessor::open(
+            &config,
+            thumbnail_cache_path().unwrap(),
+            rename_journal_path().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            processor.journal_path(),
+            journal,
+            "the watched-folder action journals somewhere else than the dialog"
         );
     }
 

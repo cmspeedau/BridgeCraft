@@ -304,9 +304,7 @@ impl PhotoCraftBridge {
     }
 
     pub fn handoff_default(&self, selection: &[PathBuf]) -> Result<PathBuf> {
-        let destination = crate::recents::user_data_dir()?
-            .join("BridgeCraft")
-            .join(HANDOFF_DIRECTORY);
+        let destination = crate::paths::data_file(HANDOFF_DIRECTORY)?;
         prepare_handoff(&destination, selection)
     }
 }

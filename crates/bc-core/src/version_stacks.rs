@@ -45,11 +45,7 @@ pub struct VersionStacks {
 
 impl VersionStacks {
     pub fn open_default() -> Result<Self> {
-        Self::open(
-            crate::recents::user_data_dir()?
-                .join("BridgeCraft")
-                .join(FILE_NAME),
-        )
+        Self::open(crate::paths::data_file(FILE_NAME)?)
     }
 
     pub fn open(file: impl Into<PathBuf>) -> Result<Self> {
@@ -241,7 +237,10 @@ impl VersionStacks {
         let bytes = serde_json::to_vec_pretty(&persisted).map_err(|e| {
             CoreError::InvalidOperation(format!("could not encode version stacks: {e}"))
         })?;
-        fs::write(&self.file, bytes)?;
+
+        // A stack records which files the user grouped together; nothing else
+        // holds that, so it is written atomically like the other JSON stores.
+        crate::paths::write_atomic(&self.file, bytes).map_err(CoreError::Io)?;
         Ok(())
     }
 }

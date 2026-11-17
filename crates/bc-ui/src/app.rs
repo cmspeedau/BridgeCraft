@@ -5889,10 +5889,17 @@ mod tests {
         app.request_search();
         finish_search(&mut app, &ctx);
 
-        let file = data
-            .join("data")
-            .join("BridgeCraft")
-            .join("saved-searches.json");
+        // Asked of the store rather than spelled out: a test that rebuilds the
+        // path by hand keeps its own copy of the rule and would quietly check a
+        // different file if the rule ever moved.
+        let file = bc_core::SavedSearches::open_default()
+            .unwrap()
+            .path()
+            .to_path_buf();
+        assert!(
+            file.starts_with(&data),
+            "{file:?} is not under the isolation root"
+        );
         std::fs::write(&file, b"{ this is not json").unwrap();
         let before = std::fs::read(&file).unwrap();
 

@@ -8,7 +8,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::{recents::user_data_dir, CoreError, Result};
+use crate::{CoreError, Result};
 
 const BIN_DIR: &str = "bin";
 const INDEX_FILE: &str = "index.json";
@@ -39,7 +39,7 @@ pub struct TrashBin {
 impl TrashBin {
     /// Open the current user's BridgeCraft bin.
     pub fn open_default() -> Result<Self> {
-        Self::open(user_data_dir()?.join("BridgeCraft").join(BIN_DIR))
+        Self::open(crate::paths::app_data_dir()?.join(BIN_DIR))
     }
 
     /// Open a bin rooted at `root`; primarily useful for embedding and tests.

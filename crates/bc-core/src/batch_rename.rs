@@ -468,10 +468,6 @@ pub fn undo(journal_path: &Path) -> Result<usize> {
 }
 
 /// Default journal location under a caller-supplied cache directory.
-pub fn journal_path(cache_dir: &Path) -> PathBuf {
-    cache_dir.join("last-rename.json")
-}
-
 /// Convenience: current time as Unix seconds.
 pub fn now_timestamp() -> i64 {
     SystemTime::now()
@@ -569,7 +565,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let a = temp.path().join("a.txt");
         std::fs::write(&a, b"a").unwrap();
-        let journal = journal_path(temp.path());
+        let journal = temp.path().join("last-rename.json");
         let p = Pattern::parse("renamed_{seq:0>2}").unwrap();
         let contexts = vec![RenameContext::from_path(a.clone(), 0)];
         let items = plan(&p, &contexts).unwrap();
