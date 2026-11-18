@@ -536,6 +536,39 @@ reported wrongly.
   fix (their own store beside favourites and recents) and with the version field
   that makes the move a copy rather than a rewrite.
 
+### CI was already red on two of three platforms, and one of those was mine (2026-11-19)
+
+Pushing the eleven accumulated commits ran the matrix for the first time since
+2026-11-15, and both the old and the new runs fail the same two legs — while
+everything I checked locally passed, because local is Linux.
+
+- **Windows: the atomic writer's temp file name, and a colon.** `write_atomic` names its
+  temp file `.‹file›.bridgecraft-tmp-‹pid›-‹thread›-‹nanos›-‹seq›`, and a Rust thread name is
+  arbitrary text. Under `cargo test` the thread is named for the test —
+  `favorites::tests::add_is_ordered_deduplicated_and_persisted` — and `:` on Windows starts
+  a drive specifier, so `CreateFile` failed with os error 123 (`InvalidFilename`) and *every*
+  store that writes atomically reported itself unusable. The bug is older than this session:
+  the 2026-11-15 run already failed three `auto_process` tests this way, when the helper was
+  still private to that module. What this session did was widen its reach — favourites,
+  recents, saved searches and now templates all went through the one writer — turning 3 red
+  tests into 20. Fixed by sanitising the thread tag to `[A-Za-z0-9_-]` and truncating it to
+  32 characters (the pid, clock and counter are what make the name unique; the thread is
+  only a label), with `a_temp_name_uses_only_characters_legal_in_a_windows_file_name`
+  asserting the illegal set directly — which reproduces the Windows failure on Linux, the
+  only place I can prove the fix without a Windows machine. Checked by hand: with the
+  sanitiser removed the test fails, naming the colon.
+- **macOS: a dependency that no longer compiles, and it is not mine.** `objc2 0.4.1`, pulled
+  in transitively by the winit/eframe stack, fails type-checking with the current toolchain
+  (`E0277` inside `objc2`'s own `ivar_forwarding_impls`). The same failure is present in the
+  2026-11-15 run, so nothing in these commits caused it, and nothing in these commits can fix
+  it: it needs the GUI stack updated or the CI toolchain pinned. Recorded in Risks rather
+  than left as a red badge somebody else will one day investigate.
+- **The uncomfortable general point.** Nine slices of "verified against the release binary"
+  were verified on one platform, and the repository's own quality gate —
+  `cargo test --workspace` — was green the whole time. A cross-platform claim in the README
+  is worth nothing if the only matrix run is the one nobody looked at. The matrix has been
+  red since before this session started; the difference now is that it is named.
+
 ### Metadata templates that can only change what they name (slice 15, shipped 2026-11-19)
 
 Critical path item 3 said four engines were "implemented, tested and unreachable".
@@ -958,6 +991,15 @@ down twice.
 - Video thumbnails require a user-installed FFmpeg binary, which is not bundled (mitigate: availability probe cached per process, videos simply skipped when absent, binary stays outside our licence surface)
 - PDF thumbnails require a user-provided Pdfium library, which is not bundled (mitigate: same availability probe and graceful skip; Pdfium's licence applies only to the user's copy)
 - Camera RAW thumbnails require a user-provided LibRaw library, which is not bundled (mitigate: same availability probe and graceful skip; LIBRAW_PATH override; embedded-preview fast-path keeps it fast; licence applies only to the user's copy)
+- **The macOS build is broken by a transitive dependency, and has been since before this
+  phase of work.** `objc2 0.4.1` — pulled in by the winit/eframe stack, not chosen by us —
+  does not type-check against the current Rust toolchain (`E0277` in its own
+  `ivar_forwarding_impls`), so `cargo test --workspace` fails on `macos-latest` CI while
+  passing on Linux. Ubuntu and Windows legs are the ones anyone has watched. Mitigate: update
+  the GUI stack (eframe/winit → a release resolving a newer objc2), or pin the CI toolchain to
+  a version `objc2 0.4.1` still compiles under; a universal-2 Phase 6 build is not reachable
+  until one of the two is done. Windows had its own red — an atomic-writer temp name built
+  from a test thread name, which contains `:` and so is illegal there — fixed on 2026-11-19.
 - Unsigned distribution artifacts will trigger OS trust warnings (macOS Gatekeeper, Windows SmartScreen) that users must dismiss manually (accepted trade-off: no signing certificates are purchased or managed)
 
 ---

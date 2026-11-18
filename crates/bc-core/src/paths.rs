@@ -150,11 +150,46 @@ fn temp_name(path: &Path) -> String {
     // A coarse clock can repeat within a process, which is why the counter is
     // here rather than being assumed unnecessary.
     let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!(
-        ".{name}.bridgecraft-tmp-{}-{}-{nanos}-{sequence}",
-        std::process::id(),
-        std::thread::current().name().unwrap_or("worker"),
-    )
+    let pid = std::process::id();
+    let thread = thread_tag();
+    format!(".{name}.bridgecraft-tmp-{pid}-{thread}-{nanos}-{sequence}")
+}
+
+/// The calling thread's name, made safe to put in a file name.
+///
+/// This was not always sanitised, and on Windows that turned every atomic store
+/// into a `CreateFile` failure with os error 123 (`InvalidFilename`): a Rust
+/// thread name may hold anything, and the names that matter here are exactly the
+/// ones that do. A test thread is named for the test —
+/// `favorites::tests::add_is_ordered_deduplicated_and_persisted`, with its
+/// `::` — and `:` is a drive separator on Windows, so the *temp* file could not be
+/// created and the store reported itself unavailable. It failed on Windows CI only,
+/// in tests, which is how it survived from the day it was written.
+fn thread_tag() -> String {
+    let raw = std::thread::current()
+        .name()
+        .unwrap_or("worker")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    // Truncated from the front rather than the end: what identifies the thread is
+    // usually its start, and the pid, nanoseconds and counter after it are what
+    // make the name unique, so a short tag loses nothing but readability.
+    const LIMIT: usize = 32;
+    if raw.len() <= LIMIT {
+        return raw;
+    }
+    let mut cut = LIMIT;
+    while cut > 0 && !raw.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    raw[..cut].to_string()
 }
 
 /// The batch-rename undo journal.
@@ -334,6 +369,58 @@ pub(crate) mod tests {
         assert!(
             stale.exists(),
             "the helper deleted a file it did not create"
+        );
+    }
+
+    /// The temp name has to be a legal file name on *every* platform this
+    /// application ships on, and it is built partly from a thread name, which
+    /// Rust does not constrain. Asserting the disallowed set directly is the only
+    /// way to check that from a Linux or macOS dev machine: on Windows this was a
+    /// store-wide `InvalidFilename` failure that no local test could ever see.
+    #[test]
+    fn a_temp_name_uses_only_characters_legal_in_a_windows_file_name() {
+        // `favorites::tests::add_is_ordered_deduplicated_and_persisted` — the real
+        // name of a real test thread, with the colons Windows reserves.
+        std::thread::Builder::new()
+            .name("favorites::tests::add_is_ordered::persisted".to_string())
+            .spawn(|| {
+                let dir = tempfile::tempdir().unwrap();
+                let file = dir.path().join("favorites.json");
+                let temporary = temp_name(&file);
+                for illegal in ['<', '>', ':', '"', '/', '\\', '|', '?', '*'] {
+                    assert!(
+                        !temporary.contains(illegal),
+                        "the temp name {temporary:?} holds {illegal:?}, which no Windows \
+                         file name may contain"
+                    );
+                }
+                // And it is still a name that can actually be created and written,
+                // not merely free of banned characters.
+                let written = std::fs::write(dir.path().join(&temporary), b"x");
+                assert!(
+                    written.is_ok(),
+                    "{temporary:?} could not be created: {written:?}"
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+
+        // And for whatever thread this test itself runs on — libtest names it for
+        // the test, colons and all — the same properties hold. The "worker"
+        // fallback for an unnamed thread needs no assertion: it is a literal in
+        // this file, and it contains nothing illegal.
+        let dir = tempfile::tempdir().unwrap();
+        let here = temp_name(&dir.path().join("state.json"));
+        for illegal in ['<', '>', ':', '"', '/', '\\', '|', '?', '*'] {
+            assert!(
+                !here.contains(illegal),
+                "this thread's own temp name {here:?} holds {illegal:?}"
+            );
+        }
+        assert!(
+            here.len() < 120,
+            "a temp name this long risks a MAX_PATH failure: {here}"
         );
     }
 
