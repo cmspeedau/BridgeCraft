@@ -2,9 +2,14 @@
 //!
 //! A template is a named, persistable bundle of metadata properties that can be
 //! applied to an asset with a chosen merge policy (replace / merge / append).
-//! Pure logic lives here; file I/O helpers are included for JSON persistence.
-
-use std::path::{Path, PathBuf};
+//!
+//! Pure logic and the serialisable shape live here. **Persistence does not**: the
+//! document, its path, its version and the atomic write belong to
+//! `bc_core::MetadataTemplates`, beside the saved searches, because that is where
+//! every other user-authored store in this project lives and where the one shared
+//! atomic writer is. Four file helpers used to sit in this file with no caller and
+//! a plain `fs::write`; deleting them is what stops a future caller from picking
+//! the unsafe one by accident.
 
 use serde::{Deserialize, Serialize};
 
@@ -116,46 +121,6 @@ pub fn apply_template(target: &Metadata, template: &MetadataTemplate) -> Metadat
 // Need Value in scope.
 use crate::Value;
 
-/// Save a template to a JSON file.
-pub fn save_template(path: &Path, template: &MetadataTemplate) -> Result<(), crate::MetadataError> {
-    let json = serde_json::to_string_pretty(template)
-        .map_err(|e| crate::MetadataError::Malformed(e.to_string()))?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(crate::MetadataError::Io)?;
-    }
-    std::fs::write(path, json.as_bytes()).map_err(crate::MetadataError::Io)?;
-    Ok(())
-}
-
-/// Load a template from a JSON file.
-pub fn load_template(path: &Path) -> Result<MetadataTemplate, crate::MetadataError> {
-    let bytes = std::fs::read(path).map_err(crate::MetadataError::Io)?;
-    let template: MetadataTemplate = serde_json::from_slice(&bytes)
-        .map_err(|e| crate::MetadataError::Malformed(e.to_string()))?;
-    Ok(template)
-}
-
-/// Load all templates from a directory (files ending in .json).
-pub fn load_templates(dir: &Path) -> Vec<MetadataTemplate> {
-    let mut out = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("json") {
-                if let Ok(t) = load_template(&path) {
-                    out.push(t);
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Default templates directory under a config root.
-pub fn templates_dir(config_root: &Path) -> PathBuf {
-    config_root.join("metadata_templates")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,28 +167,42 @@ mod tests {
         assert_eq!(ks.iter().filter(|k| *k == "A").count(), 1);
     }
 
+    /// The shape on disk, asserted here rather than in the store's tests: the
+    /// store writes exactly this serialisation, so a change to any of these names
+    /// is a change to files already on someone's disk and has to be a versioned
+    /// one. `mode` and `description` are optional on read, which is what lets a
+    /// document written before they existed still load.
     #[test]
-    fn save_load_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("t.json");
+    fn the_serialised_shape_is_the_contract_with_the_saved_document() {
         let mut m = Metadata::new();
         m.set_text(NS_XMP, "Rating", "4".to_string());
-        let tpl = MetadataTemplate::new("MyTpl", m).with_description("desc");
-        save_template(&path, &tpl).unwrap();
-        let back = load_template(&path).unwrap();
-        assert_eq!(back, tpl);
-    }
+        let tpl = MetadataTemplate::new("MyTpl", m)
+            .with_description("desc")
+            .with_mode(TemplateMode::Append);
 
-    #[test]
-    fn load_templates_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let tdir = dir.path().join("templates");
-        std::fs::create_dir_all(&tdir).unwrap();
-        let mut m = Metadata::new();
-        m.set_text(NS_XMP, "Rating", "1".to_string());
-        save_template(&tdir.join("a.json"), &MetadataTemplate::new("a", m)).unwrap();
-        let loaded = load_templates(&tdir);
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].name, "a");
+        let json = serde_json::to_string(&tpl).unwrap();
+        for key in ["\"name\"", "\"description\"", "\"metadata\"", "\"mode\""] {
+            assert!(json.contains(key), "{key} missing from {json}");
+        }
+        let back: MetadataTemplate = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, tpl);
+
+        // A document with only the required members still reads, and gets the
+        // default mode rather than failing: templates are meant to be hand-editable,
+        // and rejecting `{"name":"plain","metadata":{}}` would report the user's own
+        // file as corrupt.
+        for minimal in [
+            r#"{"name":"plain","metadata":{"properties":[]}}"#,
+            r#"{"name":"plain","metadata":{}}"#,
+        ] {
+            let back: MetadataTemplate = serde_json::from_str(minimal).unwrap_or_else(|error| {
+                panic!("{minimal} should read as a template, and did not: {error}")
+            });
+            assert_eq!(back.name, "plain");
+            assert_eq!(back.description, None);
+            assert_eq!(back.mode, TemplateMode::Replace);
+            assert!(back.metadata.properties.is_empty());
+            assert!(back.metadata.native.is_empty());
+        }
     }
 }

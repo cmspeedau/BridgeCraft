@@ -215,8 +215,14 @@ pub struct NativeBlock {
 /// blocks carry payloads that cannot be projected (§2 of the RFC).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Metadata {
-    #[serde(with = "props_serde")]
+    // Both members default when absent, because the only place this shape is read
+    // back from is a *user-authored* template document (`bc_core::MetadataTemplates`).
+    // A hand-written `{"name":"plain","metadata":{}}` is a template that means
+    // "no properties", not a parse failure, and a store that rejects it would
+    // report the user's own file as corrupt.
+    #[serde(default, with = "props_serde")]
     pub properties: BTreeMap<QualifiedName, Value>,
+    #[serde(default)]
     pub native: Vec<NativeBlock>,
 }
 

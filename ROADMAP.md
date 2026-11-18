@@ -607,6 +607,18 @@ file's properties a human meant to overwrite.
   belongs to the panel, not the file, so the test's second "open" click had closed it again)
   and the width drift. Writing the hypothesis down was still worth it; believing it would
   not have been.
+- **Four dead file helpers went with it.** `bc_metadata::templates` carried
+  `save_template`, `load_template`, `load_templates` and `templates_dir` — a
+  plain-`fs::write` persistence path that no code called, and that bc-metadata
+  cannot fix: the atomic writer lives in bc-core, which depends on this crate rather
+  than the other way round. Deleting them is not tidiness — leaving a non-atomic
+  template writer one `use` away from a future caller is exactly how two answers to
+  one question come back. Their round-trip test became a test of the *shape*, since
+  the shape is what `bc_core::MetadataTemplates` writes, and writing it made the
+  missing tolerance visible: `Metadata`'s two members had no `serde(default)`, so a
+  hand-written `{"name":"plain","metadata":{}}` — the likeliest thing a person would
+  type into a template file — failed to parse with "missing field `native`". Both
+  members now default on read; the writer still emits both.
 - **A flake of my own making, caught by running it twice.** The store test that asserts
   `open_default` finds its document set `HOME` and `XDG_DATA_HOME` itself, under no lock. It
   passed every time under a test filter and failed in a full run, where it was racing
