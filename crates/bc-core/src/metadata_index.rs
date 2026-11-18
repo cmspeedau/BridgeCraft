@@ -47,6 +47,15 @@ const EXTRACTOR_VERSION: i64 = 2;
 // Indexed row
 // ---------------------------------------------------------------------------
 
+/// One keyword the library has already used, and how many indexed files carry
+/// it. `files` counts rows, so a keyword on both a photo and its sidecar counts
+/// twice — the honest reading of a store keyed by path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeywordSuggestion {
+    pub keyword: String,
+    pub files: usize,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct IndexedFile {
     pub path: PathBuf,
@@ -1011,6 +1020,73 @@ impl MetadataIndex {
             });
         }
         Ok(rows.into_iter().filter(|row| query.matches(row)).collect())
+    }
+
+    /// Keywords used anywhere in the library that begin with `prefix`, most
+    /// widely used first.
+    ///
+    /// This is the question a keyword box should answer: not "what does this
+    /// file already carry" but "what does this library call things", which is
+    /// how "Beach" and "beach " and "Beaches" end up as three keywords that no
+    /// search can join. The count is part of the answer for the same reason —
+    /// a word used by 5 000 files is the vocabulary, and a word used by one is
+    /// possibly a typo worth looking at before it is copied.
+    ///
+    /// Two deliberate properties:
+    ///
+    /// - The prefix is compared case-insensitively (`NOCASE`, so ASCII only, the
+    ///   same limit every other text comparison in this crate has) but the
+    ///   keyword is *returned exactly as stored*, and variants of spelling are
+    ///   returned separately with their own counts. Folding them together would
+    ///   hide the near-duplicate problem this feature exists to prevent.
+    /// - An empty prefix returns nothing rather than the whole vocabulary. The
+    ///   library's most-used keywords are an interesting list and a full-table
+    ///   aggregate to produce; a box with nothing typed in it has not asked a
+    ///   question yet.
+    ///
+    /// The query needs an index on the keyword column, and `init` does not
+    /// create it: on a 600 000-row keyword table building it takes about 0.7 s,
+    /// which is a visible freeze if it happens on a thread that paints. So the
+    /// statement below creates it on first use (a no-op costing ~12 µs once it
+    /// exists) and the interface calls this from a worker.
+    pub fn keyword_suggestions(
+        &self,
+        prefix: &str,
+        limit: usize,
+    ) -> crate::Result<Vec<KeywordSuggestion>> {
+        // The same normalisation the writer applies, or typing two spaces would
+        // ask for a keyword no file can ever carry: `add_keyword` collapses runs
+        // of whitespace and drops empty segments, so the query has to speak that
+        // form too.
+        let needle = bc_metadata::keywords::normalize_prefix(prefix);
+        if needle.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let upper = next_prefix(&needle);
+        let conn = self.lock();
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS keywords_keyword_nocase ON keywords (keyword COLLATE NOCASE);",
+        )
+        .map_err(|e| crate::CoreError::InvalidOperation(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT keyword, COUNT(*) FROM keywords
+                 WHERE keyword >= ?1 COLLATE NOCASE AND keyword < ?2 COLLATE NOCASE
+                 GROUP BY keyword
+                 ORDER BY COUNT(*) DESC, keyword
+                 LIMIT ?3",
+            )
+            .map_err(|e| crate::CoreError::InvalidOperation(e.to_string()))?;
+        let rows = stmt
+            .query_map(rusqlite::params![needle, upper, limit as i64], |row| {
+                Ok(KeywordSuggestion {
+                    keyword: row.get(0)?,
+                    files: row.get::<_, i64>(1)? as usize,
+                })
+            })
+            .map_err(|e| crate::CoreError::InvalidOperation(e.to_string()))?;
+        rows.collect::<Result<_, _>>()
+            .map_err(|e| crate::CoreError::InvalidOperation(e.to_string()))
     }
 
     pub fn all(&self) -> crate::Result<Vec<IndexedFile>> {
@@ -2576,6 +2652,245 @@ mod tests {
         }
         assert_eq!(one.all().unwrap().len(), 40);
         assert_eq!(two.all().unwrap().len(), 40);
+    }
+
+    /// Files with keywords, through the same `index_file` the indexer uses.
+    fn keyword_fixture(
+        dir: &Path,
+        index: &MetadataIndex,
+        name: &str,
+        keywords: &[&str],
+    ) -> PathBuf {
+        let file = dir.join(name);
+        std::fs::write(&file, b"jpeg bytes").unwrap();
+        let mut meta = bc_metadata::Metadata::new();
+        for keyword in keywords {
+            bc_metadata::keywords::add_keyword(&mut meta, keyword);
+        }
+        index.index_file(&file, &meta).unwrap();
+        file
+    }
+
+    #[test]
+    fn keyword_suggestions_come_back_most_used_first_and_as_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = MetadataIndex::open_in_memory().unwrap();
+        keyword_fixture(dir.path(), &index, "a.jpg", &["Beach"]);
+        keyword_fixture(dir.path(), &index, "b.jpg", &["Beach"]);
+        keyword_fixture(dir.path(), &index, "c.jpg", &["Beach"]);
+        keyword_fixture(dir.path(), &index, "d.jpg", &["Beach", "Beach|2024"]);
+        keyword_fixture(dir.path(), &index, "e.jpg", &["beach"]);
+        keyword_fixture(dir.path(), &index, "f.jpg", &["Mountain"]);
+
+        let found = index.keyword_suggestions("bea", 10).unwrap();
+        let pairs: Vec<(String, usize)> =
+            found.iter().map(|s| (s.keyword.clone(), s.files)).collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("Beach".to_string(), 4),
+                ("Beach|2024".to_string(), 1),
+                ("beach".to_string(), 1),
+            ],
+            "suggestions are not ordered by use, or spelled otherwise than stored"
+        );
+    }
+
+    #[test]
+    fn keyword_suggestions_fold_case_when_looking_and_not_when_answering() {
+        // Typing lower-case finds a capitalised vocabulary, which is the whole
+        // point; returning it folded would hide the fact that the library holds
+        // both spellings, and clicking a suggestion would then store a keyword
+        // the library already has under another name.
+        let dir = tempfile::tempdir().unwrap();
+        let index = MetadataIndex::open_in_memory().unwrap();
+        keyword_fixture(dir.path(), &index, "a.jpg", &["Beach"]);
+        keyword_fixture(dir.path(), &index, "b.jpg", &["BEACH"]);
+
+        for prefix in ["beach", "BEACH", "BeAcH"] {
+            let found = index.keyword_suggestions(prefix, 10).unwrap();
+            let spelled: Vec<&str> = found.iter().map(|s| s.keyword.as_str()).collect();
+            assert_eq!(
+                spelled,
+                vec!["BEACH", "Beach"],
+                "{prefix} answered {spelled:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_parent_prefix_offers_the_tree_and_a_separator_offers_only_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = MetadataIndex::open_in_memory().unwrap();
+        keyword_fixture(
+            dir.path(),
+            &index,
+            "a.jpg",
+            &["Beach", "Beach|2024", "Beaches"],
+        );
+        keyword_fixture(dir.path(), &index, "b.jpg", &["Beach|Family"]);
+
+        let tree: Vec<String> = index
+            .keyword_suggestions("Beach", 10)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.keyword)
+            .collect();
+        assert!(
+            tree.contains(&"Beach".to_string()),
+            "the word itself vanished"
+        );
+        assert!(
+            tree.contains(&"Beach|2024".to_string()),
+            "children were not offered: {tree:?}"
+        );
+        assert!(
+            tree.contains(&"Beaches".to_string()),
+            "a near-duplicate was hidden: {tree:?}"
+        );
+
+        // Typing the separator is the question "what hangs under this?", and the
+        // parent itself is not one of the answers.
+        let children: Vec<String> = index
+            .keyword_suggestions("Beach|", 10)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.keyword)
+            .collect();
+        assert_eq!(
+            children,
+            vec!["Beach|2024".to_string(), "Beach|Family".to_string()],
+            "a child-prefix answered {children:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_prefix_asks_no_question_and_a_miss_returns_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = MetadataIndex::open_in_memory().unwrap();
+        keyword_fixture(dir.path(), &index, "a.jpg", &["Beach"]);
+
+        // No whole-library aggregate for a box nobody has typed in yet.
+        for blank in ["", "   ", "|"] {
+            assert!(
+                index.keyword_suggestions(blank, 50).unwrap().is_empty(),
+                "{blank:?} returned the vocabulary"
+            );
+        }
+        assert!(index.keyword_suggestions("beach", 0).unwrap().is_empty());
+        assert!(index.keyword_suggestions("zzz", 50).unwrap().is_empty());
+    }
+
+    #[test]
+    fn keyword_suggestions_normalise_the_prefix_the_way_the_writer_does() {
+        // `add_keyword` collapses whitespace runs and drops empty segments, so a
+        // query that did not would ask for a spelling no row can hold.
+        let dir = tempfile::tempdir().unwrap();
+        let index = MetadataIndex::open_in_memory().unwrap();
+        keyword_fixture(dir.path(), &index, "a.jpg", &["Beach|2024"]);
+
+        let found: Vec<String> = index
+            .keyword_suggestions("  Beach | 2024 ", 10)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.keyword)
+            .collect();
+        assert_eq!(found, vec!["Beach|2024".to_string()]);
+    }
+
+    #[test]
+    fn keyword_suggestions_stop_at_the_limit_and_never_at_a_partial_word() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = MetadataIndex::open_in_memory().unwrap();
+        for i in 0..6 {
+            keyword_fixture(dir.path(), &index, &format!("{i}.jpg"), &["Beach"]);
+            let mut meta = bc_metadata::Metadata::new();
+            bc_metadata::keywords::add_keyword(&mut meta, &format!("Topic{i}"));
+            let other = dir.path().join(format!("t{i}.jpg"));
+            std::fs::write(&other, b"jpeg bytes").unwrap();
+            index.index_file(&other, &meta).unwrap();
+        }
+
+        let capped = index.keyword_suggestions("topic", 3).unwrap();
+        assert_eq!(capped.len(), 3, "the limit was ignored");
+        // Alphabetical within equal popularity, so the same three come back
+        // every time rather than a reshuffling list under a typing user.
+        let names: Vec<&str> = capped.iter().map(|s| s.keyword.as_str()).collect();
+        assert_eq!(names, vec!["Topic0", "Topic1", "Topic2"], "{names:?}");
+        let again = index.keyword_suggestions("topic", 3).unwrap();
+        assert_eq!(again, capped, "two identical queries answered differently");
+    }
+
+    #[test]
+    fn a_keyword_dropped_from_a_file_stops_being_suggested() {
+        // Suggestions are a view of the rows, not a vocabulary that outlives the
+        // files: the count has to fall when the last file stops carrying it.
+        let dir = tempfile::tempdir().unwrap();
+        let index = MetadataIndex::open_in_memory().unwrap();
+        let one = keyword_fixture(dir.path(), &index, "a.jpg", &["Holiday"]);
+        keyword_fixture(dir.path(), &index, "b.jpg", &["Holiday"]);
+        assert_eq!(index.keyword_suggestions("holi", 10).unwrap()[0].files, 2);
+
+        let mut meta = bc_metadata::Metadata::new();
+        bc_metadata::keywords::add_keyword(&mut meta, "Holiday");
+        bc_metadata::keywords::remove_keyword(&mut meta, "Holiday");
+        index.index_file(&one, &meta).unwrap();
+        let after = index.keyword_suggestions("holi", 10).unwrap();
+        assert_eq!(after.len(), 1, "the keyword vanished rather than shrank");
+        assert_eq!(after[0].files, 1, "the count ignored the re-index");
+
+        index.delete(&one).unwrap();
+        assert_eq!(index.keyword_suggestions("holi", 10).unwrap()[0].files, 1);
+        index.delete(&dir.path().join("b.jpg")).unwrap();
+        assert!(
+            index.keyword_suggestions("holi", 10).unwrap().is_empty(),
+            "a keyword every file lost is still suggested"
+        );
+    }
+
+    #[test]
+    fn the_keyword_index_is_built_by_the_first_query_and_not_by_opening() {
+        // The lazy build is a deliberate choice about who pays: `init` does not
+        // create the index, because building it over 600 000 keyword rows
+        // measured 0.7 s, and an open that happens on a paint thread would stop
+        // the interface for it. The first suggestion query pays instead, and is
+        // expected to run on a worker.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.sqlite");
+        let index = MetadataIndex::open(&path).unwrap();
+        keyword_fixture(dir.path(), &index, "a.jpg", &["Beach"]);
+        assert!(
+            !index_has_keyword_index(&index),
+            "opening the index built the keyword index anyway"
+        );
+
+        let found = index.keyword_suggestions("bea", 10).unwrap();
+        assert_eq!(found.len(), 1, "the first query answered wrong: {found:?}");
+        assert!(
+            index_has_keyword_index(&index),
+            "the query did not build the index it needs"
+        );
+        // And a second query, through the index that now exists, says the same.
+        assert_eq!(index.keyword_suggestions("bea", 10).unwrap(), found);
+
+        // Dropping and reopening the file keeps the index: it is part of the
+        // database now, so the 0.7 s is paid once per library, not once per run.
+        drop(index);
+        let reopened = MetadataIndex::open(&path).unwrap();
+        assert!(
+            index_has_keyword_index(&reopened),
+            "the keyword index did not survive the file"
+        );
+        assert_eq!(reopened.keyword_suggestions("bea", 10).unwrap(), found);
+    }
+
+    fn index_has_keyword_index(index: &MetadataIndex) -> bool {
+        index
+            .lock()
+            .prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'keywords_keyword_nocase'")
+            .unwrap()
+            .exists([])
+            .unwrap()
     }
 
     #[test]

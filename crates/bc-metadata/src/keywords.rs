@@ -40,6 +40,39 @@ pub fn normalize_keyword(s: &str) -> String {
         .join("|")
 }
 
+/// Normalise a keyword *prefix* — what a search for vocabulary asks with, as
+/// opposed to what a file stores.
+///
+/// Different from [`normalize_keyword`] in exactly one way, and that way is the
+/// whole question: a trailing `|` is the user asking "what hangs under this",
+/// and dropping it turns the question into the parent itself, which would offer
+/// the parent and its siblings as answers to a question about children. So the
+/// segments are normalised identically and one separator is kept at the end.
+///
+/// ```text
+/// normalize_prefix("Beach|")      -> "Beach|"
+/// normalize_prefix("  Beach | 2024 ") -> "Beach|2024"
+/// normalize_prefix("|")           -> ""     (no word was asked about)
+/// normalize_prefix("Beach||")     -> "Beach|"
+/// ```
+pub fn normalize_prefix(s: &str) -> String {
+    let segments: Vec<String> = s
+        .split('|')
+        .map(normalize_segment)
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    let joined = segments.join("|");
+    // A separator with nothing before it is not a prefix of anything.
+    if joined.is_empty() {
+        return String::new();
+    }
+    if s.trim_end().ends_with('|') {
+        format!("{joined}|")
+    } else {
+        joined
+    }
+}
+
 /// Read the keyword list from `dc:subject`.
 pub fn subjects(meta: &Metadata) -> Vec<String> {
     match meta.get(NS_DC, "subject") {
@@ -216,6 +249,46 @@ pub fn children_of<'a>(tree: &'a [KeywordNode], parent_path: &str) -> Vec<&'a Ke
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_prefix_keeps_the_separator_that_asks_about_children() {
+        // The bug this pins: reusing the stored-keyword normaliser for a prefix
+        // silently widened "what hangs under Beach" back into "Beach", so the
+        // parent and its siblings answered a question about its children.
+        assert_eq!(normalize_prefix("Beach|"), "Beach|");
+        assert_eq!(normalize_prefix("Beach||"), "Beach|");
+        assert_eq!(normalize_prefix("  Beach  |  2024 |"), "Beach|2024|");
+        assert_eq!(normalize_prefix("Beach|2024"), "Beach|2024");
+        assert_eq!(normalize_prefix("Beach"), "Beach");
+        // Whitespace inside a segment collapses, exactly as the writer does it,
+        // or the query would ask for a word no file can hold.
+        assert_eq!(normalize_prefix("  Beach   Coast "), "Beach Coast");
+
+        // A prefix that says nothing is not a question: no separator survives a
+        // word that isn't there.
+        for blank in ["", "   ", "|", "||", " | ", "\t"] {
+            assert_eq!(
+                normalize_prefix(blank),
+                "",
+                "{blank:?} became a prefix rather than nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_and_stored_forms_agree_except_at_the_end() {
+        // The two normalisers must not drift into different ideas of a word:
+        // every segment rule is shared, and only the trailing separator differs.
+        for input in ["Beach", "Beach|2024", "  Beach | 2024 ", "Beach||2024"] {
+            assert_eq!(normalize_prefix(input), normalize_keyword(input));
+        }
+        for input in ["Beach|", "Beach| ", "Beach||"] {
+            let kept = normalize_prefix(input);
+            assert!(kept.ends_with('|'), "{input:?} -> {kept:?}");
+            assert_eq!(kept.trim_end_matches('|'), normalize_keyword(input));
+        }
+    }
+
     use super::*;
 
     #[test]

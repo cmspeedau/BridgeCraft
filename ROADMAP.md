@@ -60,12 +60,13 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [x] XMP sidecar read/write (`.xmp` files) — `bc-metadata::xmp` (parse/serialize + atomic file I/O)
 - [x] Metadata panel with editable fields: grouped list, dirty tracking, Save/Revert via the #5 write policy (`bc-ui::metadata_edit`), multi-selection bulk editor with per-file failure reporting. Sidecar properties now merge in full, so `dc:` and `xmp:` values written by this app or another tool reach the panel instead of being filtered out
 - [~] Custom metadata templates: `bc-metadata::templates` has the model (Replace/Merge/Append), JSON persistence (`<data>/BridgeCraft/metadata_templates`) and tests, but nothing calls it: no save/apply UI and no path that writes a template onto a file
-- [x] Keyword hierarchy management & tagging: `bc-metadata::keywords` (dc:subject `Parent|Child` convention, tree/type-ahead/tag-count logic) plus a panel editor in `bc-ui::tag_widgets`: chips that remove on click, an add field, and completions drawn from the hierarchy the file already carries. Bulk add and remove across a selection. Cross-library suggestions wait on the index UI
+- [x] Keyword hierarchy management & tagging: `bc-metadata::keywords` (dc:subject `Parent|Child` convention, tree/type-ahead/tag-count logic) plus a panel editor in `bc-ui::tag_widgets`: chips that remove on click, an add field, and completions drawn from the hierarchy the file already carries. Bulk add and remove across a selection. Completions now come from the whole library rather than from the file alone — see the saved-searches line below
 - [x] Star ratings, color labels, approve/reject flags: `bc-metadata::ratings` (XMP `xmp:Rating`, `photoshop:Label`, BridgeCraft `Flag`) plus the panel editor: five drawn stars, the label chips, Approve/Reject/No flag. Clicking the current rating clears it — which means the property leaves the JPEG or TIFF too, not just the panel: an embedded save now states whether it is the whole tag state (`TagWrite::Replace`) or a partial update (`Merge`), because a metadata that omits `xmp:Rating` cannot otherwise tell "cleared" from "not touched", and until that distinction existed a cleared star kept its old value in the file forever. Each property is stampable on its own in the bulk editor, so "set the rating, leave the labels alone" is explicit. Tags write to the XMP sidecar, never into the image bytes, because there is no EXIF equivalent and embedded XMP is still open
 - [x] Rating and label display: label dot on the grid thumbnail, dot on list rows, and Rating plus Label columns in the details view, with the header sharing the row column math
 - [x] Background metadata indexing: opening a folder queues a pass over its files on the shared job pool (`bc-core::jobs::JobQueue::submit_index` running `bc-core::indexer::index_one`), and a settled watcher event re-runs it. A row that still matches its file is skipped after two `stat`s and one indexed lookup rather than re-read; a pass also records the folder (`add_root`) and prunes rows under it whose file is gone (`prune_absent_from_listing`), clearing their keyword projection rows with them. Progress, per-file states and cancellation are the Jobs window's, the same ones exports use (`bc-ui::app::start_indexing`, an `Indexing 4/7` readout in the status bar, `Index offline` when the database cannot be opened). Verified against the release binary, not only in unit tests: a run over a 6-file folder wrote 6 rows and the folder into `$XDG_DATA_HOME/BridgeCraft/metadata.sqlite`; a second run with one file added left all six existing rows' `indexed_at` untouched and added the seventh; a third run after deleting two files took the table from 7 rows to 5
 - [x] Index-backed sorting and filtering: the grid, list and details views can order by rating, colour label or flag (`SortKey::Rating`/`Label`/`Flag` in `bc-core::fs`, fed by `MetadataIndex::tag_values_for` — one indexed range query per folder, not one lookup per file), and the toolbar's Tags menu filters by a rating floor, a label or a flag. A tag sort inherits the direction the user already chose and the button names the end that comes first (`1★`/`5★`, `A-Z`/`Z-A`, `smallest`/`largest`), because `Asc` means nothing useful for a rating. Ties break by name so the order is the same twice in a row. Saving tags writes the row back through `index_saved_tags`, so a starred photo moves immediately instead of sitting in the unrated half of the folder until the next pass. Files the index has not read sort as unrated and are *hidden* by a tag filter, which the status bar and the menu both count — the alternative is a grid that quietly omits photos
-- [~] Cross-library keyword suggestions and the tag overlay on cells still read files directly: the suggestions menu offers only the keywords the current file carries, and the rating badge on a visible cell keeps its own mtime-checked cache. Neither is wrong; both are the remaining per-file work in this area
+- [x] Cross-library keyword suggestions: both keyword boxes — the single file's and the bulk stamp's — ask the index what the library already calls things beginning with what is typed, and answer with up to eight candidates ordered by how many indexed files carry each (`Beach (73246)`). Clicking stores the library's spelling rather than the letters typed, which is the one moment a near-duplicate keyword can still be prevented: after the save there are two `dc:subject` entries and no interface merges them. Typing a trailing `|` asks what hangs under a parent and gets only children, because `keywords::normalize_prefix` keeps the separator that `normalize_keyword` (rightly) drops for a stored value. A word nothing uses is said to be new, an empty branch is said to be empty, and an offline index is reported as unavailable rather than silently as a vocabulary with nothing in it. The single-file box also withholds a keyword the file already carries, because clicking it could only be refused; the bulk box cannot make that claim about a selection, so it offers the vocabulary and the stamp path skips files that already hold the word (`keywords::add_keyword` de-duplicates per file). `MetadataIndex::keyword_suggestions` answers on the shared search worker behind a 150 ms debounce, and only ever shows a list whose sequence matches the outstanding request
+- [~] The tag overlay on grid cells still reads files directly: the rating badge on a visible cell keeps its own mtime-checked cache, deliberately — one indexed lookup measured 98 µs per row against 14.9 µs to parse the file, and the cache answers in 2.3 µs. This is the remaining per-file work in this area, and it stays because the measurement says so rather than because nobody got to it
 - [x] Library search over the index: a toolbar box (`bc-ui::app::request_search`, `poll_search`, `handle_os_drops`) takes one or more words, matches them against the row's searchable text (`Field::AnyText`, `Query::text` — name, path, keywords, title, description, camera make and model, label, flag), and is scoped to this folder, this folder and subfolders, or the whole library (`bc_core::SearchScope`, applied as a primary-key range so a folder search stays proportional to the folder). Results replace the grid through `BrowserState`'s listing mode, so sorting, the tag filter, thumbnails and selection work on a result exactly as on a folder listing; the status line counts the files the index has never read in scope, because those cannot match however the words are phrased. Runs on its own thread with the existing mpsc pattern: one query is a table scan at ~1.4 ms per 2 000 rows, which is not something to spend per keystroke on the paint thread. Esc leaves the search, navigating away empties the box, and dropping files from the desktop while searching is refused rather than quietly copying into a folder that is not on screen
 - [x] Saved searches (collections): a Collections tab in the sidebar lists every stored search in name order, one click runs it into the grid, ✎ opens it in the rule editor and ✕ deletes it. Storage is `bc_core::SavedSearches` over `saved-searches.json` in the data directory — deliberately not the metadata index, which is a cache; a store that will not parse is reported and never overwritten. A running collection keeps the scope it was saved with (`SearchScope` inside the stored document, so a folder search does not silently widen into a library search on reopen), and the box mirrors the collection's words only when the rules really are words. The tab reads the list when it is entered and after a save or delete, not on every redraw. `an_unreadable_saved_search_file_is_reported_and_never_overwritten` covers the damaged store: the panel says the file cannot be read, the save control is disabled with that reason, and the bytes on disk are asserted unchanged afterwards
 - [x] A rule editor for collections: "Edit rules…" in the Collections tab opens a dialog that authors the whole stored shape — words, any number of conditions on the eleven indexed fields the editor offers (file name, path, extension, keyword, title, description, camera make and model, colour label, flag, star rating), AND or OR across them, and the scope — and ✎ on a saved collection opens that collection's own rules. It shows a live "N file(s) match" count, debounced like the search box and answered by the same worker thread, so no rule set is ever saved on faith. Each operator menu lists only the tests that field can actually answer: a text field is never offered `>` and a number is never offered "contains", because `eval_predicate` answers those with false rather than with an error — and the same guard, `Predicate::problem`, refuses a star count outside 0–5, a non-number in a number field (the engine reads it as zero), an empty value, a value typed into "is set", and "is set" on a field no file can lack. While any row is refused the dialog counts nothing and says so, because an impossible rule and an empty library look identical in a grid, and it will not save a rule set it has just explained cannot match. Two tests hold the menus against the evaluator rather than against each other: `every_operator_a_field_offers_can_actually_match_a_row` constructs a value per pair and asserts a populated row matches it, and `is_set_is_offered_exactly_where_a_value_can_actually_be_absent` derives `Field::can_be_unset` from `field_exists` on an empty row. The pair that is *not* offered is deliberate: `Size`, `Mtime`, `Width`, `Height` and the two date fields are indexed and queryable but absent from the menus, because a size in bytes and a 
@@ -158,6 +159,39 @@ M1's remaining items are the two surfacing defects (failed-versus-pending thumbn
 - **Persistence is atomic and single-sourced; one store still adopts before it writes.** `favorites.json`, `recents.json`, `saved-searches.json`, the version-stack file and the watched-folder state all write through `bc_core::paths::write_atomic` now (the helper moved out of `auto_process` rather than being copied), and `favorites`/`recents` additionally write the *candidate* list before adopting it, so a save that fails leaves the on-screen list and the file agreeing. Two residuals. `version_stacks` still mutates in memory before persisting at eight call sites — it is atomic, so a crash cannot corrupt the file, but a failed save leaves the session showing a stack that is not on disk; it is listed as deferred not because it is fine but because the feature has no UI at all, so nobody can experience it, and the same argument applied to it eight times is how this file keeps accruing debts.
 - **Two path bugs that only surfaced because the rename journal was drawn twice.** `bc-ui::batch_rename_ui::journal_path` had its own copy of the platform rules and an XDG-only one, so a macOS or Windows launch wrote the undo journal somewhere every other store ignores; and the watched-folder action derived the same journal from the *configuration* directory while the dialog derived it from the *data* directory, so a rename made by a rule could not be undone from the dialog and vice versa. Both now resolve through `paths::rename_journal_path`, and `both_rename_journal_writers_resolve_the_same_file` asserts the agreement through `AutoProcessor::open_default` rather than comparing the helper with itself. Five call sites that hand-appended `"BridgeCraft"` (`favorites`, `recents`, `trash`, `plugins`, `photocraft`, `version_stacks`) were moved onto the helpers, and `recents::user_data_dir` — the alias those sites leaned on — is deleted. One consequence of settling the journal on the data directory: an undo journal a previous build left in the configuration directory is no longer read, so a rename that was waiting to be undone across a restart loses that history. Nothing else about it is affected, the file is left where it is for anyone who wants it, and the journal is a transient record of one dialog action rather than user-authored content — which is why no migration was written for it.
 
+- **Suggestions reach the two keyword boxes, not the rule editor's.** The dialog's keyword
+  row takes free text with no completions, because there is one suggestion state and the
+  editor can hold several keyword rows at once: deciding *which row* a candidate list
+  belongs to needs the row's identity, not another query. The live match count already
+  tells an editor user when a spelling finds nothing, which is the same fact in a less
+  convenient form, so this is listed rather than fixed here.
+- **The first suggestion query pays for the keyword index, once per library.**
+  `MetadataIndex::keyword_suggestions` runs `CREATE INDEX IF NOT EXISTS` on a NOCASE
+  expression index before it asks anything, because putting that statement in `init`
+  would make every open of an existing library pay it — measured at **0.645 s on 735 000
+  keyword rows** built from a database the release binary wrote. A no-op re-run costs
+  0.04 ms, and the queries themselves cost 15-45 ms depending on how many rows carry the
+  prefix (a miss is 0.03 ms), which is why they sit behind a 150 ms debounce on the
+  worker thread rather than in the panel draw. What is not done: building the index
+  during a background indexing pass, which would move the 0.645 s off the first keystroke
+  and is the obvious next step if anyone finds the delay noticeable.
+- **A keyword prefix's meaning is decided by which normaliser runs, and the two differ
+  by one character.** `keywords::normalize_keyword("Beach|")` is `"Beach"` — correct for
+  a value being stored, wrong for a question being asked, because dropping the trailing
+  separator turns "what hangs under Beach" into "Beach" and answers it with the parent and
+  its siblings. That is exactly what happened before `normalize_prefix` existed, and the
+  test that found it (`a_parent_prefix_offers_the_tree_and_a_separator_offers_only_children`)
+  was a *core* test: nothing in the interface would have looked wrong, the list simply
+  contained answers to a different question. Any future prefix input must use the prefix
+  normaliser.
+- **Suggestion state is registered by drawing, which the tests must do explicitly.** The
+  completion row is what tells the frame which prefix it is asking about, so the query is
+  scheduled during a draw and answered by the next tick. That is right for the app (egui
+  repaints after every keystroke) but it means a test that sets a draft and ticks without
+  drawing sees nothing happen at all — three of this slice's tests failed for exactly that
+  reason before they drew the panel once after typing. A unit test cannot treat the state
+  machine as reachable by field writes alone.
+
 - **Two lists of colour-label names, and they do not agree.** `bc_metadata::ratings::ColorLabel` has five fixed names (Red, Yellow, Green, Blue, Purple) plus `Custom`, which absorbs anything else; the interface's `metadata_edit::LABEL_CHOICES` offers seven (it adds Orange and Grey) and calls them known (its `is_known_label` asks about drawable chips, not about the enum). Nothing checks the pair, and the mismatch is invisible in practice only because `Custom` is doing the work: choosing "Orange" writes a label the enum has no variant for, round-trips as `Custom("Orange")`, and `is_custom()` then reports true for what the UI presents as a standard label. A rule editor has to sit this out — the index stores whatever string a file carries, so a popup of any one list would offer an incomplete vocabulary and hide the rest of the library — which is why the label row takes free text and the live count is the check on a misspelling. The fix is one list, owned by `bc-metadata`, with the colours living in the UI beside it.
 - **Collections can now be authored as rules; two of their inputs are still boxes of raw values.** The editor offers eleven fields and refuses every operator a field cannot answer, which closes the item this file kept deferring. It opens a smaller one: `Size`, `Mtime`, `Width`, `Height`, `Created` and `Modified` stay unoffered because the only control available for them is a text box asking for bytes and for nanoseconds since the epoch, and `Created`/`Modified` are stored as ISO *text*, so "taken after March" would be a string comparison that happens to work only while the format stays ISO-8601 and zero-padded. Date and size controls are the remaining half; the query model is not.
 - **Duplicate query spellings removed, not normalised.** `bc-core::metadata_index` used to accept several field and operator spellings (`Field::Make`/`CameraMake`, `Operator::Eq`/`Equals`, and `Query`'s `predicates`/`conditions`/`clauses`/`and`/`or`/`expr`) and reconcile them at match time, with the rule that they had to be kept because they were serialised into stored smart-collection rows. The premise was checked before it was dropped: nothing in the repository has ever called `save_smart_collection`, so no such row exists on any disk, and `matches` was quietly giving different answers depending on which synonym a query happened to use. There is now one predicate container, one combinator, and one spelling per field and operator; the `a_stored_query_round_trips_through_the_shape_that_is_saved` test asserts the serialised form contains none of the old containers, so the shape cannot regrow unnoticed.
@@ -202,9 +236,12 @@ The same four properties are stampable per-property across a selection.
 - Verified by driving the real panel with synthetic keyboard events: Tab plus Enter
   sets a rating, and walking on to Save writes the sidecar. The label chip colors are
   pinned and tested against WCAG's 3:1 non-text floor on the dark panel (lowest 4.71:1).
-- Left open, deliberately: cross-library keyword suggestions and tag-count trees need
-  the search index, and sorting by rating or label needs the same index rather than a
-  per-row sidecar read.
+- Left open, deliberately: tag-count trees still need the search index (the keyword
+  table holds every row needed to build one, and `build_tree` already does the maths
+  for a folder's worth of keywords), and sorting by rating or label needs the same
+  index rather than a per-row sidecar read. Cross-library keyword suggestions — the
+  other half of that older note — shipped here: they are the same query, one prefix
+  at a time.
 
 ### Embedded metadata reading (slice 3, shipped 2026-11-15)
 
@@ -481,6 +518,70 @@ reported wrongly.
   collection, not tolerable now that a button does. Named in Tech debt with the
   fix (their own store beside favourites and recents) and with the version field
   that makes the move a copy rather than a rewrite.
+
+### Cross-library keyword suggestions, and the one question a keyword box should ask (slice 14, shipped 2026-11-19)
+
+The roadmap had deferred this feature for three slices with the same reason: the
+suggestions menu "waits on the index UI". That became untrue when the indexer started
+filling the keyword table in slice 7 — the pool to ask had existed for a week and nothing
+had been re-reading the note. So this slice asks it, in both keyword boxes, and the
+interesting part is not the query but what the query said back.
+
+- **The value of the feature is the moment it prevents, not the list it shows.** A
+  near-duplicate keyword is invisible after the save: two `dc:subject` entries, both
+  plausible, and every search that asks for one misses the other. The completion row is
+  the last point at which a person can choose the spelling the library already uses, so
+  clicking a candidate stores *that* string, and the count beside it is what makes the
+  choice: `Beach (73246)` is a vocabulary, `Beach (1)` is worth a look before it is
+  copied. A word nothing uses is said out loud as new, because silence would read as
+  "the library has no opinion", which is a different claim.
+- **What the row it replaced could actually do was nothing.** The old
+  `Complete:` line offered `keywords::suggest` over *the file's own* keywords, and the
+  click handler then called `add_keyword` on the file with the word it had just taken
+  from the file — which returns "already on this file" every time. It looked like
+  type-ahead and was a button that could only refuse itself. The new row filters those
+  out before drawing, so the difference is visible rather than apologetic. Deleting it
+  needed a reason beyond tidiness and this is one: the reason the roadmap had deferred
+  library suggestions ("a global keyword pool that nothing fills yet") was still in the
+  code comment, three slices after the indexer started filling that pool.
+- **A prefix is not a keyword, and the difference was one character.** The engine reused
+  `normalize_keyword` for the query, which drops empty segments — so `"Beach|"` became
+  `"Beach"` and a question about children was answered with the parent and its siblings.
+  It looked correct in the UI: a list of plausible keywords, all of them wrong for what
+  was typed. `keywords::normalize_prefix` now keeps exactly one thing that the stored form
+  must drop, and the two functions carry a test that walks every case where they agree so
+  they cannot drift.
+- **A bug the tests found, not the eye.** `a_parent_prefix_offers_the_tree_and_a_separator_offers_only_children`
+  failed on the full run after everything had already passed under a name filter — the
+  same shape as slice 11's stale release binary: a filtered run is a partial
+  verification wearing a green badge. The full-suite run is the only one that means
+  "nothing is broken".
+- **Two claims on one screen.** The probe that showed the query working also showed
+  `"In use:  Beach (2)"` drawn immediately above `"“bea” is not used by any indexed file —
+  this would be a new keyword."`. The row was answering and the status line was denying it.
+  No test had checked for that because each test checked its own half. The fix is one
+  branch — candidates present means no status line — and the assertions now check the
+  absence of *every* status line, not just the one that was wrong, so the two cannot be
+  friends again.
+- **First-use cost, measured on a database the release binary wrote:** 0.645 s to build a
+  NOCASE expression index over 735 000 keyword rows, then 0.04 ms to discover it exists,
+  then 15-45 ms per query depending on how many rows share the prefix (a miss: 0.03 ms).
+  `init` does not create it — that would charge every open of every existing library for a
+  feature most sessions never use — so the first keyword keystroke pays it, on the worker
+  thread. The honest framing in the code says what this buys and what it costs; the honest
+  framing in Tech debt says nobody has measured whether users mind.
+- **Harness learning worth keeping:** in this codebase's click helpers the pressing pass has
+  to *move* the pointer in that same pass, or egui treats the press as arriving wherever the
+  previous frame left it and the button never hears about it. `click_right_panel` now does
+  its own three passes for that reason while the single-file helper keeps using `click_at`,
+  and I verified the difference by printing the button's rect across passes rather than by
+  reasoning about egui's pointer state.
+- **Four ways this slice could have shipped wrong, and what each one actually was**: the
+  prefix normaliser (a real bug, caught by a core test), the contradictory status line (a
+  real bug, caught by a probe because no test spanned both halves), the tests that ticked
+  without drawing (a test bug, not an app bug — but it looked identical from the failure),
+  and the click helper (a harness bug). Three of the four were only visible once I asked the
+  running code what it did instead of reading what I meant.
 
 ### A rule editor that counts, and six bugs it counted out of the woodwork (slice 13, shipped 2026-11-18)
 

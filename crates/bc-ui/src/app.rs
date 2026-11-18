@@ -49,6 +49,16 @@ const WATCHER_DEBOUNCE: Duration = Duration::from_millis(300);
 /// watcher debounce on purpose: the watcher re-reads a directory, a search
 /// scans the whole index.
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(450);
+
+/// Type-ahead settles faster than a search has to. The suggestion query is a
+/// range over an index — measured at 2 to 25 ms on a 600 000-row keyword table —
+/// against a whole-library search at roughly 70 ms per 100 000 rows, so a shorter
+/// wait costs a scan nobody asked for twice in a row.
+const SUGGEST_DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// How many candidates the keyword box shows. More than this is a list to read
+/// rather than a completion to glance at.
+const SUGGEST_LIMIT: usize = 8;
 const LIST_ROW_HEIGHT: f32 = 28.0;
 /// Sidebar "Recent" section cap.
 const SIDEBAR_RECENTS: usize = 6;
@@ -433,6 +443,18 @@ fn split_saved(saved: &bc_core::SavedSearch) -> (String, Vec<RuleRow>) {
     (words.join(" "), rows)
 }
 
+/// A keyword vocabulary question, asked of the index by the keyword box.
+struct SuggestQuery {
+    seq: u64,
+    prefix: String,
+    index: Arc<bc_core::MetadataIndex>,
+}
+
+struct SuggestAnswer {
+    seq: u64,
+    results: Result<Vec<bc_core::KeywordSuggestion>, String>,
+}
+
 struct ThumbJob {
     path: PathBuf,
     mtime_ns: i64,
@@ -539,6 +561,10 @@ enum SearchJob {
         request: SearchQuery,
         reply: Sender<CountAnswer>,
     },
+    Suggest {
+        request: SuggestQuery,
+        reply: Sender<SuggestAnswer>,
+    },
 }
 
 /// The library search runs on its own thread, like the thumbnails.
@@ -566,6 +592,21 @@ fn spawn_search_worker(rx: Receiver<SearchJob>) {
                             .map_err(|error| error.to_string());
                         if reply.send(SearchAnswer { seq, rows }).is_err() {
                             tracing::debug!("search answer undelivered (frame gone)");
+                        }
+                    }
+                    SearchJob::Suggest { request, reply } => {
+                        // One deliberate exception to "the worker answers and
+                        // moves on": the first call builds an index over the
+                        // keyword table, measured at 0.7 s on 600 000 rows. That
+                        // is why this query belongs on this thread and not where
+                        // the box is drawn, and why a slow first answer is not a
+                        // defect to fix by moving it back to the paint path.
+                        let SuggestQuery { seq, prefix, index } = request;
+                        let results = index
+                            .keyword_suggestions(&prefix, SUGGEST_LIMIT)
+                            .map_err(|error| error.to_string());
+                        if reply.send(SuggestAnswer { seq, results }).is_err() {
+                            tracing::debug!("keyword suggestions undelivered (panel gone)");
                         }
                     }
                     SearchJob::Count { request, reply } => {
@@ -771,6 +812,23 @@ pub struct BridgeApp {
     /// `search_tx` like every other query, so a stale answer cannot race a
     /// newer one across two threads reading one SQLite connection.
     editor: Option<CollectionEditor>,
+    /// Library-wide keyword type-ahead for the box in the tags panel.
+    /// `suggestions` describes `suggestions_prefix`, and the panel shows nothing
+    /// unless the two still agree: a candidate list for a word the user has
+    /// already changed is how a typo becomes a permanent keyword.
+    suggest_reply_tx: Sender<SuggestAnswer>,
+    suggest_rx: Receiver<SuggestAnswer>,
+    suggest_seq: u64,
+    /// The request in flight and the prefix it asks about.
+    suggest_waiting: Option<(u64, String)>,
+    suggestions: Vec<bc_core::KeywordSuggestion>,
+    /// The prefix the panel drew last frame and wants an answer for. Set by the
+    /// row helper rather than read off a particular box, because there are two
+    /// keyword boxes — a single file's and a bulk stamp's — and one list.
+    suggest_query: String,
+    suggestions_prefix: String,
+    suggest_error: Option<String>,
+    suggest_due: Option<Instant>,
     /// Counters so an answer can be matched to the request it answers, and a
     /// superseded one thrown away.
     search_seq: u64,
@@ -867,6 +925,7 @@ impl BridgeApp {
         // the frame drains, but the two channels are deliberately not the same.
         let (query_tx, query_rx) = channel::<SearchJob>();
         let (answer_tx, answer_rx) = channel::<SearchAnswer>();
+        let (suggest_reply_tx, suggest_rx) = channel::<SuggestAnswer>();
         spawn_search_worker(query_rx);
 
         let (favorites, favorites_error) = match Favorites::open_default() {
@@ -938,6 +997,15 @@ impl BridgeApp {
             search_rx: answer_rx,
             search_reply_tx: answer_tx,
             editor: None,
+            suggest_reply_tx,
+            suggest_rx,
+            suggest_seq: 0,
+            suggest_waiting: None,
+            suggestions: Vec::new(),
+            suggest_query: String::new(),
+            suggestions_prefix: String::new(),
+            suggest_error: None,
+            suggest_due: None,
             search_seq: 0,
             search_waiting: None,
             search_due: None,
@@ -1621,6 +1689,233 @@ impl BridgeApp {
             }
         }
         self.editor = Some(editor);
+    }
+
+    /// The frame's half of keyword suggestions: take any answer that landed, and
+    /// fire the deadline the completion row set. Scheduling is the row's job — it
+    /// is the only thing that knows which of the two keyword boxes is on screen
+    /// and what is typed in it — so this is a clock and nothing else.
+    fn tick_suggestions(&mut self, ctx: &egui::Context) {
+        self.poll_suggestions();
+        let Some(due) = self.suggest_due else {
+            if self.suggest_waiting.is_some() {
+                // Outstanding: keep the frame clock awake so the answer is taken
+                // as soon as it lands, without repainting at 60 Hz while idle.
+                ctx.request_repaint_after(Duration::from_millis(60));
+            }
+            return;
+        };
+        if Instant::now() < due {
+            ctx.request_repaint_after(due.saturating_duration_since(Instant::now()));
+            return;
+        }
+        self.suggest_due = None;
+        let typed = self.typed_prefix();
+        if !typed.is_empty() && self.suggestions_prefix != typed {
+            self.request_suggestions(typed);
+        }
+    }
+
+    /// Queue a suggestion query for what a keyword box currently holds. Called
+    /// from the row on every frame it draws, so the cost of being called again
+    /// with the same text is one comparison.
+    ///
+    /// The deadline is what keeps a fast typist from queueing a scan per
+    /// keystroke, and asking for whatever is typed *when the deadline fires* —
+    /// rather than what was typed when it was set — is what keeps an abandoned
+    /// word from being asked about at all.
+    fn schedule_suggestions(&mut self, ui: &egui::Ui, typed: &str) {
+        // Nothing typed is not a slow query, it is no question at all: the list
+        // goes, and an answer already travelling is dropped by the receiver
+        // nobody is waiting for.
+        if typed.is_empty() {
+            self.suggestions.clear();
+            self.suggestions_prefix.clear();
+            self.suggest_error = None;
+            self.suggest_due = None;
+            self.suggest_waiting = None;
+            return;
+        }
+        if self.suggestions_prefix == typed || self.suggest_due.is_some() {
+            // Answered, or already on its way.
+            return;
+        }
+        self.suggest_due = Some(Instant::now() + SUGGEST_DEBOUNCE);
+        ui.ctx().request_repaint_after(SUGGEST_DEBOUNCE);
+    }
+
+    /// The prefix the last drawn keyword row was asking about, already in the
+    /// form the index stores keywords in. Normalised at the row rather than
+    /// here, because the row is the only place that knows which box is on
+    /// screen: two spaces typed by hand are the same word to `add_keyword`, and
+    /// asking the library with the un-normalised text would answer "new
+    /// keyword" about a word the library already has.
+    fn typed_prefix(&self) -> String {
+        self.suggest_query.clone()
+    }
+
+    fn poll_suggestions(&mut self) {
+        let Some((seq, asked)) = self.suggest_waiting.clone() else {
+            while self.suggest_rx.try_recv().is_ok() {}
+            return;
+        };
+        while let Ok(answer) = self.suggest_rx.try_recv() {
+            if answer.seq != seq {
+                // A reply to a word that is no longer outstanding. The list it
+                // carries belongs to a prefix nobody is asking about.
+                continue;
+            }
+            self.suggest_waiting = None;
+            self.suggestions_prefix = asked;
+            self.suggest_due = None;
+            match answer.results {
+                Ok(list) => {
+                    self.suggestions = list;
+                    self.suggest_error = None;
+                }
+                Err(error) => {
+                    self.suggestions = Vec::new();
+                    self.suggest_error = Some(error);
+                }
+            }
+            return;
+        }
+    }
+
+    /// The keyword completion row: what the library already calls things that
+    /// begin with what is typed, plus one line saying which kind of absence the
+    /// box is looking at. Shared by both keyword boxes, because the question is
+    /// the same and the bulk one is where a wrong keyword multiplies by the
+    /// size of the selection.
+    ///
+    /// `carried` names keywords the subject already holds, which are not offered
+    /// back as additions. The bulk panel passes nothing: "already carried" means
+    /// something different for every file in a selection, and the stamp path
+    /// refuses the duplicates it meets.
+    fn keyword_completions(
+        &mut self,
+        ui: &mut egui::Ui,
+        draft: String,
+        carried: &[String],
+    ) -> Option<String> {
+        let typed = bc_metadata::keywords::normalize_prefix(&draft);
+        self.suggest_query = typed.clone();
+        self.schedule_suggestions(ui, &typed);
+        let answered = !typed.is_empty() && self.suggestions_prefix == typed;
+
+        // Only a list answered *for this prefix* may be shown: `suggestions`
+        // holds the last one that landed, which after an edit is a list for a
+        // word nobody is typing.
+        let candidates: Vec<(String, usize)> = if answered {
+            self.suggestions
+                .iter()
+                .filter(|s| !carried.contains(&s.keyword))
+                .map(|s| (s.keyword.clone(), s.files))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let mut chosen = None;
+        if !candidates.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.add(
+                    egui::Label::new(egui::RichText::new("In use:").weak().small())
+                        .selectable(false),
+                );
+                for (keyword, files) in &candidates {
+                    // The count is the point of the row: a word used by 5 000
+                    // files is the library's vocabulary, and a word used by one
+                    // is worth a look before it is copied.
+                    let label = format!("{keyword} ({files})");
+                    if ui
+                        .small_button(egui::RichText::new(label).small())
+                        .on_hover_text(format!(
+                            "Used by {files} indexed file(s). Clicking adds this spelling, \
+                             exactly as those files spell it."
+                        ))
+                        .clicked()
+                    {
+                        chosen = Some(keyword.clone());
+                    }
+                }
+            });
+        }
+
+        // One status line, distinguishing the three absences a keyword box can
+        // mean: not asked yet, cannot ask, and asked with nothing to show.
+        // Collapsing them is how "no suggestions" comes to read as "this word is
+        // new" when the index was simply offline.
+        if !typed.is_empty() {
+            let line =
+                if let Some(error) = answered.then_some(self.suggest_error.as_ref()).flatten() {
+                    Some(format!("Library suggestions unavailable: {error}"))
+                } else if !answered {
+                    Some("Checking the library’s keywords…".to_string())
+                } else if !candidates.is_empty() {
+                    // The row above already said what is true of this word: the
+                    // library uses it. Nothing to add, and anything added here
+                    // would contradict the buttons a line above.
+                    None
+                } else if !self.suggestions.is_empty() {
+                    // Every spelling the library holds is already on this file.
+                    Some("Already on this file.".to_string())
+                } else if typed.ends_with('|') {
+                    // A trailing separator is not a keyword: it is the question
+                    // "what hangs under this", and answering it with "this would
+                    // be a new keyword" would offer to create a word nobody
+                    // typed. Say what is empty instead.
+                    let parent = typed.trim_end_matches('|');
+                    Some(format!("Nothing is filed under “{parent}” yet."))
+                } else {
+                    Some(format!(
+                        "“{typed}” is not used by any indexed file — this would be a new \
+                         keyword."
+                    ))
+                };
+            if let Some(line) = line {
+                ui.add(
+                    egui::Label::new(egui::RichText::new(line).weak().small()).selectable(false),
+                );
+            }
+        }
+        chosen
+    }
+
+    /// Ask the worker what the library calls things beginning with `prefix`.
+    fn request_suggestions(&mut self, prefix: String) {
+        let Some(index) = self.open_index() else {
+            // Say so rather than showing nothing: an empty list and an offline
+            // index look identical in a keyword box, and one of them means the
+            // word the user is typing may already exist somewhere.
+            self.suggestions_prefix = prefix;
+            self.suggestions = Vec::new();
+            self.suggest_error = Some(
+                self.index_error
+                    .clone()
+                    .unwrap_or_else(|| "the metadata index is offline".to_string()),
+            );
+            return;
+        };
+        self.suggest_seq += 1;
+        let seq = self.suggest_seq;
+        let request = SuggestQuery {
+            seq,
+            prefix: prefix.clone(),
+            index,
+        };
+        let reply = self.suggest_reply_tx.clone();
+        if self
+            .search_tx
+            .send(SearchJob::Suggest { request, reply })
+            .is_err()
+        {
+            self.suggestions_prefix = prefix;
+            self.suggestions = Vec::new();
+            self.suggest_error = Some("the background search thread is not running".to_string());
+        } else {
+            self.suggest_waiting = Some((seq, prefix));
+        }
     }
 
     fn request_count(&mut self, editor: &mut CollectionEditor, key: CountKey) {
@@ -2997,32 +3292,22 @@ impl BridgeApp {
             }
         });
 
-        // Completions come from the hierarchy this file already carries, so
-        // typing a parent offers its children instead of inventing a global
-        // keyword pool that nothing fills yet.
-        let prefix = self.keyword_draft.trim().to_string();
-        let suggestions: Vec<String> = if prefix.is_empty() {
-            Vec::new()
-        } else {
-            bc_metadata::keywords::suggest(&self.tags_form.current().keywords, &prefix)
-        };
-        let mut chosen: Option<String> = None;
-        if !suggestions.is_empty() {
-            ui.horizontal_wrapped(|ui| {
-                ui.add(
-                    egui::Label::new(egui::RichText::new("Complete:").weak().small())
-                        .selectable(false),
-                );
-                for suggestion in &suggestions {
-                    if ui
-                        .small_button(egui::RichText::new(suggestion.as_str()).small())
-                        .clicked()
-                    {
-                        chosen = Some(suggestion.clone());
-                    }
-                }
-            });
-        }
+        // Completions used to come only from the hierarchy this file carries,
+        // because there was no pool to ask. The indexer has since filled the
+        // index's keyword table from every folder it has read, so the box can
+        // answer the question a keyword actually raises: not "what is this word
+        // called" but "does this library already have a word for it, and how is
+        // it spelled". That is the one place a near-duplicate can still be
+        // stopped, because after the save there are two keywords and no
+        // interface that will merge them.
+        let carried: Vec<String> = self
+            .tags_form
+            .current()
+            .keywords
+            .iter()
+            .map(|keyword| bc_metadata::keywords::normalize_keyword(keyword))
+            .collect();
+        let chosen = self.keyword_completions(ui, self.keyword_draft.clone(), &carried);
         if let Some(suggestion) = chosen {
             self.keyword_draft = suggestion;
             request_add = true;
@@ -3283,6 +3568,14 @@ impl BridgeApp {
                         .desired_width(110.0),
                 );
             });
+            // The same vocabulary question the single-file box asks, in the
+            // place where a wrong answer is worst: a misspelling stamped on
+            // two hundred files is two hundred copies of a keyword no
+            // search will find.
+            let chosen = self.keyword_completions(ui, self.bulk_keyword.clone(), &[]);
+            if let Some(keyword) = chosen {
+                self.bulk_keyword = keyword;
+            }
 
             let has_value = !self.bulk_description.trim().is_empty()
                 || !self.bulk_artist.trim().is_empty()
@@ -6074,6 +6367,7 @@ impl eframe::App for BridgeApp {
         // drawn, so a count that landed while the user was deciding is on screen
         // in the same frame it arrives.
         self.tick_editor_count(ctx);
+        self.tick_suggestions(ctx);
         self.handle_search_shortcuts(ctx);
         // A debounced search fires on the clock, not on an event: nothing
         // happens 450 ms after the last keystroke except this check.
@@ -8960,6 +9254,738 @@ mod tests {
         assert!(
             index.contains(&landed),
             "the destination folder of a superseded pass was never indexed"
+        );
+    }
+
+    /// Index rows carrying keywords, written through the same `index_file` the
+    /// indexer uses, so a suggestion test cannot disagree with the indexer about
+    /// what a keyword row looks like.
+    fn seed_keywords(
+        isolated: &Path,
+        rows: &[(PathBuf, &[&str])],
+        stores: &std::sync::MutexGuard<'static, ()>,
+    ) {
+        isolated_env(isolated, stores);
+        let path = bc_core::paths::metadata_index_path().unwrap();
+        let index = bc_core::MetadataIndex::open(&path).unwrap();
+        for (file, keywords) in rows {
+            std::fs::write(file, [0xFFu8, 0xD8, 0xFF, 0xD9]).unwrap();
+            let mut meta = bc_metadata::Metadata::new();
+            for keyword in *keywords {
+                bc_metadata::keywords::add_keyword(&mut meta, keyword);
+            }
+            index.index_file(file, &meta).unwrap();
+        }
+    }
+
+    /// Collapse the debounce and let the worker answer, the way `finish_search`
+    /// does for the box. Returns when the list on screen describes what is typed.
+    fn finish_suggestions(app: &mut BridgeApp, ctx: &egui::Context) {
+        for _ in 0..500 {
+            if app.typed_prefix().is_empty() {
+                return;
+            }
+            app.suggest_due = Some(Instant::now());
+            app.tick_suggestions(ctx);
+            let typed = app.typed_prefix();
+            if app.suggest_waiting.is_none() && app.suggestions_prefix == typed {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        panic!("the keyword suggestions never answered");
+    }
+
+    /// Draw the metadata panel for one file and return every string it wrote.
+    fn panel_texts(
+        app: &mut BridgeApp,
+        ctx: &egui::Context,
+        path: &Path,
+        mtime: i64,
+    ) -> Vec<String> {
+        let target = path.to_path_buf();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(420.0, 1_400.0),
+            )),
+            time: Some(next_frame_time()),
+            ..Default::default()
+        };
+        // Two passes: the panel lives in a scroll area whose contents are only
+        // laid out after the first, and a single pass can miss them.
+        let _ = ctx.run(raw.clone(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    app.metadata_form_ui(ui, &target, mtime);
+                });
+            });
+        });
+        let out = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    app.metadata_form_ui(ui, &target, mtime);
+                });
+            });
+        });
+        out.shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Draw the right-hand panel the way the app does, which chooses the bulk
+    /// form whenever more than one file is selected.
+    fn right_panel_texts(app: &mut BridgeApp, ctx: &egui::Context) -> Vec<String> {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(420.0, 1_600.0),
+            )),
+            time: Some(next_frame_time()),
+            ..Default::default()
+        };
+        let _ = ctx.run(raw.clone(), |ctx| {
+            egui::SidePanel::right("probe").show(ctx, |ui| app.metadata_panel(ui));
+        });
+        let out = ctx.run(raw, |ctx| {
+            egui::SidePanel::right("probe").show(ctx, |ui| app.metadata_panel(ui));
+        });
+        out.shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Click a control in the right-hand panel. Written as its own pass
+    /// sequence rather than through `click_at`, because this panel is measured
+    /// and clicked with a frame clock: the pointer has to be *moved* in the
+    /// clicking pass itself, or egui treats the press as arriving at wherever
+    /// the previous frame left it and the button never hears about it.
+    fn click_right_panel(app: &mut BridgeApp, ctx: &egui::Context, wanted: &str) {
+        let raw = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(420.0, 1_600.0),
+            )),
+            time: Some(next_frame_time()),
+            events,
+            ..Default::default()
+        };
+        let at = {
+            let out = ctx.run(raw(vec![]), |ctx| {
+                egui::SidePanel::right("probe").show(ctx, |ui| app.metadata_panel(ui));
+            });
+            let drawn: Vec<(String, egui::Rect)> = out
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some((
+                        text.galley.text().to_string(),
+                        egui::Rect::from_min_size(text.pos, text.galley.size()),
+                    )),
+                    _ => None,
+                })
+                .collect();
+            drawn
+                .iter()
+                .find(|(text, _)| text == wanted)
+                .map(|(_, rect)| rect.center())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "“{wanted}” was not drawn in the right panel; it drew {:?}",
+                        drawn
+                            .iter()
+                            .map(|(text, _)| text.as_str())
+                            .collect::<Vec<_>>()
+                    )
+                })
+        };
+        let _ = ctx.run(raw(vec![egui::Event::PointerMoved(at)]), |ctx| {
+            egui::SidePanel::right("probe").show(ctx, |ui| app.metadata_panel(ui));
+        });
+        let _ = ctx.run(
+            raw(vec![
+                egui::Event::PointerMoved(at),
+                button(at, true),
+                button(at, false),
+            ]),
+            |ctx| {
+                egui::SidePanel::right("probe").show(ctx, |ui| app.metadata_panel(ui));
+            },
+        );
+    }
+
+    /// Click the panel control whose text is exactly `wanted`.
+    fn click_panel(
+        app: &mut BridgeApp,
+        ctx: &egui::Context,
+        path: &Path,
+        mtime: i64,
+        wanted: &str,
+    ) {
+        let target = path.to_path_buf();
+        let drawn = {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(420.0, 1_400.0),
+                )),
+                time: Some(next_frame_time()),
+                ..Default::default()
+            };
+            let out = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        app.metadata_form_ui(ui, &target, mtime);
+                    });
+                });
+            });
+            let rects: Vec<(String, egui::Rect)> = out
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some((
+                        text.galley.text().to_string(),
+                        egui::Rect::from_min_size(text.pos, text.galley.size()),
+                    )),
+                    _ => None,
+                })
+                .collect();
+            rects
+        };
+        let at = drawn
+            .iter()
+            .find(|(text, _)| text == wanted)
+            .map(|(_, rect)| rect.center())
+            .unwrap_or_else(|| {
+                panic!(
+                    "“{wanted}” was not drawn in the metadata panel; it drew {:?}",
+                    drawn
+                        .iter()
+                        .map(|(text, _)| text.as_str())
+                        .collect::<Vec<_>>()
+                )
+            });
+        click_at(app, ctx, at, |app, ctx| {
+            let target = target.clone();
+            egui::CentralPanel::default().show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    app.metadata_form_ui(ui, &target, mtime);
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn the_keyword_box_offers_what_the_library_already_calls_it() {
+        // The feature in one assertion: a word typed in lower case finds the
+        // spelling the library uses, with the count that makes it worth using.
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let photo = root.join("photo.jpg");
+        std::fs::write(&photo, [0xFFu8, 0xD8, 0xFF, 0xD9]).unwrap();
+        seed_keywords(
+            &data,
+            &[
+                (root.join("a.jpg"), &["Beach"][..]),
+                (root.join("b.jpg"), &["Beach"]),
+                (root.join("c.jpg"), &["Beach|2024"]),
+                (root.join("d.jpg"), &["Mountain"]),
+            ],
+            &_stores,
+        );
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data, &_stores);
+        let mtime = 1_700_000_000_000_000_000;
+        // Load the form once: setting the draft afterwards survives the draw,
+        // while a first load clears it.
+        panel_texts(&mut app, &ctx, &photo, mtime);
+
+        app.keyword_draft = "bea".to_string();
+        // The row is what says which prefix the box is asking about, so it has
+        // to be drawn before anything can be scheduled — the same frame the
+        // live app spends between a keystroke and a query.
+        panel_texts(&mut app, &ctx, &photo, mtime);
+        // Drawing the row set a deadline and asked for nothing: the query
+        // belongs to the worker, and a scan inside the panel draw is a frozen
+        // right-hand column.
+        assert!(
+            app.suggest_due.is_some(),
+            "typing into the box queued no deadline"
+        );
+        assert!(
+            app.suggest_waiting.is_none() && app.suggestions.is_empty(),
+            "the frame that typed ran the query itself"
+        );
+        app.tick_suggestions(&ctx);
+        assert!(
+            app.suggest_waiting.is_none(),
+            "the deadline fired a frame early"
+        );
+
+        finish_suggestions(&mut app, &ctx);
+        let words = panel_texts(&mut app, &ctx, &photo, mtime);
+        assert!(
+            words.iter().any(|t| t == "In use:"),
+            "no completion row was drawn: {words:?}"
+        );
+        assert!(
+            words.iter().any(|t| t == "Beach (2)"),
+            "the library's own word and its count are missing: {words:?}"
+        );
+        assert!(
+            words.iter().any(|t| t == "Beach|2024 (1)"),
+            "the hierarchy below it was not offered: {words:?}"
+        );
+        assert!(
+            !words.iter().any(|t| t.starts_with("Mountain")),
+            "a word unrelated to the prefix was shown: {words:?}"
+        );
+        // With candidates on screen the row speaks for itself: any status line
+        // beside it says either "this is new" or "already on this file", and
+        // both are contradicted by the buttons one line above.
+        assert!(
+            !words.iter().any(|t| t.contains("new keyword")),
+            "the panel called a word it just listed as in use a new keyword: {words:?}"
+        );
+        assert!(
+            !words.iter().any(|t| t == "Already on this file."),
+            "the panel said nothing was left to add while listing things to add: {words:?}"
+        );
+        assert!(
+            !words.iter().any(|t| t.contains("Checking the library")),
+            "the panel claimed to still be working after answering: {words:?}"
+        );
+    }
+
+    #[test]
+    fn clicking_a_keyword_completion_stores_the_library_spelling_not_the_typed_one() {
+        // The point of the whole row: "bea" clicked becomes "Beach", so the
+        // library keeps one keyword rather than gaining a near-duplicate that
+        // no search can join.
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let photo = root.join("photo.jpg");
+        std::fs::write(&photo, [0xFFu8, 0xD8, 0xFF, 0xD9]).unwrap();
+        seed_keywords(
+            &data,
+            &[
+                (root.join("a.jpg"), &["Beach"]),
+                (root.join("b.jpg"), &["Beach"]),
+            ],
+            &_stores,
+        );
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data, &_stores);
+        let mtime = 1_700_000_000_000_000_000;
+        panel_texts(&mut app, &ctx, &photo, mtime);
+        app.keyword_draft = "bea".to_string();
+        panel_texts(&mut app, &ctx, &photo, mtime);
+        finish_suggestions(&mut app, &ctx);
+
+        click_panel(&mut app, &ctx, &photo, mtime, "Beach (2)");
+        assert_eq!(
+            app.tags_form.current().keywords,
+            vec!["Beach".to_string()],
+            "the completion stored what was typed rather than what is in use"
+        );
+        assert!(
+            app.keyword_draft.is_empty(),
+            "the box kept the text of a keyword it already added"
+        );
+    }
+
+    #[test]
+    fn a_word_no_indexed_file_uses_is_said_to_be_new() {
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let photo = root.join("photo.jpg");
+        std::fs::write(&photo, [0xFFu8, 0xD8, 0xFF, 0xD9]).unwrap();
+        seed_keywords(&data, &[(root.join("a.jpg"), &["Beach"])], &_stores);
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data, &_stores);
+        let mtime = 1_700_000_000_000_000_000;
+        panel_texts(&mut app, &ctx, &photo, mtime);
+        app.keyword_draft = "zzz".to_string();
+        panel_texts(&mut app, &ctx, &photo, mtime);
+        finish_suggestions(&mut app, &ctx);
+
+        let words = panel_texts(&mut app, &ctx, &photo, mtime);
+        let line = words
+            .iter()
+            .find(|t| t.contains("indexed file"))
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            line.contains("new keyword"),
+            "an unseen word was not said to be new: {words:?}"
+        );
+        assert!(
+            !words.iter().any(|t| t == "In use:"),
+            "a completion row appeared for a word nothing uses: {words:?}"
+        );
+    }
+
+    #[test]
+    fn an_unreachable_index_is_reported_and_never_called_a_new_keyword() {
+        // The two absences that must not look alike. If "no suggestions" is
+        // reported as "this word is new" while the index is offline, the user is
+        // told to invent a keyword the library already has.
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&root).unwrap();
+        let photo = root.join("photo.jpg");
+        std::fs::write(&photo, [0xFFu8, 0xD8, 0xFF, 0xD9]).unwrap();
+        // A file standing where the data directory would have to be.
+        let blocker = temp.path().join("data");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        std::env::set_var("HOME", temp.path());
+        std::env::set_var("APPDATA", &blocker);
+        std::env::set_var("XDG_DATA_HOME", &blocker);
+
+        let ctx = egui::Context::default();
+        let mut app = BridgeApp::new(&ctx, Some(root.display().to_string()));
+        assert!(
+            app.index_error.is_some(),
+            "the fixture did not make the index unreachable"
+        );
+        let mtime = 1_700_000_000_000_000_000;
+        panel_texts(&mut app, &ctx, &photo, mtime);
+        app.keyword_draft = "bea".to_string();
+        // The row is what registers the question, so it has to be drawn once
+        // with the new text before anything can be answered.
+        panel_texts(&mut app, &ctx, &photo, mtime);
+        finish_suggestions(&mut app, &ctx);
+
+        let words = panel_texts(&mut app, &ctx, &photo, mtime);
+        assert!(
+            words
+                .iter()
+                .any(|t| t.contains("Library suggestions unavailable")),
+            "the offline index was not said out loud: {words:?}"
+        );
+        assert!(
+            !words.iter().any(|t| t.contains("new keyword")),
+            "an unreachable index told the user the word was new: {words:?}"
+        );
+    }
+
+    #[test]
+    fn a_completion_already_on_the_file_is_not_offered_back() {
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let photo = root.join("photo.jpg");
+        std::fs::write(&photo, [0xFFu8, 0xD8, 0xFF, 0xD9]).unwrap();
+        seed_keywords(
+            &data,
+            &[
+                (photo.clone(), &["Beach"]),
+                (root.join("b.jpg"), &["Beach"]),
+            ],
+            &_stores,
+        );
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data, &_stores);
+        let mtime = 1_700_000_000_000_000_000;
+        panel_texts(&mut app, &ctx, &photo, mtime);
+        assert!(
+            app.tags_form.add_keyword("Beach"),
+            "the fixture could not put the keyword on the file"
+        );
+        app.keyword_draft = "bea".to_string();
+        panel_texts(&mut app, &ctx, &photo, mtime);
+        finish_suggestions(&mut app, &ctx);
+
+        let words = panel_texts(&mut app, &ctx, &photo, mtime);
+        assert!(
+            !words.iter().any(|t| t.starts_with("Beach (")),
+            "the box offered to add a keyword the file already carries: {words:?}"
+        );
+        assert!(
+            words.iter().any(|t| t == "Already on this file."),
+            "and it said nothing about why: {words:?}"
+        );
+        assert!(
+            !words.iter().any(|t| t.contains("new keyword")),
+            "a word the library holds was called new: {words:?}"
+        );
+    }
+
+    #[test]
+    fn the_bulk_keyword_box_asks_the_same_question_as_the_single_one() {
+        // The expensive version of the mistake: a misspelling stamped across a
+        // selection is one keyword per file, and nothing later merges them. The
+        // row has to be in that panel too, not only beside one photo.
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        seed_keywords(
+            &data,
+            &[
+                (root.join("a.jpg"), &["Beach"]),
+                (root.join("b.jpg"), &["Beach"]),
+                (root.join("c.jpg"), &["Beach"]),
+            ],
+            &_stores,
+        );
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data, &_stores);
+        app.right_tab = RightTab::Metadata;
+        let count = app.browser.len();
+        assert!(count >= 2, "the fixture needs a multi-file selection");
+        app.browser.selection.select_all(count);
+
+        // Draw once so the bulk row registers the prefix it wants an answer for.
+        let before = right_panel_texts(&mut app, &ctx);
+        assert!(
+            before.iter().any(|t| t == "Add keyword:"),
+            "the bulk panel does not have the keyword box: {before:?}"
+        );
+        app.bulk_keyword = "bea".to_string();
+        right_panel_texts(&mut app, &ctx);
+        finish_suggestions(&mut app, &ctx);
+
+        let words = right_panel_texts(&mut app, &ctx);
+        assert!(
+            words.iter().any(|t| t == "Beach (3)"),
+            "the bulk box offered no library vocabulary: {words:?}"
+        );
+
+        click_right_panel(&mut app, &ctx, "Beach (3)");
+        assert_eq!(
+            app.bulk_keyword, "Beach",
+            "the bulk stamp kept the typed spelling instead of the one in use"
+        );
+    }
+
+    #[test]
+    fn a_trailing_separator_asks_about_children_and_only_offers_children() {
+        // The hierarchical convention is the reason keywords are worth a
+        // vocabulary check at all, and a trailing `|` is the question about it.
+        // The stored-keyword normaliser drops that separator, so if the box used
+        // it the answer would be the parent and its siblings — a plausible-looking
+        // list that is not what was asked.
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let photo = root.join("photo.jpg");
+        std::fs::write(&photo, [0xFFu8, 0xD8, 0xFF, 0xD9]).unwrap();
+        seed_keywords(
+            &data,
+            &[
+                (root.join("a.jpg"), &["Beach", "Beach|2024", "Beaches"]),
+                (root.join("b.jpg"), &["Beach|Family"]),
+            ],
+            &_stores,
+        );
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data, &_stores);
+        let mtime = 1_700_000_000_000_000_000;
+        panel_texts(&mut app, &ctx, &photo, mtime);
+        app.keyword_draft = "Beach|".to_string();
+        panel_texts(&mut app, &ctx, &photo, mtime);
+        finish_suggestions(&mut app, &ctx);
+
+        let words = panel_texts(&mut app, &ctx, &photo, mtime);
+        assert!(
+            words.iter().any(|t| t == "Beach|2024 (1)"),
+            "the children were not offered: {words:?}"
+        );
+        assert!(
+            words.iter().any(|t| t == "Beach|Family (1)"),
+            "and only some of them arrived: {words:?}"
+        );
+        assert!(
+            !words
+                .iter()
+                .any(|t| t.starts_with("Beach (") || t.starts_with("Beaches (")),
+            "a child-prefix answered with the parent and its siblings: {words:?}"
+        );
+
+        // And the empty case keeps its own sentence: the separator is not a
+        // keyword, so it must not be reported as one about to be created.
+        app.keyword_draft = "Beach|Nothing|".to_string();
+        panel_texts(&mut app, &ctx, &photo, mtime);
+        finish_suggestions(&mut app, &ctx);
+        let after = panel_texts(&mut app, &ctx, &photo, mtime);
+        assert!(
+            after.iter().any(|t| t.contains("Nothing is filed under")),
+            "an empty branch was described as a new keyword: {after:?}"
+        );
+        assert!(
+            !after.iter().any(|t| t.contains("new keyword")),
+            "the box offered to create a word that was never typed: {after:?}"
+        );
+    }
+
+    #[test]
+    fn an_answer_for_another_word_is_refused_even_when_it_lands() {
+        // Two guards, both needed: the sequence rejects an answer that is no
+        // longer outstanding, and the prefix gate keeps an answer off the screen
+        // once the box has moved on.
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let photo = root.join("photo.jpg");
+        std::fs::write(&photo, [0xFFu8, 0xD8, 0xFF, 0xD9]).unwrap();
+        seed_keywords(&data, &[(root.join("a.jpg"), &["Beach"])], &_stores);
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data, &_stores);
+        let mtime = 1_700_000_000_000_000_000;
+        panel_texts(&mut app, &ctx, &photo, mtime);
+
+        app.keyword_draft = "bea".to_string();
+        panel_texts(&mut app, &ctx, &photo, mtime);
+        app.suggest_due = Some(Instant::now());
+        app.tick_suggestions(&ctx);
+        assert!(
+            app.suggest_waiting.is_some(),
+            "the request was never put in flight"
+        );
+        // A reply for a request nobody outstanding matches.
+        app.suggest_reply_tx
+            .send(SuggestAnswer {
+                seq: 4242,
+                results: Ok(vec![bc_core::KeywordSuggestion {
+                    keyword: "Wrongword".to_string(),
+                    files: 1,
+                }]),
+            })
+            .unwrap();
+        app.tick_suggestions(&ctx);
+        assert!(
+            app.suggestions.iter().all(|s| s.keyword != "Wrongword"),
+            "an answer for a stale sequence was taken: {:?}",
+            app.suggestions
+        );
+
+        // Let the real answer land, so the panel genuinely has a list for "bea".
+        finish_suggestions(&mut app, &ctx);
+        let before = panel_texts(&mut app, &ctx, &photo, mtime);
+        assert!(
+            before.iter().any(|t| t == "Beach (1)"),
+            "the answer never reached the panel it was asked for: {before:?}"
+        );
+
+        // Now the box moves on without another answer arriving. The list the
+        // panel holds describes a word that is no longer typed, so showing it
+        // would offer a completion for "bea" while the user is asking about
+        // "beach|" — the one state in which a clicked keyword is guaranteed to
+        // be the wrong one.
+        app.keyword_draft = "beach|".to_string();
+        let words = panel_texts(&mut app, &ctx, &photo, mtime);
+        assert!(
+            !words.iter().any(|t| t.starts_with("Beach (")),
+            "a list for the previous word was shown under the new one: {words:?}"
+        );
+        assert!(
+            words.iter().any(|t| t.contains("Checking the library")),
+            "and it did not say it was re-asking: {words:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_keyword_box_asks_nothing_of_the_library() {
+        // The debounce is not the only saving: an empty box must not be a query
+        // at all, or every panel draw on an unselected file costs a scan.
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let photo = root.join("photo.jpg");
+        std::fs::write(&photo, [0xFFu8, 0xD8, 0xFF, 0xD9]).unwrap();
+        seed_keywords(&data, &[(root.join("a.jpg"), &["Beach"])], &_stores);
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data, &_stores);
+        let mtime = 1_700_000_000_000_000_000;
+        for _ in 0..5 {
+            app.tick_suggestions(&ctx);
+        }
+        assert_eq!(app.suggest_seq, 0, "an empty box queried the index");
+        assert!(app.suggest_due.is_none(), "an empty box queued a scan");
+        assert!(app.suggestions_prefix.is_empty());
+
+        // Answer a real prefix, so there is a list and a prefix on record.
+        panel_texts(&mut app, &ctx, &photo, mtime);
+        app.keyword_draft = "bea".to_string();
+        panel_texts(&mut app, &ctx, &photo, mtime);
+        finish_suggestions(&mut app, &ctx);
+        let asked = app.suggest_seq;
+        assert!(asked > 0, "a typed prefix never reached the worker");
+
+        // Clearing the box must not ask another question. This is the half that
+        // makes the guard load-bearing: with the empty-prefix branch removed,
+        // an empty prefix differs from the last answered one, so the debounce
+        // fires and a scan runs for nothing — and `add_keyword` would refuse the
+        // word the scan was asked about.
+        for blank in ["", "   "] {
+            app.keyword_draft = blank.to_string();
+            // Drawing the row is how a box says what it holds, cleared included.
+            panel_texts(&mut app, &ctx, &photo, mtime);
+            for _ in 0..4 {
+                app.suggest_due = Some(Instant::now());
+                app.tick_suggestions(&ctx);
+            }
+            assert_eq!(
+                app.suggest_seq, asked,
+                "{blank:?} asked the library a second question"
+            );
+        }
+        assert!(
+            app.suggestions.is_empty(),
+            "the list for a cleared box was kept"
+        );
+        let words = panel_texts(&mut app, &ctx, &photo, mtime);
+        assert!(
+            !words.iter().any(|t| t.contains("Checking the library")),
+            "a blank box claimed to be working: {words:?}"
+        );
+        assert!(
+            !words.iter().any(|t| t == "In use:"),
+            "a cleared box still offered completions: {words:?}"
         );
     }
 
