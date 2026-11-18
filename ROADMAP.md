@@ -563,6 +563,20 @@ everything I checked locally passed, because local is Linux.
   2026-11-15 run, so nothing in these commits caused it, and nothing in these commits can fix
   it: it needs the GUI stack updated or the CI toolchain pinned. Recorded in Risks rather
   than left as a red badge somebody else will one day investigate.
+- **The Windows fix took two rounds, and the second round was the more interesting one.**
+  Sanitising the thread tag took the Windows failures from twenty to four — `paths::tests`,
+  all of them assuming that the data root and the configuration root are different
+  directories. They are on Linux. On Windows both resolve to `%APPDATA%` and on macOS both to
+  `~/Library/Application Support`, so "write the legacy database in config and the current one
+  in data" writes *one file twice*, and "assert the journal is not in the config directory"
+  asserts something that cannot be true there. Three tests now branch on `roots_are_distinct()`,
+  and the same shape is reachable deliberately on any machine: `collapse_roots()` points both
+  XDG variables at one directory, so `a_migration_with_nowhere_to_move_from_leaves_exactly_one_database`
+  and `the_journal_has_one_answer_when_config_and_data_are_one_tree` exercise on Linux the code
+  paths Windows and macOS take. The first of those caught something worth catching: with the
+  early return removed and a cleanup `remove_file(legacy)` after a self-rename, the live
+  database is deleted during a migration that had nowhere to migrate from — a data-loss bug
+  that no Linux-root layout can trigger and that was, until it had a test, unexamined.
 - **The uncomfortable general point.** Nine slices of "verified against the release binary"
   were verified on one platform, and the repository's own quality gate —
   `cargo test --workspace` — was green the whole time. A cross-platform claim in the README

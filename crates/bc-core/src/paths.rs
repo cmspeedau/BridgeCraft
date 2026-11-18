@@ -290,6 +290,19 @@ pub(crate) mod tests {
         isolate_env(dir)
     }
 
+    /// Whether this platform keeps user data and user configuration in different
+    /// trees.
+    ///
+    /// Linux does. Windows resolves both to `%APPDATA%` and macOS both to
+    /// `~/Library/Application Support`, so on those two the "legacy" location and
+    /// the current one are literally the same path. That is not a defect — a file
+    /// already where it should be needs no move — but it does mean any test that
+    /// stages one file in config and another in data is staging *one* file, and
+    /// three of them here did until Windows CI said so.
+    fn roots_are_distinct() -> bool {
+        expected_root("DATA") != expected_root("CONFIG")
+    }
+
     /// The root each kind of file is expected under *on this platform*, so the
     /// assertions do not bake in a Linux layout and then fail on the macOS and
     /// Windows CI runners.
@@ -342,10 +355,16 @@ pub(crate) mod tests {
     /// shape the naming used to produce: `pid` and thread name only.
     fn stale_temp_of_the_old_scheme(file: &Path) -> PathBuf {
         let name = file.file_name().unwrap().to_string_lossy();
+        // The `thread_tag()` here is deliberate. What makes this name the old
+        // scheme is that it is *deterministic* for a given pid and thread, and
+        // that is the property under test; using a raw thread name would only
+        // reproduce a different bug — a test thread's name holds `::`, which is
+        // not a legal character in a Windows file name, and this fixture would
+        // fail to create the very file it is staging.
         file.parent().unwrap().join(format!(
             ".{name}.bridgecraft-tmp-{}-{}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("main")
+            thread_tag()
         ))
     }
 
@@ -377,6 +396,78 @@ pub(crate) mod tests {
     /// Rust does not constrain. Asserting the disallowed set directly is the only
     /// way to check that from a Linux or macOS dev machine: on Windows this was a
     /// store-wide `InvalidFilename` failure that no local test could ever see.
+    /// Point data and configuration at one tree, the shape Windows (`%APPDATA%`)
+    /// and macOS (`~/Library/Application Support`) have natively, and return the
+    /// guard that keeps the environment to this test alone.
+    ///
+    /// This exists so the "roots coincide" branches are not left to be discovered
+    /// by a Windows runner: they are ordinary code paths that happen to be
+    /// unreachable on a Linux desk, and a branch no one executes is a branch no
+    /// one has read.
+    fn collapse_roots(dir: &Path) -> std::sync::MutexGuard<'static, ()> {
+        let guard = isolate_env(dir);
+        let shared = dir.join("shared");
+        std::env::set_var("XDG_DATA_HOME", &shared);
+        std::env::set_var("XDG_CONFIG_HOME", &shared);
+        guard
+    }
+
+    #[test]
+    fn a_migration_with_nowhere_to_move_from_leaves_exactly_one_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = collapse_roots(temp.path());
+        assert!(
+            !roots_are_distinct(),
+            "the fixture did not collapse the roots, so this is the other test"
+        );
+
+        let home = expected_root("DATA").join(APP_FOLDER);
+        std::fs::create_dir_all(&home).unwrap();
+        let database = home.join("metadata.sqlite");
+        std::fs::write(&database, b"rows worth keeping").unwrap();
+
+        let path = metadata_index_path().unwrap();
+        assert_eq!(path, database, "the live database was not used as it is");
+        assert_eq!(std::fs::read(&path).unwrap(), b"rows worth keeping");
+        assert_eq!(
+            std::fs::read_dir(&home)
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("metadata.sqlite"))
+                .count(),
+            1,
+            "a migration that could not move anything still made a second file"
+        );
+    }
+
+    #[test]
+    fn the_journal_has_one_answer_when_config_and_data_are_one_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = collapse_roots(temp.path());
+        assert!(
+            !roots_are_distinct(),
+            "the fixture did not collapse the roots"
+        );
+
+        let journal = rename_journal_path().unwrap();
+        assert_eq!(
+            journal,
+            expected_root("DATA")
+                .join(APP_FOLDER)
+                .join("last-rename.json"),
+            "the journal stopped following the data resolver"
+        );
+        // The "not in the configuration directory" claim is withheld on this
+        // shape, and this is where the reason lives rather than in a comment on
+        // the platform: where the two roots are one directory, being in the
+        // configuration directory is unavoidable and says nothing about which
+        // writer resolved the path.
+        assert!(journal.starts_with(expected_root("CONFIG").join(APP_FOLDER)));
+    }
+
     #[test]
     fn a_temp_name_uses_only_characters_legal_in_a_windows_file_name() {
         // `favorites::tests::add_is_ordered_deduplicated_and_persisted` — the real
@@ -479,12 +570,18 @@ pub(crate) mod tests {
                 .join(APP_FOLDER)
                 .join("last-rename.json")
         );
-        // Not in the configuration directory, where one of them used to put it.
-        let config = user_config_root().unwrap().join(APP_FOLDER);
-        assert!(
-            !journal.starts_with(&config),
-            "the journal resolved into the config directory: {journal:?}"
-        );
+        // Not in the configuration directory, where one of the two writers used
+        // to put it. Only a meaningful claim where the roots are different
+        // directories: on Windows and macOS they are the same one, so the journal
+        // is in the configuration directory there by definition — and the equality
+        // asserted above is what actually pins which resolver answered.
+        if roots_are_distinct() {
+            let config = user_config_root().unwrap().join(APP_FOLDER);
+            assert!(
+                !journal.starts_with(&config),
+                "the journal resolved into the config directory: {journal:?}"
+            );
+        }
         // The assertion with teeth: a processor built by `open_default` — the
         // path production takes — writes to the file the interactive dialog
         // reads. Comparing the helper with itself would prove nothing.
@@ -572,11 +669,38 @@ pub(crate) mod tests {
                 .join("metadata.sqlite")
         );
         assert_eq!(std::fs::read(&path).unwrap(), b"rows worth keeping");
-        assert!(
-            !legacy.exists(),
-            "the old database was copied rather than moved"
-        );
         assert_eq!(metadata_index_path().unwrap(), path, "a second call agrees");
+
+        if roots_are_distinct() {
+            assert!(
+                !legacy.exists(),
+                "the old database was copied rather than moved"
+            );
+        } else {
+            // Windows and macOS: config *is* data, so the file that needed moving
+            // is already in the place it would be moved to. The guarantee that
+            // survives is the one that matters there — the rows are still where
+            // the name says, and no second copy has been made beside them.
+            assert_eq!(
+                legacy, path,
+                "the roots compared distinct but resolved to the same file"
+            );
+            assert!(legacy.exists(), "the database disappeared");
+            let siblings = std::fs::read_dir(legacy.parent().unwrap())
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("metadata.sqlite")
+                })
+                .count();
+            assert_eq!(
+                siblings, 1,
+                "a no-op migration left {siblings} metadata files beside each other"
+            );
+        }
     }
 
     #[test]
@@ -593,8 +717,24 @@ pub(crate) mod tests {
             .join(APP_FOLDER)
             .join("metadata.sqlite");
         std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        std::fs::write(&legacy, b"old").unwrap();
 
+        if !roots_are_distinct() {
+            // Two different files in the two places is a scenario that does not
+            // exist where config and data are one directory: writing "old" here
+            // would overwrite the "new" file, and the test would then be asserting
+            // that a file equals content it never had. What is checkable on these
+            // platforms is the same guarantee from one side: a live database at the
+            // resolved location is used as it is, not moved or replaced.
+            assert_eq!(metadata_index_path().unwrap(), current);
+            assert_eq!(
+                std::fs::read(&current).unwrap(),
+                b"new",
+                "the existing database was rewritten where there is nowhere to migrate from"
+            );
+            return;
+        }
+
+        std::fs::write(&legacy, b"old").unwrap();
         assert_eq!(metadata_index_path().unwrap(), current);
         assert_eq!(
             std::fs::read(&current).unwrap(),
