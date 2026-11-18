@@ -224,14 +224,18 @@ pub fn metadata_index_path() -> Result<PathBuf> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::Path;
-
-    /// Point the platform variables at a scratch root. The environment is
-    /// process-global, so these tests hold a lock for their whole body. No
-    /// other bc-core test reads these variables: they pass explicit paths.
-    fn scoped(dir: &Path) -> std::sync::MutexGuard<'static, ()> {
+/// Shared by this module's own tests and by any other test that needs the
+/// platform roots pointed at a temporary directory. See [`isolate_env`].
+pub(crate) mod tests {
+    /// Point every platform root at `dir` and hand back the guard that keeps
+    /// other tests out while they are set.
+    ///
+    /// Shared because process-wide environment variables are not a resource two
+    /// tests can use at once: `metadata_templates` needs the same isolation to
+    /// assert that `open_default` reads back what it wrote, and a second copy of
+    /// these four `set_var` calls under a second lock would let the two tests
+    /// stomp on each other while both believed they were isolated.
+    pub(crate) fn isolate_env(dir: &Path) -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("APPDATA", dir.join("win"));
@@ -241,10 +245,20 @@ mod tests {
         guard
     }
 
+    use super::*;
+    use std::path::Path;
+
+    /// Point the platform variables at a scratch root. The environment is
+    /// process-global, so these tests hold a lock for their whole body. No
+    /// other bc-core test reads these variables: they pass explicit paths.
+    fn scoped(dir: &Path) -> std::sync::MutexGuard<'static, ()> {
+        isolate_env(dir)
+    }
+
     /// The root each kind of file is expected under *on this platform*, so the
     /// assertions do not bake in a Linux layout and then fail on the macOS and
     /// Windows CI runners.
-    fn expected_root(kind: &str) -> PathBuf {
+    pub(crate) fn expected_root(kind: &str) -> PathBuf {
         if cfg!(target_os = "windows") {
             PathBuf::from(std::env::var("APPDATA").unwrap())
         } else if cfg!(target_os = "macos") {

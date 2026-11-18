@@ -35,6 +35,7 @@ use eframe::egui;
 use crate::batch_rename_ui;
 use crate::metadata_edit::{self, BulkReport, MetadataForm};
 use crate::tag_widgets;
+use crate::template_apply;
 use crate::viewer::{self, ViewerState, ZoomMode, FULL_EDGE, PREVIEW_EDGE};
 
 /// Default grid cell width; the status-bar zoom slider ranges from this.
@@ -808,6 +809,17 @@ pub struct BridgeApp {
     /// The sender this app reads the matching receiver from; handed to each
     /// job so one worker thread can answer several consumers.
     search_reply_tx: Sender<SearchAnswer>,
+    /// Saved metadata templates, read from their own document. `templates` is a
+    /// copy for drawing and `template_store` owns the file, so the panel never
+    /// reads a JSON document per frame and never writes one blind.
+    templates: Vec<bc_metadata::templates::MetadataTemplate>,
+    template_store: Option<bc_core::MetadataTemplates>,
+    template_store_error: Option<String>,
+    /// Which template the popup has selected, by name.
+    template_choice: Option<String>,
+    /// The draft being saved as a new template.
+    template_name: String,
+    template_mode: bc_metadata::templates::TemplateMode,
     /// The collection rule editor, open when `Some`. Count requests go out on
     /// `search_tx` like every other query, so a stale answer cannot race a
     /// newer one across two threads reading one SQLite connection.
@@ -997,6 +1009,12 @@ impl BridgeApp {
             search_rx: answer_rx,
             search_reply_tx: answer_tx,
             editor: None,
+            templates: Vec::new(),
+            template_store: None,
+            template_store_error: None,
+            template_choice: None,
+            template_name: String::new(),
+            template_mode: bc_metadata::templates::TemplateMode::Merge,
             suggest_reply_tx,
             suggest_rx,
             suggest_seq: 0,
@@ -1485,6 +1503,385 @@ impl BridgeApp {
                 );
             }
         });
+    }
+
+    /// Open the template store, or explain why it cannot be opened. Same rule as
+    /// the saved searches: a file that will not parse is reported and left alone,
+    /// because a template is user-authored content that exists nowhere else.
+    fn template_store(&mut self) -> Option<&mut bc_core::MetadataTemplates> {
+        if self.template_store.is_some() {
+            return self.template_store.as_mut();
+        }
+        match bc_core::MetadataTemplates::open_default() {
+            Ok(store) => {
+                self.template_store_error = None;
+                self.template_store = Some(store);
+                self.template_store.as_mut()
+            }
+            Err(error) => {
+                self.template_store_error = Some(error.to_string());
+                self.template_store = None;
+                None
+            }
+        }
+    }
+
+    fn refresh_templates(&mut self) {
+        let Some(store) = self.template_store() else {
+            self.templates.clear();
+            return;
+        };
+        self.templates = store.list().to_vec();
+    }
+
+    /// The template the popup has selected, if it is still in the list. A
+    /// template deleted in another window, or a name that no longer parses,
+    /// answers `None` rather than applying whatever is first in the list.
+    fn chosen_template(&self) -> Option<&bc_metadata::templates::MetadataTemplate> {
+        let name = self.template_choice.as_deref()?;
+        self.templates.iter().find(|template| template.name == name)
+    }
+
+    /// The values on screen for one file: what it holds on disk, plus the panel's
+    /// unsaved edits. A template captured from anything else would be a template
+    /// of a file the user was not looking at.
+    fn on_screen_metadata(&mut self, path: &Path) -> bc_metadata::Metadata {
+        let mut view = self
+            .exif_for(
+                path,
+                mtime_ns(std::fs::metadata(path).and_then(|m| m.modified()).ok()),
+            )
+            .unwrap_or_default();
+        for change in self.metadata_form.dirty_changes() {
+            change.apply(&mut view);
+        }
+        // The tag widgets hold their own pending state, and they are the fields
+        // most worth templating: keywords and a label are exactly what a shoot
+        // repeats across hundreds of files.
+        self.tags_form.current().apply_to(&mut view);
+        view
+    }
+
+    fn save_template_from(&mut self, path: &Path) {
+        let name = self.template_name.trim().to_string();
+        if name.is_empty() {
+            self.metadata_status = Some("A template needs a name.".to_string());
+            return;
+        }
+        let source = self.on_screen_metadata(path);
+        let template = template_apply::capture(&name, None, self.template_mode, &source);
+        if template_apply::describes(&template).is_empty() {
+            // A template that names nothing would apply as a no-op forever, and
+            // the user would only learn that by watching nothing happen.
+            self.metadata_status = Some(
+                "Nothing to save: the panel holds no values to put in a template.".to_string(),
+            );
+            return;
+        }
+        let outcome = match self.template_store() {
+            Some(store) => store.save(&template).map_err(|error| error.to_string()),
+            None => Err(self
+                .template_store_error
+                .clone()
+                .unwrap_or_else(|| "the template file could not be opened".to_string())),
+        };
+        match outcome {
+            Ok(replaced) => {
+                self.refresh_templates();
+                self.template_choice = Some(name.clone());
+                self.template_name.clear();
+                let verb = if replaced { "Replaced" } else { "Saved" };
+                self.metadata_status = Some(format!("{verb} template “{name}”"));
+                self.status = format!("{verb} metadata template “{name}”");
+            }
+            Err(reason) => {
+                self.metadata_status = Some(format!("Could not save template “{name}”: {reason}"));
+            }
+        }
+    }
+
+    fn delete_template(&mut self, name: &str) {
+        let outcome = match self.template_store() {
+            Some(store) => store.remove(name).map_err(|error| error.to_string()),
+            None => Err(self
+                .template_store_error
+                .clone()
+                .unwrap_or_else(|| "the template file could not be opened".to_string())),
+        };
+        match outcome {
+            Ok(true) => {
+                self.refresh_templates();
+                if self.template_choice.as_deref() == Some(name) {
+                    self.template_choice = None;
+                }
+                self.status = format!("Deleted template “{name}”. No files were touched.");
+            }
+            Ok(false) => {
+                self.refresh_templates();
+                self.status = format!("“{name}” was already gone; the list has been re-read.");
+            }
+            Err(reason) => self.status = format!("Could not delete “{name}”: {reason}"),
+        }
+    }
+
+    /// Apply the chosen template to `targets`, naming the files that did not
+    /// change as clearly as the ones that did.
+    fn apply_template_to(&mut self, targets: &[PathBuf]) {
+        let Some(template) = self.chosen_template().cloned() else {
+            self.metadata_status = Some("Choose a template first.".to_string());
+            return;
+        };
+        if targets.is_empty() {
+            self.metadata_status = Some("Nothing is selected to apply it to.".to_string());
+            return;
+        }
+        let report =
+            template_apply::apply_to_many(targets, &template, bc_metadata::WritePolicy::Auto);
+        let name = template.name.clone();
+
+        // Every file the template changed needs its caches dropped and its index
+        // row re-read, exactly as after a panel save: the row would otherwise keep
+        // the rating the sort and the tag filter answer from.
+        for path in &report.changed {
+            self.exif_cache.remove(path);
+            self.index_saved_tags(path);
+        }
+        // The open file needs its form reloaded, or the panel would go on showing
+        // what the template replaced.
+        if let Some(open) = self.metadata_form_path.as_deref() {
+            if report.changed.iter().any(|path| path == open) {
+                let stamp = mtime_ns(std::fs::metadata(open).and_then(|m| m.modified()).ok());
+                let saved = metadata_edit::read_panel_metadata(open);
+                self.metadata_form.load(&saved);
+                self.tags_form.load(&saved);
+                self.metadata_form_mtime = stamp;
+            }
+        }
+
+        let mut line = format!("Template “{name}”: {} file(s) updated", report.changed());
+        if !report.already_matching.is_empty() {
+            line.push_str(&format!(
+                ", {} already matching",
+                report.already_matching.len()
+            ));
+        }
+        if let Some((path, error)) = report.failures.first() {
+            line.push_str(&format!(
+                ", {} failed (first: {}): {error}",
+                report.failures.len(),
+                path.display()
+            ));
+        }
+        self.status = line.clone();
+        self.metadata_status = Some(line);
+    }
+
+    /// The template picker, save-as row and apply button, shared by the single-file
+    /// panel and the bulk editor. `targets_words` says what applying touches, so
+    /// the button cannot be read as acting on the wrong thing.
+    fn template_controls(&mut self, ui: &mut egui::Ui, targets: Vec<PathBuf>, targets_words: &str) {
+        // A disclosure rather than a permanent section, for two reasons that point
+        // the same way. The panel below the tags is already the busiest part of the
+        // window; and every control drawn here joins the tab order of the whole
+        // panel, which is how a template combo box came to swallow the Enter key
+        // that `every_tag_control_in_the_panel_does_something_when_activated` walks
+        // on its way to the keyword chip. Folded, the section costs the keyboard
+        // nothing until someone asks for it.
+        if let Some(error) = &self.template_store_error {
+            // Outside the disclosure, on purpose: a folded header hiding
+            // "unavailable" is a missing feature with a lid on it.
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                format!("Templates unavailable: {error}"),
+            );
+            return;
+        }
+        // Reading the store is a file read, so it happens when the panel first asks
+        // rather than once per frame — the same edge `refresh_collections` marks.
+        if self.templates.is_empty() && self.template_store.is_none() {
+            self.refresh_templates();
+        }
+
+        // Everything the body can trigger is *recorded* and acted on after the
+        // closure returns, so no store write or file write happens while the panel
+        // holds a borrow of itself.
+        let mut apply = false;
+        let mut delete: Option<String> = None;
+        let mut save_from: Option<PathBuf> = None;
+
+        egui::CollapsingHeader::new(format!("Templates ({})", self.templates.len()))
+            // Folded the first time, then remembered. `open` would drive it from a
+            // constant and the header would never open at all.
+            .default_open(false)
+            // The label counts the templates, which would otherwise *be* the id
+            // source: saving one would rename the header, and a renamed header is a
+            // different widget to egui, so the section the user just opened would
+            // snap shut under them.
+            .id_source("templates")
+            .show(ui, |ui| {
+                let names: Vec<String> = self.templates.iter().map(|t| t.name.clone()).collect();
+                ui.horizontal(|ui| {
+                    let selected = self
+                        .template_choice
+                        .clone()
+                        .unwrap_or_else(|| "template\u{2026}".to_string());
+                    egui::ComboBox::from_id_source("template_choice")
+                        .selected_text(selected)
+                        .show_ui(ui, |ui| {
+                            if names.is_empty() {
+                                ui.weak("No templates saved yet.");
+                            }
+                            for name in &names {
+                                ui.selectable_value(
+                                    &mut self.template_choice,
+                                    Some(name.clone()),
+                                    name,
+                                );
+                            }
+                        });
+                    // A per-file preview, but only from metadata the panel already
+                    // holds: working out what a template would change means reading
+                    // the target, and doing that once per frame is the same mistake
+                    // as a query in the paint path. No cache entry, no count — the
+                    // button still applies.
+                    let preview: Option<usize> = if targets.len() == 1 {
+                        self.chosen_template().and_then(|template| {
+                            self.exif_cache.get(&targets[0]).map(|(_, base)| {
+                                template_apply::plan(base, template).property_count()
+                            })
+                        })
+                    } else {
+                        None
+                    };
+                    let chosen = self.chosen_template().is_some();
+                    let apply_hover = if !chosen {
+                        "Pick a template from the list first.".to_string()
+                    } else {
+                        let mut line = match preview {
+                            Some(0) => "Nothing to change: this file already says \
+                                        everything the template holds."
+                                .to_string(),
+                            Some(count) => format!(
+                                "Writes {count} propert{} on this file, through the same \
+                                 storage policy as Save.",
+                                if count == 1 { "y" } else { "ies" }
+                            ),
+                            None => "Writes through the same storage policy as Save: in \
+                                     place for JPEG and TIFF, sidecar for the rest."
+                                .to_string(),
+                        };
+                        if targets.len() > 1 {
+                            line.push_str(&format!(
+                                " Files that already match are left untouched ({} selected).",
+                                targets.len()
+                            ));
+                        }
+                        line
+                    };
+                    if ui
+                        .add_enabled(
+                            chosen,
+                            egui::Button::new(format!("Apply to {targets_words}")).small(),
+                        )
+                        .on_hover_text(apply_hover)
+                        .clicked()
+                    {
+                        apply = true;
+                    }
+                    if let Some(name) = self.template_choice.clone() {
+                        if ui
+                            .small_button("\u{2715}")
+                            .on_hover_text(format!(
+                                "Delete the template \u{201c}{name}\u{201d}. No files are touched."
+                            ))
+                            .clicked()
+                        {
+                            delete = Some(name);
+                        }
+                    }
+                });
+
+                // What the chosen template holds, in panel order. This is the
+                // preview that makes the mode meaningful: the same lines applied as
+                // Merge and as Replace do different things, and a user who cannot
+                // see the values cannot reason about either.
+                if let Some(template) = self.chosen_template() {
+                    let lines = template_apply::describes(template);
+                    let mode = template_apply::mode_words(template.mode);
+                    ui.indent("template_preview", |ui| {
+                        for line in lines {
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(line).weak().small())
+                                    .selectable(false)
+                                    .truncate(true),
+                            );
+                        }
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!("Mode: {mode}")).weak().small(),
+                            )
+                            .selectable(false),
+                        );
+                    });
+                }
+
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [ui.available_width() - 96.0, 18.0],
+                        egui::TextEdit::singleline(&mut self.template_name)
+                            .hint_text("name this template")
+                            .font(egui::TextStyle::Small),
+                    );
+                    egui::ComboBox::from_id_source("template_mode")
+                        .selected_text(template_apply::mode_words(self.template_mode))
+                        .show_ui(ui, |ui| {
+                            for mode in [
+                                bc_metadata::templates::TemplateMode::Merge,
+                                bc_metadata::templates::TemplateMode::Replace,
+                                bc_metadata::templates::TemplateMode::Append,
+                            ] {
+                                ui.selectable_value(
+                                    &mut self.template_mode,
+                                    mode,
+                                    template_apply::mode_words(mode),
+                                );
+                            }
+                        });
+                });
+                ui.horizontal(|ui| {
+                    let named = !self.template_name.trim().is_empty();
+                    let replaces = named
+                        && self
+                            .templates
+                            .iter()
+                            .any(|t| t.name.eq_ignore_ascii_case(self.template_name.trim()));
+                    let label = if replaces { "Replace" } else { "Save as" };
+                    let hover = if replaces {
+                        "This overwrites the template with that name."
+                    } else {
+                        "Saves the values in this panel \u{2014} unsaved edits included \u{2014} \
+                         under the name above. A template only ever changes the fields it \
+                         holds values for."
+                    };
+                    if ui
+                        .add_enabled(named, egui::Button::new(format!("{label} current")).small())
+                        .on_hover_text(hover)
+                        .clicked()
+                    {
+                        save_from = targets.first().cloned();
+                    }
+                });
+            });
+
+        if apply {
+            self.apply_template_to(&targets);
+        }
+        if let Some(name) = delete {
+            self.delete_template(&name);
+        }
+        if let Some(path) = save_from {
+            self.save_template_from(&path);
+        }
     }
 
     /// Open the saved-search store, or explain why it cannot be opened.
@@ -2234,7 +2631,8 @@ impl BridgeApp {
                     ui.colored_label(
                         ui.visuals().warn_fg_color,
                         format!(
-                            "{count} condition(s) above cannot match anything, so nothing was                              counted. Fix them or remove them."
+                            "{count} condition(s) above cannot match anything, so nothing was \
+                             counted. Fix them or remove them."
                         ),
                     );
                 } else if editor.outstanding.is_some() {
@@ -2264,7 +2662,8 @@ impl BridgeApp {
                     let can_save =
                         !typed.is_empty() && problems.is_empty() && !store_unreadable;
                     let reason = if store_unreadable {
-                        "The saved-search file cannot be read, so nothing will be written over                          it."
+                        "The saved-search file cannot be read, so nothing will be written over \
+                             it."
                     } else if typed.is_empty() {
                         "A collection needs a name."
                     } else if !problems.is_empty() {
@@ -3453,6 +3852,10 @@ impl BridgeApp {
                 );
             }
         });
+        // Before the status line, so a template applied or saved by this frame's
+        // click is reported in the same frame it happened.
+        ui.separator();
+        self.template_controls(ui, vec![path.to_path_buf()], "this file");
         if let Some(status) = &self.metadata_status {
             ui.add(egui::Label::new(egui::RichText::new(status).small()).selectable(false));
         }
@@ -3704,6 +4107,8 @@ impl BridgeApp {
                 }
             }
 
+            ui.separator();
+            self.template_controls(ui, paths.clone(), &format!("{count} selected"));
             ui.separator();
             for path in paths.iter().take(200) {
                 ui.weak(
@@ -7371,6 +7776,502 @@ mod tests {
         );
     }
 
+    /// A PNG, so every tag and field write lands in a `.xmp` sidecar: the test can
+    /// then read exactly what the application wrote, and assert on the absence of a
+    /// sidecar as evidence that nothing was written at all.
+    fn png_file(root: &Path, name: &str) -> PathBuf {
+        let path = root.join(name);
+        std::fs::write(&path, [0x89u8, b'P', b'N', b'G', 0, 0, 0, 0]).unwrap();
+        path
+    }
+
+    fn sidecar_for(path: &Path) -> PathBuf {
+        bc_metadata::xmp::sidecar_path(path)
+    }
+
+    /// Put values into the panel's fields without a keyboard: the form is what the
+    /// template is captured from, so the test sets the same state the widgets would.
+    fn fill_form(app: &mut BridgeApp, pairs: &[(&str, &str)]) {
+        for value in app.metadata_form.values_mut() {
+            if let Some((_, want)) = pairs.iter().find(|(name, _)| *name == value.spec.id.name) {
+                value.current = (*want).to_string();
+            }
+        }
+    }
+
+    #[test]
+    fn a_template_saved_from_one_file_writes_the_other_file_it_is_applied_to() {
+        // The whole loop, through the widgets: capture the values on screen, find
+        // the template in the list, apply it to a different file, and read what
+        // that file now says off disk. Every step is the one a user takes.
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let source = png_file(&root, "source.png");
+        let target = png_file(&root, "target.png");
+        let mtime = 1_700_000_000_000_000_000;
+
+        let ctx = still_ctx();
+        let mut app = isolated_app(&ctx, &root, &data, &_stores);
+
+        // Load the source file's form, then type the values a template should keep.
+        panel_texts(&mut app, &ctx, &source, mtime);
+        fill_form(
+            &mut app,
+            &[("Artist", "J. Rivera"), ("Copyright", "© 2026 J. Rivera")],
+        );
+        assert!(
+            app.tags_form.add_keyword("Clients|ACME"),
+            "the fixture could not add a keyword"
+        );
+        app.template_name = "client work".to_string();
+        app.template_mode = bc_metadata::templates::TemplateMode::Merge;
+
+        // Reachable, not just available: the section is opened by a click on its
+        // header, the button is drawn, and a click on the drawn coordinates is what
+        // saves the template.
+        let words = panel_texts(&mut app, &ctx, &source, mtime);
+        assert!(
+            words.iter().any(|t| t == "Templates (0)"),
+            "the metadata panel has no template section: {words:?}"
+        );
+        assert!(
+            !words.iter().any(|t| t == "Save as current"),
+            "the section is drawn open before anyone asked for it: {words:?}"
+        );
+        click_panel(&mut app, &ctx, &source, mtime, "Templates (0)");
+        let opened = panel_texts(&mut app, &ctx, &source, mtime);
+        assert!(
+            opened.iter().any(|t| t == "Save as current"),
+            "opening the section does not offer to save a template: {opened:?}"
+        );
+        click_panel(&mut app, &ctx, &source, mtime, "Save as current");
+
+        assert_eq!(app.templates.len(), 1, "the template was not listed");
+        let document = bc_core::MetadataTemplates::open_default().unwrap();
+        let stored = document
+            .get("client work")
+            .expect("saved in memory but not on disk");
+        assert_eq!(
+            stored.metadata.text(bc_metadata::NS_EXIF, "Artist"),
+            Some("J. Rivera")
+        );
+        assert_eq!(
+            bc_metadata::keywords::subjects(&stored.metadata),
+            vec!["Clients|ACME".to_string()],
+            "the keyword hierarchy was not carried into the template"
+        );
+        assert_eq!(stored.mode, bc_metadata::templates::TemplateMode::Merge);
+        assert!(
+            app.status.contains("Saved template") || app.status.contains("client work"),
+            "{}",
+            app.status
+        );
+
+        // Now the other file: same panel, different subject, apply. The section is
+        // one widget of the panel rather than one per file, so it is still open
+        // from the click above — clicking its header again would fold it.
+        panel_texts(&mut app, &ctx, &target, mtime);
+        app.template_choice = Some("client work".to_string());
+        let before = panel_texts(&mut app, &ctx, &target, mtime);
+        assert!(
+            before.iter().any(|t| t == "Apply to this file"),
+            "no apply button next to the chosen template: {before:?}"
+        );
+        click_panel(&mut app, &ctx, &target, mtime, "Apply to this file");
+
+        assert!(
+            app.status
+                .starts_with("Template “client work”: 1 file(s) updated"),
+            "the apply did not report one file changed: {}",
+            app.status
+        );
+        let written = metadata_edit::read_panel_metadata(&target);
+        assert_eq!(
+            written.text(bc_metadata::NS_EXIF, "Artist"),
+            Some("J. Rivera"),
+            "the sidecar does not say what the template said"
+        );
+        assert_eq!(
+            written.text(bc_metadata::NS_EXIF, "Copyright"),
+            Some("© 2026 J. Rivera")
+        );
+        assert_eq!(
+            bc_metadata::keywords::subjects(&written),
+            vec!["Clients|ACME".to_string()]
+        );
+        assert!(
+            sidecar_for(&target).exists(),
+            "the write went somewhere other than the sidecar"
+        );
+        assert!(
+            !sidecar_for(&source).exists(),
+            "applying a template wrote to the file it was captured from as well"
+        );
+
+        // And the panel now shows the values it just wrote, rather than the empty
+        // form it had when the click happened.
+        let after = panel_texts(&mut app, &ctx, &target, mtime);
+        assert!(
+            after.iter().any(|t| t == "J. Rivera"),
+            "the panel did not reload after applying: {after:?}"
+        );
+
+        // The panel draw above re-read the file into `exif_cache`, so a stale
+        // entry here would be a stale preview, a stale rating badge and a tag
+        // filter answering from what the file said before the template touched it.
+        let (_, cached) = app
+            .exif_cache
+            .get(&target)
+            .expect("drawing the panel leaves nothing cached to check");
+        assert_eq!(
+            cached.text(bc_metadata::NS_EXIF, "Artist"),
+            Some("J. Rivera"),
+            "the cache still says what the file said before the apply"
+        );
+    }
+
+    #[test]
+    fn an_applied_template_drops_the_cached_view_of_every_file_it_wrote() {
+        // The claim the panel assertion cannot make: this filesystem serves the
+        // same modification timestamp across a stretch of same-size writes (the
+        // tech-debt entry that measures it says 149 of 400), so an mtime-checked
+        // cache is not by itself enough to notice a write. The apply has to drop
+        // the entries it invalidated, and that is observable without staging a
+        // timestamp collision: check the cache immediately, before any draw can
+        // refill it.
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let target = png_file(&root, "target.png");
+        let mtime = 1_700_000_000_000_000_000;
+
+        let ctx = still_ctx();
+        let mut app = isolated_app(&ctx, &root, &data, &_stores);
+        panel_texts(&mut app, &ctx, &target, mtime);
+        assert!(
+            app.exif_cache.contains_key(&target),
+            "the fixture never populated the cache the apply is meant to drop"
+        );
+
+        let filled = {
+            let mut meta = bc_metadata::Metadata::new();
+            meta.set_text(bc_metadata::NS_EXIF, "Artist", "J. Rivera".to_string());
+            meta
+        };
+        let template = template_apply::capture(
+            "artist",
+            None,
+            bc_metadata::templates::TemplateMode::Replace,
+            &filled,
+        );
+        let store = app.template_store().expect("the store opens");
+        store.save(&template).unwrap();
+        app.refresh_templates();
+        app.template_choice = Some("artist".to_string());
+
+        app.apply_template_to(std::slice::from_ref(&target));
+        assert!(
+            app.status
+                .starts_with("Template “artist”: 1 file(s) updated"),
+            "{}",
+            app.status
+        );
+        assert!(
+            !app.exif_cache.contains_key(&target),
+            "the file was written and its cached view survived"
+        );
+
+        // And a file the template did not write keeps its entry. Dropping
+        // everything on every apply would re-read a whole library because one
+        // file changed, which is the opposite failure.
+        let other = png_file(&root, "other.png");
+        let mut already = bc_metadata::Metadata::new();
+        already.set_text(bc_metadata::NS_EXIF, "Artist", "J. Rivera".to_string());
+        bc_metadata::xmp::write_xmp_file(&sidecar_for(&other), &already).unwrap();
+        panel_texts(&mut app, &ctx, &other, mtime);
+        assert!(
+            app.exif_cache.contains_key(&other),
+            "nothing cached the second file, so this half of the check is blind"
+        );
+        app.apply_template_to(std::slice::from_ref(&other));
+        assert!(
+            app.status.contains("0 file(s) updated"),
+            "the unchanged file was not reported as such: {}",
+            app.status
+        );
+        assert!(
+            app.exif_cache.contains_key(&other),
+            "an apply that wrote nothing dropped a cache entry it had no reason to touch"
+        );
+    }
+
+    #[test]
+    fn applying_a_template_that_changes_nothing_writes_no_file() {
+        // The property behind "already matching" is a file-side guarantee, not a
+        // wording one. The tag writer creates a sidecar where none exists, so a
+        // no-op apply that still called it would litter a library with `.xmp`
+        // files for a template that changed nothing — and on a selection of four
+        // hundred, that is four hundred files the user never asked for.
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let one = png_file(&root, "one.png");
+        let two = png_file(&root, "two.png");
+
+        // `one` already carries what the template holds; `two` carries nothing.
+        let mut filled = bc_metadata::Metadata::new();
+        filled.set_text(bc_metadata::NS_EXIF, "Artist", "J. Rivera".to_string());
+        bc_metadata::xmp::write_xmp_file(&sidecar_for(&one), &filled).unwrap();
+
+        let template = template_apply::capture(
+            "artist",
+            None,
+            bc_metadata::templates::TemplateMode::Replace,
+            &filled,
+        );
+        let report = template_apply::apply_to_many(
+            &[one.clone(), two.clone()],
+            &template,
+            bc_metadata::WritePolicy::Auto,
+        );
+        assert_eq!(
+            report.changed,
+            vec![two.clone()],
+            "the wrong file was written"
+        );
+        assert_eq!(
+            report.already_matching,
+            vec![one.clone()],
+            "the file that needed nothing was not counted as already matching"
+        );
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+    }
+
+    #[test]
+    fn a_template_with_no_values_is_refused_rather_than_saved_as_a_no_op() {
+        // A template that names nothing applies as nothing, forever, and the only
+        // way a user finds that out is by watching four hundred files not change.
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let blank = png_file(&root, "blank.png");
+        let mtime = 1_700_000_000_000_000_000;
+
+        let ctx = still_ctx();
+        let mut app = isolated_app(&ctx, &root, &data, &_stores);
+        panel_texts(&mut app, &ctx, &blank, mtime);
+        app.template_name = "nothing".to_string();
+        click_panel(&mut app, &ctx, &blank, mtime, "Templates (0)");
+        click_panel(&mut app, &ctx, &blank, mtime, "Save as current");
+
+        assert!(
+            app.metadata_status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Nothing to save"),
+            "an empty template was accepted: {:?}",
+            app.metadata_status
+        );
+        assert!(app.templates.is_empty(), "the empty template was kept");
+        assert!(
+            !bc_core::MetadataTemplates::open_default()
+                .unwrap()
+                .path()
+                .exists(),
+            "a refused save still created the template document"
+        );
+
+        // An unnamed template is refused twice over: the button is disabled, so a
+        // click cannot even reach the save, and the save itself refuses. Both
+        // matter — the first is what the user sees, the second is what happens if
+        // a future control calls the save directly — so each gets its own claim.
+        app.template_name = "   ".to_string();
+        fill_form(&mut app, &[("Artist", "Someone")]);
+        panel_texts(&mut app, &ctx, &blank, mtime);
+        let before_click = app.metadata_status.clone();
+        click_panel(&mut app, &ctx, &blank, mtime, "Save as current");
+        assert_eq!(
+            app.metadata_status, before_click,
+            "a click on a blank name did something, so the control is not disabled"
+        );
+        assert!(app.templates.is_empty(), "the blank name made a template");
+
+        app.save_template_from(&blank);
+        // The store would also refuse a blank name, so the assertion asks for
+        // *this* guard's words: if the panel stopped checking, the failure would
+        // arrive as "Could not save template ”: …" and say the wrong thing about
+        // what went wrong.
+        assert_eq!(
+            app.metadata_status.as_deref(),
+            Some("A template needs a name."),
+            "the panel's own blank-name guard did not fire"
+        );
+        assert!(app.templates.is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_template_document_is_reported_and_never_overwritten() {
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let photo = png_file(&root, "photo.png");
+        let mtime = 1_700_000_000_000_000_000;
+
+        let ctx = still_ctx();
+        let mut app = isolated_app(&ctx, &root, &data, &_stores);
+        let file = bc_core::MetadataTemplates::open_default()
+            .unwrap()
+            .path()
+            .to_path_buf();
+        std::fs::write(&file, b"{ this is not json").unwrap();
+        let before = std::fs::read(&file).unwrap();
+
+        // The panel has to say the file is unreadable rather than show an empty
+        // list, and the save control must not look like it worked.
+        panel_texts(&mut app, &ctx, &photo, mtime);
+        let words = panel_texts(&mut app, &ctx, &photo, mtime);
+        assert!(
+            words.iter().any(|t| t.contains("Templates unavailable")),
+            "the panel hid an unreadable template file: {words:?}"
+        );
+        assert!(
+            !words.iter().any(|t| t.starts_with("Templates (")),
+            "an unreadable store still offered a section to open: {words:?}"
+        );
+        app.template_name = "doomed".to_string();
+        fill_form(&mut app, &[("Artist", "Someone")]);
+        panel_texts(&mut app, &ctx, &photo, mtime);
+        assert!(
+            !words.iter().any(|t| t == "Save as current"),
+            "the section offered to save into a file it cannot read: {words:?}"
+        );
+
+        app.save_template_from(&photo);
+        assert!(
+            app.metadata_status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("could not be read"),
+            "saving into an unreadable store should refuse: {:?}",
+            app.metadata_status
+        );
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            before,
+            "a refused save still overwrote the user's templates"
+        );
+    }
+
+    #[test]
+    fn the_bulk_panel_offers_templates_and_leaves_already_matching_files_alone() {
+        // Bulk is where a template is worth anything, and where an accidental
+        // clear is worth the most: the same rule has to hold across a selection.
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let one = png_file(&root, "a.png");
+        let two = png_file(&root, "b.png");
+        let three = png_file(&root, "c.png");
+        let mut filled = bc_metadata::Metadata::new();
+        filled.set_text(bc_metadata::NS_EXIF, "Artist", "J. Rivera".to_string());
+        bc_metadata::xmp::write_xmp_file(&sidecar_for(&one), &filled).unwrap();
+        let untouched = std::fs::read(sidecar_for(&one)).unwrap();
+
+        let ctx = still_ctx();
+        let mut app = isolated_app(&ctx, &root, &data, &_stores);
+        app.right_tab = RightTab::Metadata;
+        // Selected by name, not `select_all`: the folder also lists `a.xmp`, which
+        // is a sidecar *and* a file, so taking the whole listing would aim the
+        // template at it too. There it is its own sidecar — `sidecar_path` is
+        // `with_extension("xmp")`, which maps `a.xmp` to itself — so the counts
+        // below would describe a write into the metadata file rather than into a
+        // photograph. Odd enough to name here and worth a policy decision of its
+        // own, recorded in Tech debt.
+        let wanted = ["a.png", "b.png", "c.png"];
+        let indices: Vec<usize> = app
+            .browser
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                entry
+                    .path
+                    .file_name()
+                    .is_some_and(|name| wanted.contains(&name.to_string_lossy().as_ref()))
+            })
+            .map(|(idx, _)| idx)
+            .collect();
+        assert_eq!(indices.len(), 3, "the fixture lost a file: {indices:?}");
+        app.browser.selection.select_only(indices[0]);
+        for idx in &indices[1..] {
+            app.browser.selection.toggle(*idx);
+        }
+
+        let template = template_apply::capture(
+            "artist",
+            None,
+            bc_metadata::templates::TemplateMode::Merge,
+            &filled,
+        );
+        let replaced = app.template_store().unwrap().save(&template).unwrap();
+        assert!(!replaced, "a fresh template store had something to replace");
+        app.refresh_templates();
+        app.template_choice = Some("artist".to_string());
+
+        click_right_panel(&mut app, &ctx, "Templates (1)");
+        let words = right_panel_texts(&mut app, &ctx);
+        assert!(
+            words.iter().any(|t| t == "Templates (1)"),
+            "the bulk panel has no template section: {words:?}"
+        );
+        assert!(
+            words.iter().any(|t| t == "Apply to 3 selected"),
+            "the bulk apply button does not say what it touches: {words:?}"
+        );
+
+        click_right_panel(&mut app, &ctx, "Apply to 3 selected");
+        assert!(
+            app.status
+                .starts_with("Template “artist”: 2 file(s) updated, 1 already matching"),
+            "the bulk apply miscounted: {}",
+            app.status
+        );
+        // The file that already had the artist keeps its sidecar as it was, and the
+        // two empty ones gain theirs.
+        for path in [&two, &three] {
+            assert_eq!(
+                metadata_edit::read_panel_metadata(path).text(bc_metadata::NS_EXIF, "Artist"),
+                Some("J. Rivera"),
+                "{} was not stamped",
+                path.display()
+            );
+        }
+        assert_eq!(
+            std::fs::read(sidecar_for(&one)).unwrap(),
+            untouched,
+            "the already-matching file was rewritten anyway"
+        );
+    }
+
     #[test]
     fn a_collection_of_rules_only_runs_from_the_sidebar_and_says_so_about_itself() {
         // The run path is what makes authoring worth doing, and a rules-only
@@ -9296,6 +10197,17 @@ mod tests {
         panic!("the keyword suggestions never answered");
     }
 
+    /// A context with egui's collapse animation switched off. A
+    /// `CollapsingHeader` reveals its body over several frames otherwise — probed:
+    /// one row per frame — so a test that opens a section and then looks for a
+    /// widget inside it sees only the first row and concludes the control is
+    /// missing. The animation is right in the app and wrong for an assertion.
+    fn still_ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        ctx.style_mut(|style| style.animation_time = 0.0);
+        ctx
+    }
+
     /// Draw the metadata panel for one file and return every string it wrote.
     fn panel_texts(
         app: &mut BridgeApp,
@@ -9307,7 +10219,7 @@ mod tests {
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::pos2(0.0, 0.0),
-                egui::vec2(420.0, 1_400.0),
+                egui::vec2(420.0, 3_000.0),
             )),
             time: Some(next_frame_time()),
             ..Default::default()
@@ -9337,22 +10249,33 @@ mod tests {
             .collect()
     }
 
-    /// Draw the right-hand panel the way the app does, which chooses the bulk
-    /// form whenever more than one file is selected.
+    /// Draw the right-hand panel the way the app does, which chooses the bulk form
+    /// whenever more than one file is selected.
+    ///
+    /// `exact_width` is not cosmetics: a `SidePanel` with no fixed width shrinks or
+    /// grows to fit its content, so each pass moves everything inside it — measured
+    /// at 246, 148, 80, 31, 26 px across five passes as one section opened. A helper
+    /// that finds a widget in one pass and clicks it in the next would then aim at a
+    /// coordinate that no longer holds that widget, and the failure looks exactly like
+    /// a control that does not respond.
     fn right_panel_texts(app: &mut BridgeApp, ctx: &egui::Context) -> Vec<String> {
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::pos2(0.0, 0.0),
-                egui::vec2(420.0, 1_600.0),
+                egui::vec2(420.0, 3_000.0),
             )),
             time: Some(next_frame_time()),
             ..Default::default()
         };
         let _ = ctx.run(raw.clone(), |ctx| {
-            egui::SidePanel::right("probe").show(ctx, |ui| app.metadata_panel(ui));
+            egui::SidePanel::right("probe")
+                .exact_width(380.0)
+                .show(ctx, |ui| app.metadata_panel(ui));
         });
         let out = ctx.run(raw, |ctx| {
-            egui::SidePanel::right("probe").show(ctx, |ui| app.metadata_panel(ui));
+            egui::SidePanel::right("probe")
+                .exact_width(380.0)
+                .show(ctx, |ui| app.metadata_panel(ui));
         });
         out.shapes
             .iter()
@@ -9372,7 +10295,7 @@ mod tests {
         let raw = |events: Vec<egui::Event>| egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::pos2(0.0, 0.0),
-                egui::vec2(420.0, 1_600.0),
+                egui::vec2(420.0, 3_000.0),
             )),
             time: Some(next_frame_time()),
             events,
@@ -9380,7 +10303,9 @@ mod tests {
         };
         let at = {
             let out = ctx.run(raw(vec![]), |ctx| {
-                egui::SidePanel::right("probe").show(ctx, |ui| app.metadata_panel(ui));
+                egui::SidePanel::right("probe")
+                    .exact_width(380.0)
+                    .show(ctx, |ui| app.metadata_panel(ui));
             });
             let drawn: Vec<(String, egui::Rect)> = out
                 .shapes
@@ -9408,7 +10333,9 @@ mod tests {
                 })
         };
         let _ = ctx.run(raw(vec![egui::Event::PointerMoved(at)]), |ctx| {
-            egui::SidePanel::right("probe").show(ctx, |ui| app.metadata_panel(ui));
+            egui::SidePanel::right("probe")
+                .exact_width(380.0)
+                .show(ctx, |ui| app.metadata_panel(ui));
         });
         let _ = ctx.run(
             raw(vec![
@@ -9417,7 +10344,9 @@ mod tests {
                 button(at, false),
             ]),
             |ctx| {
-                egui::SidePanel::right("probe").show(ctx, |ui| app.metadata_panel(ui));
+                egui::SidePanel::right("probe")
+                    .exact_width(380.0)
+                    .show(ctx, |ui| app.metadata_panel(ui));
             },
         );
     }
@@ -9435,7 +10364,7 @@ mod tests {
             let raw = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::pos2(0.0, 0.0),
-                    egui::vec2(420.0, 1_400.0),
+                    egui::vec2(420.0, 3_000.0),
                 )),
                 time: Some(next_frame_time()),
                 ..Default::default()

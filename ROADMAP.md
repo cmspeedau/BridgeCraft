@@ -50,7 +50,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 
 *Note: the phase is closed with that one item intentionally deferred — the metadata reader (Phase 3, #5/#6) is a hard dependency, and camera RAW already fast-paths the camera's embedded preview internally. It will be picked up as part of the metadata work in `#5–#19`.*
 
-## Phase 3 — Metadata Engine (Weeks 15–26) — ◐ read and write complete for XMP/EXIF/IPTC layers, and saved collections are authored through a rule editor; a metadata template UI remains
+## Phase 3 — Metadata Engine (Weeks 15–26) — ◐ read and write complete for XMP/EXIF/IPTC layers, saved collections authored through a rule editor, and metadata templates saved and applied from the panel; PNG in-place XMP and IPTC-in-TIFF writing remain
 - [x] EXIF reading in `bc-metadata`: pure-Rust TIFF/EXIF parser (JPEG `APP1` + TIFF/DNG containers), both byte orders, IFD0 + Exif + GPS sub-IFDs + thumbnail-IFD reference; IFD loops and absurd counts are `Malformed`, malformed input never panics; hand-built fixture tests plus a real-camera check gated behind `RAW_SAMPLE` (issue #6)
 - [x] Metadata panel: Camera Data (EXIF) section for the selected file — camera, taken, exposure, aperture, ISO, focal length, orientation, color space, software, EXIF size, GPS — above File Properties; cached per path + modified time
 - [~] Embedded metadata read/write: EXIF read (issue #5 model) and EXIF write for JPEG/TIFF (issue #7) landed; IPTC-IIM read/write for JPEG APP13 (issue #8); XMP sidecar read/write (issue #9). **Reading is complete** (`bc-metadata::embedded`): the XMP packet in JPEG `APP1` and TIFF tag 700, the Photoshop resource block in TIFF tag 34377, and a raw IIM dataset in TIFF tag 33723. **Writing**: the XMP packet now goes into JPEG and TIFF in place, with an existing sidecar updated in the same save and written first (design/0005 §4, signed off). Still open: PNG (needs an `iTXt` writer, sidecar in the meantime) and writing IPTC-IIM back into TIFF containers
@@ -59,7 +59,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [x] Write policy signed off (2026-11-15): tags go in place for JPEG/TIFF, sidecar for RAW and PNG, and an existing sidecar is synced, written first. Recorded in `docs/design/0005-structured-metadata-model.md` §4 with an implementation status table, and §3's read precedence is now implemented in the panel chain
 - [x] XMP sidecar read/write (`.xmp` files) — `bc-metadata::xmp` (parse/serialize + atomic file I/O)
 - [x] Metadata panel with editable fields: grouped list, dirty tracking, Save/Revert via the #5 write policy (`bc-ui::metadata_edit`), multi-selection bulk editor with per-file failure reporting. Sidecar properties now merge in full, so `dc:` and `xmp:` values written by this app or another tool reach the panel instead of being filtered out
-- [~] Custom metadata templates: `bc-metadata::templates` has the model (Replace/Merge/Append), JSON persistence (`<data>/BridgeCraft/metadata_templates`) and tests, but nothing calls it: no save/apply UI and no path that writes a template onto a file
+- [x] Custom metadata templates: a **Templates (N)** disclosure at the bottom of the metadata panel, in both its single-file and bulk forms. It lists the saved templates, shows what the chosen one holds and in which mode, applies it to the file or to the selection, and saves the values currently in the panel — unsaved edits included — under a new name. Applying goes through the two writers the panel already uses (`FieldChange` for the text fields, `TagStamp` for rating/label/flag/keywords), so a template cannot reach a storage policy the user has not already accepted. The rule that keeps it safe: **a template changes only the properties it names** — the engine's `Replace` replaces the whole property map, which for a template holding a copyright line would otherwise mean clearing the description, the artist and the keywords of every file it is pointed at. Capture also names only the fields the bulk editor will stamp, so a template taken from a JPEG cannot carry that camera's Make onto another maker's files; and a file the template leaves unchanged is not written at all, which is what keeps "apply to 400 selected" from creating 400 sidecars for nothing. `bc_core::MetadataTemplates` keeps them in `metadata-templates.json` in the data directory, versioned, written atomically, and never overwritten when it cannot be parsed; the status line distinguishes files updated from files that already matched
 - [x] Keyword hierarchy management & tagging: `bc-metadata::keywords` (dc:subject `Parent|Child` convention, tree/type-ahead/tag-count logic) plus a panel editor in `bc-ui::tag_widgets`: chips that remove on click, an add field, and completions drawn from the hierarchy the file already carries. Bulk add and remove across a selection. Completions now come from the whole library rather than from the file alone — see the saved-searches line below
 - [x] Star ratings, color labels, approve/reject flags: `bc-metadata::ratings` (XMP `xmp:Rating`, `photoshop:Label`, BridgeCraft `Flag`) plus the panel editor: five drawn stars, the label chips, Approve/Reject/No flag. Clicking the current rating clears it — which means the property leaves the JPEG or TIFF too, not just the panel: an embedded save now states whether it is the whole tag state (`TagWrite::Replace`) or a partial update (`Merge`), because a metadata that omits `xmp:Rating` cannot otherwise tell "cleared" from "not touched", and until that distinction existed a cleared star kept its old value in the file forever. Each property is stampable on its own in the bulk editor, so "set the rating, leave the labels alone" is explicit. Tags write to the XMP sidecar, never into the image bytes, because there is no EXIF equivalent and embedded XMP is still open
 - [x] Rating and label display: label dot on the grid thumbnail, dot on list rows, and Rating plus Label columns in the details view, with the header sharing the row column math
@@ -129,7 +129,7 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 |---|---|---|---|
 | M1 — Browser MVP | Q1 2027 | Browse, sort, filter, live refresh, thumbnails, basic file ops | ◐ shipped including internal drag & drop; remaining: grid failure states, folder-open error surfacing, outbound OS drag |
 | M2 — Preview Engine | Q2 2027 | RAW/PSD/PDF/video previews with caching | ✅ PNG/JPEG/GIF/WebP/TIFF/BMP + video/PDF/camera RAW (runtime libs) + PSD/AI + SQLite cache + preview/1:1 zoom viewer |
-| M3 — Metadata Complete | Q3 2027 | XMP/EXIF/IPTC read-write, smart collections | ◐ EXIF read/write, IPTC-IIM, XMP sidecars, the editable panel, the tag editor, and embedded XMP read **and write** for JPEG/TIFF with the documented precedence are shipped, as are saved collections and their rule editor; PNG in-place XMP and IPTC-in-TIFF writing remain |
+| M3 — Metadata Complete | Q3 2027 | XMP/EXIF/IPTC read-write, smart collections | ◐ EXIF read/write, IPTC-IIM, XMP sidecars, the editable panel, the tag editor, and embedded XMP read **and write** for JPEG/TIFF with the documented precedence are shipped, as are saved collections with their rule editor and metadata templates with a save/apply UI; PNG in-place XMP and IPTC-in-TIFF writing remain |
 | M4 — Automation | Q4 2027 | Batch ops, scripting API | ◐ batch rename, export pipeline + jobs UI, contact-sheet core, watched-folder automation and the WASM sandbox done; scripting and contact-sheet UI remain |
 | M5 — Integrations | 2028 | Plugin system, ArtCraft bridge plugin, PhotoCraft and LightCraft desktop integrations | ◐ plugin system, plugin manager and PhotoCraft/LightCraft launch actions shipped; ArtCraft not started, plugin panels and hand-off wiring remain |
 | M6 — 1:1 Parity Audit & Release | 2028 | Feature checklist parity vs. Bridge 2026 user guide; universal macOS build, Windows portable+MSI, AppImage+.zsync published (unsigned) | not started |
@@ -139,9 +139,9 @@ With ADR-0001 resolved (egui/eframe), the Phase 1 shell shipped (filter, live re
 
 What is left on the critical path, in the order that unblocks the most:
 
-1. **Index-backed tags.** Done for sorting and filtering, which is where the index was the only way to do the job at all: ordering a folder by stars needs every file's rating, and reading every file costs 14.9 µs each against 1.3 µs each for one indexed range query. What this slice measured and then *rejected* was the plan I wrote in the previous commit — "the grid and details overlays stat and parse a sidecar plus a packet for every visible row each frame; that belongs in `metadata_index`". The overlays cache on the file's own mtime, so a frame costs 2.3 µs per visible row and can never show a stale tag, while a per-file index lookup costs 98 µs — 6.6× slower than parsing the file, and permitted to lag it. Per-row display stays as it is; the remaining per-file work here is cross-library keyword suggestions and the panel's full layer read, both of which need more than the four tag columns the index holds.
+1. **Index-backed tags.** Done for sorting and filtering, which is where the index was the only way to do the job at all: ordering a folder by stars needs every file's rating, and reading every file costs 14.9 µs each against 1.3 µs each for one indexed range query. What this slice measured and then *rejected* was the plan I wrote in the previous commit — "the grid and details overlays stat and parse a sidecar plus a packet for every visible row each frame; that belongs in `metadata_index`". The overlays cache on the file's own mtime, so a frame costs 2.3 µs per visible row and can never show a stale tag, while a per-file index lookup costs 98 µs — 6.6× slower than parsing the file, and permitted to lag it. Per-row display stays as it is. Cross-library keyword suggestions — the other half of that older note — shipped in slice 14; what still needs more than the four tag columns the index holds is the panel's full layer read, which keeps parsing the file so a saved star shows up immediately.
 2. ~~A rule editor for saved collections~~ — shipped: `Edit rules…` authors words, conditions, combinator and scope, with a live match count from the worker. What that item also settled was that the remaining authorship gap is *typed ergonomics*, not the query model: the fields the index stores but the editor does not offer (size, dates, dimensions) need unit and date controls, not a new query language.
-3. **Contact sheets, publish presets, metadata templates and version stacks** wired into the UI: all implemented, tested and unreachable.
+3. **Contact sheets, publish presets and version stacks** wired into the UI: all implemented, tested and unreachable. Metadata templates came off this list in slice 15; what that taught worth keeping is in the slice log — the safety question was never the merge rules but *which properties a template is allowed to name*, and the answer ("only the ones it holds, and only the bulk-stampable fields") is what made the engine safe to reach.
 4. ~~The data-path cleanup~~ — done: the thumbnail cache moved into the data directory and the CWD is no longer written to. Atomic persistence for `favorites.json` and `recents.json` is the remaining sibling of that work, listed under Tech debt rather than here.
 5. **Tags for PNG and WebP exports, and IPTC-IIM written back into TIFF.** Each needs a container writer that does not exist yet; until then the export dialog says plainly that these formats carry no tags.
 
@@ -158,6 +158,23 @@ M1's remaining items are the two surfacing defects (failed-versus-pending thumbn
 - **`TagWrite::Replace` and `TagWrite::Merge` are one bit of intent every tag writer must state.** Absence of a tag property in a metadata means either "the user cleared it" or "this save does not touch tags", and the two need opposite results. The panel and export use `Replace`; a partial update uses `Merge`. Nothing can tell them apart from the data, so the parameter is mandatory rather than defaulted — the default is exactly what made clearing silently fail for embedded packets.
 - **Persistence is atomic and single-sourced; one store still adopts before it writes.** `favorites.json`, `recents.json`, `saved-searches.json`, the version-stack file and the watched-folder state all write through `bc_core::paths::write_atomic` now (the helper moved out of `auto_process` rather than being copied), and `favorites`/`recents` additionally write the *candidate* list before adopting it, so a save that fails leaves the on-screen list and the file agreeing. Two residuals. `version_stacks` still mutates in memory before persisting at eight call sites — it is atomic, so a crash cannot corrupt the file, but a failed save leaves the session showing a stack that is not on disk; it is listed as deferred not because it is fine but because the feature has no UI at all, so nobody can experience it, and the same argument applied to it eight times is how this file keeps accruing debts.
 - **Two path bugs that only surfaced because the rename journal was drawn twice.** `bc-ui::batch_rename_ui::journal_path` had its own copy of the platform rules and an XDG-only one, so a macOS or Windows launch wrote the undo journal somewhere every other store ignores; and the watched-folder action derived the same journal from the *configuration* directory while the dialog derived it from the *data* directory, so a rename made by a rule could not be undone from the dialog and vice versa. Both now resolve through `paths::rename_journal_path`, and `both_rename_journal_writers_resolve_the_same_file` asserts the agreement through `AutoProcessor::open_default` rather than comparing the helper with itself. Five call sites that hand-appended `"BridgeCraft"` (`favorites`, `recents`, `trash`, `plugins`, `photocraft`, `version_stacks`) were moved onto the helpers, and `recents::user_data_dir` — the alias those sites leaned on — is deleted. One consequence of settling the journal on the data directory: an undo journal a previous build left in the configuration directory is no longer read, so a rename that was waiting to be undone across a restart loses that history. Nothing else about it is affected, the file is left where it is for anyone who wants it, and the journal is a transient record of one dialog action rather than user-authored content — which is why no migration was written for it.
+
+- **A sidecar is a file in the listing, so it can be selected like an asset — and a
+  template applied to it.** `sidecar_path` is `with_extension("xmp")`, which maps `a.xmp` to
+  itself, so a selected sidecar is its own target: the write lands inside the metadata
+  document rather than beside a photograph. Nothing crashes and nothing is lost (the same
+  properties are written), but a bulk apply over a folder that shows its sidecars reports
+  one more file changed than there are images, and the `Thumbnails only` toggle is the only
+  thing keeping sidecars out of a selection in the first place. The decision this needs is a
+  listing-policy one — whether a sidecar should ever have had a row — and it is the same
+  question the indexing note below has been carrying since slice 9, now with a write path
+  attached to it.
+- **A template apply writes a file twice when it changes both halves.** Text fields go
+  through `apply_changes_to_path` and the four tag properties through the stamp path, because
+  those are the two writers the panel already had and reusing them was the point. On an
+  in-place JPEG that is two reads and two rewrites of the same file per apply. It is correct,
+  and it is the slowest thing in the panel; a single-pass writer that takes fields and tags
+  together is the fix, and it should be measured before it is attempted for its own sake.
 
 - **Suggestions reach the two keyword boxes, not the rule editor's.** The dialog's keyword
   row takes free text with no completions, because there is one suggestion state and the
@@ -518,6 +535,107 @@ reported wrongly.
   collection, not tolerable now that a button does. Named in Tech debt with the
   fix (their own store beside favourites and recents) and with the version field
   that makes the move a copy rather than a rewrite.
+
+### Metadata templates that can only change what they name (slice 15, shipped 2026-11-19)
+
+Critical path item 3 said four engines were "implemented, tested and unreachable".
+This slice wires one of them, and the reason it took a slice rather than an afternoon
+is that the interesting problem was not the merge rules — `bc_metadata::templates`
+already had those and they are fine — it was deciding what a template is *allowed to
+name*, which is a question the engine cannot ask because it has no idea which of a
+file's properties a human meant to overwrite.
+
+- **The second consecutive stale deferral note.** Phase 3's line said templates waited
+  on "no path that writes a template onto a file". There were two, and both were
+  reachable from the panel: `apply_changes` for the text fields and `TagStamp` for the
+  four tag properties. Yesterday's lesson was that a roadmap claim about what is missing
+  needs checking before it is built on; today it was the same lesson in the other
+  direction — the missing piece was not a writer but a *projection*, and the writers were
+  already there.
+- **`Replace` meant "erase the file".** The engine's `TemplateMode::Replace` assigns the
+  template's property map over the target's, so a template holding one copyright line,
+  applied to a file with a description, an artist and six keywords, drops all of them. No
+  user means that by "overwrite existing values", and no preview would have warned them in
+  time across four hundred files. So the plan is built **property by property over the
+  properties the template names**, and the mode decides what happens to those. The engine
+  still does the merge — one definition of the three modes — and the projection reads only
+  the parts of its answer that correspond to a named property. `a_template_names_only_the_
+  fields_that_hold_something` checks all three modes against a file that has fields the
+  template never mentions.
+- **A template cannot carry someone else's camera.** Capture takes only the fields the
+  bulk editor will stamp (`spec.bulk`): Description, Artist, Copyright, plus the tags. Make,
+  Model, Software and Date Taken are editable for one file and refused in a many-file write,
+  and a template is by definition many files — so capturing from a JPEG does not produce a
+  template that stamps "Canon EOS 5D" onto the Nikon files it is later pointed at.
+  `plan` deliberately does *not* repeat that restriction: a hand-edited document that names
+  a Make should be obeyed rather than second-guessed, because after capture the document is
+  the user's.
+- **A no-op apply must not write, because writing creates files.** The tag writer
+  establishes a sidecar where none exists, so an apply that changed nothing and still called
+  it would leave a `.xmp` behind for every file it touched — four hundred selected, four
+  hundred new files, all saying nothing. The plan is checked empty first, and the report
+  counts `already_matching` apart from `changed`, because "applied to 0 of 400" and "400
+  already matched" look identical in a success message and mean opposite things.
+- **The status line distinguishes three absences** the way slice 14's keyword row does:
+  nothing chosen, nothing to change, and something failed — with the first failing path
+  named rather than a count of failures that cannot be acted on.
+- **A disclosure, forced by a test I broke.** The first version drew its widgets directly
+  in the panel, and `every_tag_control_in_the_panel_does_something_when_activated` — the
+  keyboard walk that Tabs through the tag controls and Shift+Tabs back to a keyword chip —
+  started failing. The honest reading was not "the walk needs more steps" but "the panel has
+  grown six focusable controls since that test was written, and a combo box now swallows the
+  Enter meant for the chip". Folding the section makes the panel cheaper to look at and the
+  tab order costless until someone asks for it. One open question this exposes is worth
+  recording rather than arguing: the existing walk test is a *sequence* test, and every
+  future panel control will trip it. It survives because folding keeps the count where it
+  was, not because the test is robust.
+- **Three harness facts, each worth more than the code that taught them.**
+  (1) A `CollapsingHeader` reveals its body over several frames — probed: one row per frame,
+  so a test that opens a section and looks for a widget inside sees only the first row and
+  concludes the control is missing. `still_ctx()` switches `animation_time` off for the
+  tests that need a settled layout.
+  (2) A `SidePanel` with no fixed width resizes to its content, and *each pass moves
+  everything inside it*: measured at x = 246, 148, 80, 31, 26 across five passes as one
+  section opened. A helper that finds a widget in one pass and clicks it in the next is then
+  aiming at a coordinate that no longer holds it, and the failure is indistinguishable from a
+  control that does not respond. `exact_width(380)` makes the layout stable and the test
+  honest.
+  (3) My first explanation for (2) was wrong and I wrote it down before testing it: I was
+  sure `click_at`'s leading no-event draw was double-toggling the header. A probe that
+  clicked once per pass and printed the open state after each one refuted it in a single run
+  — `click_panel` toggles exactly once. The real causes were a shared header id (the section
+  belongs to the panel, not the file, so the test's second "open" click had closed it again)
+  and the width drift. Writing the hypothesis down was still worth it; believing it would
+  not have been.
+- **A flake of my own making, caught by running it twice.** The store test that asserts
+  `open_default` finds its document set `HOME` and `XDG_DATA_HOME` itself, under no lock. It
+  passed every time under a test filter and failed in a full run, where it was racing
+  `paths::tests` for the same four process-wide variables. The fix was not to add a second
+  lock — two guards over one shared resource is how two tests both believe they are isolated
+  — but to make `paths::tests::isolate_env` and `expected_root` crate-visible and put the new
+  test under the same one, which also drops the Linux-shaped path the assertion had baked in.
+  Then three runs of `bc-core` and two of the workspace, all 430 green, because "it passed
+  once" is not evidence about a race.
+- **One test of mine was wrong about the engine, not the other way round.** For Replace
+  mode with template {Clients|ACME, Holiday} against a file holding {Clients, Holiday} I
+  asserted the plan would remove both and add both. It removes `Clients` and adds
+  `Clients|ACME` and leaves `Holiday` alone — which is correct, and is the minimal edit a
+  writer should make. Deriving the expectation from the sets instead of eyeballing it is what
+  caught it; the code never changed.
+- **What was not touched, and why the other three are still on the list.** Contact sheets,
+  publish presets and version stacks remain unreachable. `bc-core::publish` is the one that
+  needs a decision rather than a dialog: it runs *synchronously*, while exports of the same
+  shape go through the job queue for progress and cancellation, so wiring it as it stands
+  would put a multi-file write on the UI thread — the same class of choice the live count
+  this file argues for twice. Version stacks also still carry the eight mutate-before-persist
+  sites from slice 12. Individual template files (import/export of one template) are not
+  done: the store is one document, deliberately the same shape as `saved-searches.json`,
+  which buys atomicity across the set and costs portability of a member.
+
+26 tests added — 12 for the store, 8 for the projection and its modes, 6 through the panel
+and its widgets. fmt clean; clippy `--workspace --all-targets --locked -D warnings` clean;
+430 tests pass, up from 404. Release binary re-run on a clean profile: 200 files indexed, no
+errors logged, no `metadata-templates.json` created until something is actually saved.
 
 ### Cross-library keyword suggestions, and the one question a keyword box should ask (slice 14, shipped 2026-11-19)
 
