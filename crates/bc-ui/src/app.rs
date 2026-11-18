@@ -120,6 +120,319 @@ impl ExportDialog {
     }
 }
 
+/// One rule being written.
+///
+/// Compared by value so the live count can tell whether the rule set still
+/// means the same thing as the number on screen.
+#[derive(Clone, PartialEq)]
+struct RuleRow {
+    field: bc_core::Field,
+    operator: bc_core::Operator,
+    /// The value exactly as typed. Kept as text rather than coerced, because
+    /// the editor has to be able to show "big" in a number field and say why
+    /// that matches nothing -- silently turning it into 0 is the failure this
+    /// dialog exists to prevent.
+    value: String,
+}
+
+/// The collection rule editor, open while `BridgeApp::editor` is `Some`.
+///
+/// The dialog is state that the frame reads and writes; asking the worker for a
+/// match count is the only thing in it that leaves the thread. Counts are asked
+/// for, never computed here: a rule over a large library is a table scan, and a
+/// scan in the paint path is a frozen window for whoever is typing.
+struct CollectionEditor {
+    /// Name being saved under.
+    name: String,
+    /// The collection this dialog opened from, when it opened from one. Saving
+    /// under a different name then *creates*, and the dialog says so rather than
+    /// letting a rename look like it happened.
+    editing: Option<String>,
+    /// The words half of the rule set — the same thing the search box holds, and
+    /// saved as the same `AnyText` predicates so a collection means one thing
+    /// whoever wrote it.
+    words: String,
+    rows: Vec<RuleRow>,
+    combinator: bc_core::Combinator,
+    /// Resolved, not a menu choice: a collection can carry a folder that is not
+    /// the one on screen, and "this folder" would then silently mean somewhere
+    /// else. The dialog shows this value's own sentence, so what is written is
+    /// what runs.
+    scope: bc_core::SearchScope,
+    /// Live count plumbing. Both ends of the channel live here: the app puts the
+    /// sender into each job it hands the shared worker and reads the receiver
+    /// back, so nothing has to borrow the editor and the request channel out of
+    /// `BridgeApp` in the same statement.
+    count_tx: Sender<CountAnswer>,
+    count_rx: Receiver<CountAnswer>,
+    count_seq: u64,
+    /// The request in flight and the rules it measures. One field rather than a
+    /// sequence and a key separately, because those two agreeing is the whole
+    /// content of "this number is about these boxes".
+    outstanding: Option<(u64, CountKey)>,
+    /// What `count` and `count_error` describe. `None` means nothing on screen
+    /// has been counted, which the dialog says in words instead of showing a
+    /// stale number or a zero.
+    counted: Option<CountKey>,
+    count: Option<usize>,
+    count_error: Option<String>,
+    count_due: Option<Instant>,
+}
+
+/// Everything that decides *how many* files a draft collection matches, and
+/// nothing else. The name is deliberately absent: renaming a collection does not
+/// change its answer, and recounting for a letter typed into the name box would
+/// be a table scan for a label.
+///
+/// Compared by value once per frame instead of marking the editor dirty from
+/// each widget. A `schedule_count` at every control is nine places where a
+/// future tenth can forget to add one and leave a confident, wrong number on
+/// screen — the exact failure this dialog exists to prevent. So the check comes
+/// from the rules themselves, not from whoever last touched a box.
+#[derive(Clone, PartialEq)]
+struct CountKey {
+    words: String,
+    rows: Vec<RuleRow>,
+    combinator: bc_core::Combinator,
+    scope: bc_core::SearchScope,
+}
+
+impl CollectionEditor {
+    /// Blank, or loaded from a saved search. `scope` is resolved by the caller
+    /// against the folder on screen, because only the app knows that.
+    fn new(
+        name: String,
+        editing: Option<String>,
+        search: Option<&bc_core::SavedSearch>,
+        scope: bc_core::SearchScope,
+    ) -> Self {
+        let (count_tx, count_rx) = channel::<CountAnswer>();
+        let (words, rows) = match search.map(split_saved) {
+            Some((words, rows)) => (words, rows),
+            None => (String::new(), Vec::new()),
+        };
+        Self {
+            name,
+            editing,
+            words,
+            rows,
+            combinator: search
+                .map(|saved| saved.query.combinator)
+                .unwrap_or(bc_core::Combinator::And),
+            scope,
+            count_tx,
+            count_rx,
+            count_seq: 0,
+            outstanding: None,
+            counted: None,
+            count: None,
+            count_error: None,
+            count_due: None,
+        }
+    }
+
+    /// The ruleset as the engine sees it: words first, then the rows, under one
+    /// combinator. A collection saved from here is the same shape the search box
+    /// produces, plus whatever the boxes could not type.
+    fn query(&self) -> bc_core::Query {
+        let mut predicates: Vec<bc_core::Predicate> = self
+            .words
+            .split_whitespace()
+            .map(|word| bc_core::Predicate {
+                field: bc_core::Field::AnyText,
+                operator: bc_core::Operator::Contains,
+                // As typed. The haystack is lowercased inside the evaluator, so
+                // folding the case here would buy nothing and cost the user the
+                // letters they wrote: a collection reopened as "beach" after it
+                // was typed as "Beach" reads as a corrupted file.
+                value: Some(bc_core::QueryValue::Text(word.to_string())),
+            })
+            .collect();
+        predicates.extend(self.rows.iter().map(|row| bc_core::Predicate {
+            field: row.field,
+            operator: row.operator,
+            value: row.query_value(),
+        }));
+        bc_core::Query {
+            predicates,
+            combinator: self.combinator,
+        }
+    }
+
+    fn as_saved(&self) -> bc_core::SavedSearch {
+        bc_core::SavedSearch {
+            query: self.query(),
+            scope: self.scope.clone(),
+        }
+    }
+
+    /// What would be counted if a request went out now.
+    fn count_key(&self) -> CountKey {
+        CountKey {
+            words: self.words.clone(),
+            rows: self.rows.clone(),
+            combinator: self.combinator,
+            scope: self.scope.clone(),
+        }
+    }
+
+    /// Why the rules on screen cannot be counted yet, in row order.
+    ///
+    /// While any of these is present the dialog refuses to ask for a number: a
+    /// count from a rule set containing an impossible predicate is not a low
+    /// result, it is a meaningless one.
+    fn problems(&self) -> Vec<String> {
+        self.query().problems()
+    }
+
+    /// Whether the number on screen still describes the boxes. False while a
+    /// request is in flight, which is what makes "counting…" the honest label.
+    fn count_is_current(&self, key: &CountKey) -> bool {
+        self.counted.as_ref() == Some(key)
+    }
+
+    /// Queue a recount once the typing settles. Called every frame; the only
+    /// cost when nothing changed is one comparison of small values.
+    fn schedule_count(&mut self, key: &CountKey) {
+        if self.count_is_current(key) || self.count_due.is_some() {
+            return;
+        }
+        self.count_due = Some(Instant::now() + SEARCH_DEBOUNCE);
+    }
+
+    /// Take any count that has landed. An answer that is not the outstanding
+    /// one is dropped: it describes rules the user has edited since, and
+    /// putting it on screen would be worse than showing nothing.
+    fn poll_count(&mut self) {
+        let Some((seq, key)) = self.outstanding.clone() else {
+            while self.count_rx.try_recv().is_ok() {}
+            return;
+        };
+        while let Ok(answer) = self.count_rx.try_recv() {
+            if answer.seq != seq {
+                continue;
+            }
+            self.outstanding = None;
+            // Stamped with the rules that were on screen when the request went
+            // out, not with the rules on screen now: if the boxes changed during
+            // the scan, `count_is_current` is what keeps the number off the
+            // screen until a newer request answers.
+            self.counted = Some(key);
+            self.count_due = None;
+            match answer.count {
+                Ok(count) => {
+                    self.count = Some(count);
+                    self.count_error = None;
+                }
+                Err(error) => {
+                    self.count = None;
+                    self.count_error = Some(error);
+                }
+            }
+            return;
+        }
+    }
+}
+
+impl RuleRow {
+    /// How the typed value reaches the engine: a number field gets a number
+    /// when it parses, and anything else stays text so `Predicate::problem`
+    /// can explain it rather than a silent zero being compared.
+    fn query_value(&self) -> Option<bc_core::QueryValue> {
+        if self.operator == bc_core::Operator::Exists {
+            return None;
+        }
+        let trimmed = self.value.trim();
+        if trimmed.is_empty() {
+            return Some(bc_core::QueryValue::Text(String::new()));
+        }
+        match self.field.value_kind() {
+            // A number field keeps a number; anything that does not parse
+            // stays text so `Predicate::problem` can name it. Coercing it to
+            // zero here would be the silent failure this dialog exists to
+            // prevent, because `compare_i64` reads unparsable text as zero.
+            bc_core::ValueKind::Number => {
+                let value = match trimmed.parse::<i64>() {
+                    Ok(n) => bc_core::QueryValue::Integer(n),
+                    Err(_) => bc_core::QueryValue::Text(trimmed.to_string()),
+                };
+                Some(value)
+            }
+            // Kept exactly as written, for the same reason as the words: every
+            // text comparison in the evaluator folds case itself, so lowering it
+            // here only rewrites what the user typed.
+            bc_core::ValueKind::Text => Some(bc_core::QueryValue::Text(trimmed.to_string())),
+        }
+    }
+
+    fn problem(&self) -> Option<String> {
+        bc_core::Predicate {
+            field: self.field,
+            operator: self.operator,
+            value: self.query_value(),
+        }
+        .problem()
+    }
+
+    /// A new rule, defaulted so the first thing the popup shows is a pair that
+    /// can actually match.
+    fn new() -> Self {
+        let field = bc_core::Field::Keyword;
+        Self {
+            field,
+            operator: *field
+                .operators()
+                .first()
+                .expect("an editable field offers an operator"),
+            value: String::new(),
+        }
+    }
+}
+
+/// The scope rows the editor offers, each with what choosing it would actually
+/// search.
+///
+/// The two folder scopes are absent with no folder open, rather than resolving to
+/// the library as `SearchScopeChoice::scope` does: a row that says "this folder"
+/// and then searches everything is the same lie the search box tells, and an
+/// editor with room for a proper control should not repeat it.
+fn scope_options(root: Option<&Path>) -> Vec<(SearchScopeChoice, bc_core::SearchScope)> {
+    SearchScopeChoice::ALL
+        .into_iter()
+        .filter(|choice| root.is_some() || *choice == SearchScopeChoice::Library)
+        .map(|choice| (choice, choice.scope(root)))
+        .collect()
+}
+
+/// Split a stored rule set back into words and rules for editing. A rule this
+/// dialog cannot represent keeps its words and drops the rest, which is
+/// reported in the dialog rather than kept quiet.
+fn split_saved(saved: &bc_core::SavedSearch) -> (String, Vec<RuleRow>) {
+    let mut words: Vec<String> = Vec::new();
+    let mut rows: Vec<RuleRow> = Vec::new();
+    for predicate in &saved.query.predicates {
+        if predicate.field == bc_core::Field::AnyText {
+            if let Some(bc_core::QueryValue::Text(text)) = &predicate.value {
+                words.push(text.clone());
+            }
+            continue;
+        }
+        let value = match &predicate.value {
+            Some(bc_core::QueryValue::Text(text)) => text.clone(),
+            Some(bc_core::QueryValue::Integer(n)) => n.to_string(),
+            Some(bc_core::QueryValue::Real(n)) => n.to_string(),
+            Some(bc_core::QueryValue::Bool(b)) => b.to_string(),
+            None => String::new(),
+        };
+        rows.push(RuleRow {
+            field: predicate.field,
+            operator: predicate.operator,
+            value,
+        });
+    }
+    (words.join(" "), rows)
+}
+
 struct ThumbJob {
     path: PathBuf,
     mtime_ns: i64,
@@ -184,6 +497,9 @@ struct ThumbResult {
 /// than living in the worker: the app opens the index lazily on the first
 /// folder that needs it, and a worker spawned at startup would have to be
 /// re-spawned or polled for that handle otherwise.
+/// One rule set to run against the index, and the index to run it against.
+/// Shared by the search box (which wants the rows) and the collection editor
+/// (which wants to know how many there are).
 struct SearchQuery {
     seq: u64,
     /// Rules to run, already built: from the search box, or from a saved
@@ -199,6 +515,32 @@ struct SearchAnswer {
     rows: Result<Vec<bc_core::IndexedFile>, String>,
 }
 
+/// How many files a rule set matches, as answered by the shared worker. The
+/// number is counted where the rows already are and only the count crosses the
+/// channel: a rule over a large library answers with hundreds of thousands of
+/// `IndexedFile`s, and shipping them to call `.len()` in the paint thread would
+/// make the editor's live number a memory and CPU cost per keystroke.
+struct CountAnswer {
+    seq: u64,
+    count: Result<usize, String>,
+}
+
+/// What the search worker is asked to do. One thread serves both the box and
+/// the editor: they are the same SQLite reader, and two threads would compete
+/// for the same connection while doing the same kind of scan.
+enum SearchJob {
+    Run {
+        request: SearchQuery,
+        reply: Sender<SearchAnswer>,
+    },
+    Count {
+        /// The same request shape as `Run`: what differs is the answer, not the
+        /// question.
+        request: SearchQuery,
+        reply: Sender<CountAnswer>,
+    },
+}
+
 /// The library search runs on its own thread, like the thumbnails.
 ///
 /// A whole-library query is a table scan: measured at about 1.4 ms per 2 000
@@ -206,17 +548,46 @@ struct SearchAnswer {
 /// off the paint thread, and answers carry the sequence number of the request
 /// they came from so a reply to a word the user has already finished typing is
 /// discarded instead of replacing the grid with an older answer.
-fn spawn_search_worker(rx: Receiver<SearchQuery>, tx: Sender<SearchAnswer>) {
+fn spawn_search_worker(rx: Receiver<SearchJob>) {
     let handle = std::thread::Builder::new()
         .name("search".into())
         .spawn(move || {
             for job in rx {
-                let rows = job
-                    .index
-                    .search(&job.query, &job.scope)
-                    .map_err(|error| error.to_string());
-                if let Err(error) = tx.send(SearchAnswer { seq: job.seq, rows }) {
-                    tracing::debug!("search answer dropped: {error}");
+                match job {
+                    SearchJob::Run { request, reply } => {
+                        let SearchQuery {
+                            seq,
+                            query,
+                            scope,
+                            index,
+                        } = request;
+                        let rows = index
+                            .search(&query, &scope)
+                            .map_err(|error| error.to_string());
+                        if reply.send(SearchAnswer { seq, rows }).is_err() {
+                            tracing::debug!("search answer undelivered (frame gone)");
+                        }
+                    }
+                    SearchJob::Count { request, reply } => {
+                        let SearchQuery {
+                            seq,
+                            query,
+                            scope,
+                            index,
+                        } = request;
+                        // `search` then `len`, not a counting query: the cost
+                        // of a search here is reading the rows, which happens
+                        // either way, so a `MetadataIndex::count` would be a
+                        // second name for the same scan. What this does save is
+                        // the answer crossing a channel as a Vec of clones.
+                        let count = index
+                            .search(&query, &scope)
+                            .map(|rows| rows.len())
+                            .map_err(|error| error.to_string());
+                        if reply.send(CountAnswer { seq, count }).is_err() {
+                            tracing::debug!("count answer undelivered (dialog closed)");
+                        }
+                    }
                 }
             }
         });
@@ -391,8 +762,15 @@ pub struct BridgeApp {
     /// come from anywhere in scope.
     search_text: String,
     search_scope: SearchScopeChoice,
-    search_tx: Sender<SearchQuery>,
+    search_tx: Sender<SearchJob>,
     search_rx: Receiver<SearchAnswer>,
+    /// The sender this app reads the matching receiver from; handed to each
+    /// job so one worker thread can answer several consumers.
+    search_reply_tx: Sender<SearchAnswer>,
+    /// The collection rule editor, open when `Some`. Count requests go out on
+    /// `search_tx` like every other query, so a stale answer cannot race a
+    /// newer one across two threads reading one SQLite connection.
+    editor: Option<CollectionEditor>,
     /// Counters so an answer can be matched to the request it answers, and a
     /// superseded one thrown away.
     search_seq: u64,
@@ -487,9 +865,9 @@ impl BridgeApp {
         // Requests go out on `query_tx`; answers come back on `answer_rx`.
         // The field holding the receiver is `search_rx` because that is what
         // the frame drains, but the two channels are deliberately not the same.
-        let (query_tx, query_rx) = channel::<SearchQuery>();
+        let (query_tx, query_rx) = channel::<SearchJob>();
         let (answer_tx, answer_rx) = channel::<SearchAnswer>();
-        spawn_search_worker(query_rx, answer_tx);
+        spawn_search_worker(query_rx);
 
         let (favorites, favorites_error) = match Favorites::open_default() {
             Ok(store) => (Some(store), None),
@@ -556,8 +934,10 @@ impl BridgeApp {
             bulk_keyword_remove: String::new(),
             search_text: String::new(),
             search_scope: SearchScopeChoice::default(),
-            search_tx: query_tx,
+            search_tx: query_tx.clone(),
             search_rx: answer_rx,
+            search_reply_tx: answer_tx,
+            editor: None,
             search_seq: 0,
             search_waiting: None,
             search_due: None,
@@ -827,25 +1207,7 @@ impl BridgeApp {
         };
         let scope_choice = self.search_scope;
         let scope = scope_choice.scope(self.browser.root.as_deref());
-        // Coverage numbers have to be taken from the folder listing *before*
-        // it is replaced: once the grid holds results, the files that are not
-        // in the index are exactly the ones that are not on screen.
-        let (total, unindexed) = match scope_choice {
-            SearchScopeChoice::Folder => {
-                let files: Vec<&Path> = self
-                    .browser
-                    .entries
-                    .iter()
-                    .filter(|e| !e.is_dir)
-                    .map(|e| e.path.as_path())
-                    .collect();
-                (
-                    files.len(),
-                    self.browser.tags.missing_among(files.into_iter()),
-                )
-            }
-            _ => (0, 0),
-        };
+        let (total, unindexed) = self.scope_coverage(&scope);
         self.search_scope_total = total;
         self.search_scope_unindexed = unindexed;
 
@@ -861,7 +1223,14 @@ impl BridgeApp {
             scope,
             index,
         };
-        if self.search_tx.send(job).is_err() {
+        if self
+            .search_tx
+            .send(SearchJob::Run {
+                request: job,
+                reply: self.search_reply_tx.clone(),
+            })
+            .is_err()
+        {
             self.search_waiting = None;
             self.search_error = Some("the search worker is not running".to_string());
             self.status = "Search unavailable: the background search thread is gone".to_string();
@@ -964,6 +1333,24 @@ impl BridgeApp {
                 ui.weak("Nothing to save: the grid is showing a folder.");
             }
         });
+
+        // The box above can only ever save what the search box produced, which is
+        // words and a scope. This is the other half of the feature: conditions on
+        // the fields a sentence cannot ask for, and the way back into a collection
+        // that is already saved.
+        ui.add_enabled_ui(!store_unreadable, |ui| {
+            if ui
+                .button("Edit rules…")
+                .on_hover_text(
+                    "Build a collection from star rating, keyword, colour label, flag, camera, \
+                     name and the other indexed fields, and see how many files match while you \
+                     write it.",
+                )
+                .clicked()
+            {
+                self.open_collection_editor(String::new(), None, None);
+            }
+        });
         ui.separator();
 
         if let Some(error) = &self.saved_store_error {
@@ -997,6 +1384,23 @@ impl BridgeApp {
                         .clicked()
                     {
                         self.run_collection(&name);
+                    }
+                    if ui
+                        .small_button("✎")
+                        .on_hover_text(
+                            "Edit these rules. The collection stays as it is until \
+                         the editor saves.",
+                        )
+                        .clicked()
+                    {
+                        let search = entry.search.clone();
+                        // `name` is cloned twice rather than moved: the delete
+                        // button below asks for the same one.
+                        self.open_collection_editor(
+                            name.clone(),
+                            Some(name.clone()),
+                            Some(&search),
+                        );
                     }
                     if ui
                         .small_button("✕")
@@ -1125,6 +1529,12 @@ impl BridgeApp {
         // The box mirrors the collection's words when it can, so what the user
         // reads in the field matches what produced the grid.
         self.search_text = search.box_text();
+        // Coverage is re-asked rather than left over from the last typed
+        // search: it is a fact about the scope being run, not about whatever
+        // the box did last.
+        let (total, unindexed) = self.scope_coverage(&search.scope);
+        self.search_scope_total = total;
+        self.search_scope_unindexed = unindexed;
         self.search_seq += 1;
         let seq = self.search_seq;
         self.browser.enter_collection(name, &search);
@@ -1137,9 +1547,470 @@ impl BridgeApp {
             scope: search.scope.clone(),
             index,
         };
-        if self.search_tx.send(job).is_err() {
+        if self
+            .search_tx
+            .send(SearchJob::Run {
+                request: job,
+                reply: self.search_reply_tx.clone(),
+            })
+            .is_err()
+        {
             self.search_waiting = None;
             self.status = "Search unavailable: the background search thread is gone".to_string();
+        }
+    }
+
+    /// Open the rule editor. A saved collection arrives with its own rules and
+    /// its own scope; a new one starts where the user is looking, resolved now
+    /// rather than kept as a promise about "this folder" that a navigation could
+    /// quietly change.
+    fn open_collection_editor(
+        &mut self,
+        name: String,
+        editing: Option<String>,
+        search: Option<&bc_core::SavedSearch>,
+    ) {
+        let scope = match search {
+            Some(saved) => saved.scope.clone(),
+            None => self.search_scope.scope(self.browser.root.as_deref()),
+        };
+        self.editor = Some(CollectionEditor::new(name, editing, search, scope));
+    }
+
+    /// The editor's share of the search worker: take any count that has landed,
+    /// and ask for one when the boxes have stopped changing.
+    fn tick_editor_count(&mut self, ctx: &egui::Context) {
+        let Some(mut editor) = self.editor.take() else {
+            return;
+        };
+        // Drained before anything else, every frame: an answer that has landed is
+        // never left sitting in the channel, so `outstanding` cannot outlive its
+        // own reply and leave the dialog saying "counting…" forever.
+        editor.poll_count();
+        let key = editor.count_key();
+
+        // Rules that cannot match have no number worth scanning for, and showing
+        // the zero they would return is how an impossible collection comes to
+        // look like an empty library. Marking them counted is what stops the
+        // dialog re-asking every frame; each row says its own piece underneath.
+        if !editor.problems().is_empty() {
+            editor.counted = Some(key);
+            editor.count = None;
+            editor.count_error = None;
+            editor.outstanding = None;
+            editor.count_due = None;
+            self.editor = Some(editor);
+            return;
+        }
+
+        if editor.count_is_current(&key) {
+            self.editor = Some(editor);
+            return;
+        }
+        if let Some(due) = editor.count_due {
+            if Instant::now() >= due {
+                editor.count_due = None;
+                self.request_count(&mut editor, key);
+            } else {
+                ctx.request_repaint_after(due.saturating_duration_since(Instant::now()));
+            }
+        } else {
+            editor.schedule_count(&key);
+            if editor.count_due.is_some() {
+                ctx.request_repaint_after(SEARCH_DEBOUNCE);
+            }
+        }
+        self.editor = Some(editor);
+    }
+
+    fn request_count(&mut self, editor: &mut CollectionEditor, key: CountKey) {
+        let Some(index) = self.open_index() else {
+            // The only part of this dialog that needs the index. The rules are
+            // still savable, so the message has to be about the count and not
+            // about the collection — the two failures read differently, and the
+            // old build used one sentence for both.
+            editor.counted = Some(key);
+            editor.count = None;
+            editor.count_error = Some(
+                self.index_error
+                    .clone()
+                    .unwrap_or_else(|| "the metadata index is offline".to_string()),
+            );
+            return;
+        };
+        editor.count_seq += 1;
+        let seq = editor.count_seq;
+        let request = SearchQuery {
+            seq,
+            query: editor.query(),
+            scope: key.scope.clone(),
+            index,
+        };
+        let reply = editor.count_tx.clone();
+        if self
+            .search_tx
+            .send(SearchJob::Count { request, reply })
+            .is_err()
+        {
+            editor.counted = Some(key);
+            editor.count = None;
+            editor.count_error = Some("the background search thread is not running".to_string());
+        } else {
+            editor.outstanding = Some((seq, key));
+        }
+    }
+
+    /// Write a draft to the store. Answers whether it landed, because the dialog
+    /// must stay open when it did not: the rules the user just typed exist
+    /// nowhere else, and closing the window would discard them.
+    fn save_collection_draft(
+        &mut self,
+        name: &str,
+        search: &bc_core::SavedSearch,
+        editing: Option<&str>,
+    ) -> bool {
+        let outcome = match self.saved_store() {
+            Some(store) => store.save(name, search).map_err(|error| error.to_string()),
+            None => Err(self
+                .saved_store_error
+                .clone()
+                .unwrap_or_else(|| "the saved-search file could not be opened".to_string())),
+        };
+        match outcome {
+            Ok(replaced) => {
+                self.refresh_collections();
+                let verb = if replaced { "Replaced" } else { "Saved" };
+                let note = match editing {
+                    // Saving under a different name creates a second collection;
+                    // the original is still in the list. Saying nothing would let
+                    // this read as a rename that lost the old one.
+                    Some(old) if old != name => {
+                        format!(" “{name}”; “{old}” is still saved under its own name.")
+                    }
+                    _ => format!(" ({})", search.summary()),
+                };
+                self.status = format!("{verb} collection{note}");
+                true
+            }
+            Err(reason) => {
+                self.status = format!("Could not save “{name}”: {reason}");
+                false
+            }
+        }
+    }
+
+    /// The rule editor. Its live number comes from the worker thread: a rule over
+    /// a large library is a table scan, and a scan in the paint path is a window
+    /// that stops answering while someone types.
+    fn editor_window(&mut self, ctx: &egui::Context) {
+        let Some(mut editor) = self.editor.take() else {
+            return;
+        };
+        let root = self.browser.root.clone();
+        let store_unreadable = self.saved_store_error.is_some();
+        let saved_names: Vec<String> = self
+            .collections
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect();
+        // `open` is borrowed by the window's own close box, so the dialog's
+        // buttons set a separate flag instead of writing it — the same split the
+        // export window uses, and the reason it has one.
+        let mut open = true;
+        let mut save = false;
+        let mut dismiss = false;
+        let title = if editor.editing.is_some() {
+            "Edit collection"
+        } else {
+            "New collection"
+        };
+
+        egui::Window::new(title)
+            .id(egui::Id::new("collection_editor"))
+            .collapsible(false)
+            .resizable(true)
+            .default_width(560.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                let problems = editor.problems();
+                let key = editor.count_key();
+
+                ui.horizontal(|ui| {
+                    ui.label("Name");
+                    ui.add_sized(
+                        [260.0, 20.0],
+                        egui::TextEdit::singleline(&mut editor.name).hint_text("collection name"),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Words");
+                    ui.add_sized(
+                        [260.0, 20.0],
+                        egui::TextEdit::singleline(&mut editor.words).hint_text("beach sunset"),
+                    );
+                    // Said as what the engine does, not as "the fields below":
+                    // words are matched against the whole projected text of a
+                    // row, which is wider than the list under this box, and a
+                    // label that underscopes its own rule teaches the user the
+                    // wrong thing about how their collection works.
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new("each word, anywhere in the file's indexed text")
+                                .weak()
+                                .small(),
+                        )
+                        .selectable(false),
+                    );
+                });
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Match");
+                    ui.selectable_value(
+                        &mut editor.combinator,
+                        bc_core::Combinator::And,
+                        "every",
+                    );
+                    ui.label("of");
+                    ui.selectable_value(
+                        &mut editor.combinator,
+                        bc_core::Combinator::Or,
+                        "any",
+                    );
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new("— words count as conditions too").weak().small(),
+                        )
+                        .selectable(false),
+                    );
+                });
+
+                let mut remove: Option<usize> = None;
+                // Both halves have to be empty for that to be true: with words
+                // typed and no conditions, the collection matches files holding
+                // those words and saying "every file" would be a lie about the
+                // very rule set the count line is about to confirm.
+                if editor.rows.is_empty() && editor.words.trim().is_empty() {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new("No conditions yet: this collection matches every file in its scope.")
+                                .weak()
+                                .small(),
+                        )
+                        .selectable(false),
+                    );
+                }
+                for (ix, row) in editor.rows.iter_mut().enumerate() {
+                    ui.push_id(ix, |ui| {
+                        ui.horizontal(|ui| {
+                            egui::ComboBox::from_id_source("rule_field")
+                                .selected_text(row.field.label())
+                                .show_ui(ui, |ui| {
+                                    for field in bc_core::Field::EDITABLE {
+                                        if ui
+                                            .selectable_value(&mut row.field, field, field.label())
+                                            .clicked()
+                                        {
+                                            // Keep the operator when the new field
+                                            // can use it, so switching name→keyword
+                                            // does not silently change the question.
+                                            // A field that offers nothing is a bug
+                                            // in `EDITABLE`, not a reason to panic.
+                                            if !field.operators().contains(&row.operator) {
+                                                if let Some(first) = field.operators().first() {
+                                                    row.operator = *first;
+                                                }
+                                            }
+                                        }
+                                    }
+                                });
+                            egui::ComboBox::from_id_source("rule_operator")
+                                .selected_text(row.operator.label())
+                                .show_ui(ui, |ui| {
+                                    // Only the operators that can test this field,
+                                    // which is why a row cannot be built that
+                                    // matches nothing.
+                                    for operator in row.field.operators() {
+                                        ui.selectable_value(
+                                            &mut row.operator,
+                                            *operator,
+                                            operator.label(),
+                                        );
+                                    }
+                                });
+                            let value_box = egui::TextEdit::singleline(&mut row.value)
+                                .hint_text(if row.field.value_kind() == bc_core::ValueKind::Number {
+                                    "number"
+                                } else {
+                                    "text"
+                                });
+                            // No popup of known values for colour label or flag,
+                            // even though `bc_metadata::ratings` has an enum for
+                            // each: labels also carry whatever another application
+                            // wrote (`ColorLabel::Custom`), so a closed list would
+                            // hide half of what the index can hold. The count line
+                            // is the check on a misspelling instead.
+                            //
+                            // Left editable even for "is set", which reads no
+                            // value: a rule loaded from a hand-edited
+                            // `saved-searches.json` can arrive with text in this
+                            // box, and `problem()` refuses to save it. Disabling
+                            // the box would leave the dialog unable to save and
+                            // the user unable to clear the thing stopping it.
+                            ui.add(value_box).on_hover_text(if row.operator
+                                == bc_core::Operator::Exists
+                            {
+                                "“is set” reads no value, so what is typed here is ignored"
+                            } else {
+                                "Matched against the values the index holds"
+                            });
+                            if ui
+                                .small_button("✕")
+                                .on_hover_text("Remove this condition")
+                                .clicked()
+                            {
+                                remove = Some(ix);
+                            }
+                        });
+                        if let Some(problem) = row.problem() {
+                            ui.horizontal(|ui| {
+                                ui.label("  ");
+                                ui.colored_label(ui.visuals().warn_fg_color, problem);
+                            });
+                        }
+                    });
+                }
+
+                ui.horizontal(|ui| {
+                    if ui
+                        .small_button("+ condition")
+                        .on_hover_text("Add a condition on any indexed field")
+                        .clicked()
+                    {
+                        editor.rows.push(RuleRow::new());
+                    }
+                    // Two of the questions the box makes slow to type by hand, and
+                    // both are the shape of rule a folder listing cannot express.
+                    if ui
+                        .small_button("keyword…")
+                        .on_hover_text("Files carrying a keyword")
+                        .clicked()
+                    {
+                        editor.rows.push(RuleRow {
+                            field: bc_core::Field::Keyword,
+                            operator: bc_core::Operator::HasKeyword,
+                            value: String::new(),
+                        });
+                    }
+                    if ui
+                        .small_button("starred")
+                        .on_hover_text("Files with at least one star")
+                        .clicked()
+                    {
+                        // "is set" is not this: every indexed file has a rating,
+                        // zero included, so that rule would match the whole
+                        // scope. One star is the floor the label promises.
+                        editor.rows.push(RuleRow {
+                            field: bc_core::Field::Rating,
+                            operator: bc_core::Operator::GreaterThanOrEqual,
+                            value: "1".to_string(),
+                        });
+                    }
+                });
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Look");
+                    egui::ComboBox::from_id_source("editor_scope")
+                        .selected_text(editor.scope.describe())
+                        .show_ui(ui, |ui| {
+                            for (choice, scope) in scope_options(root.as_deref()) {
+                                ui.selectable_value(&mut editor.scope, scope, choice.label());
+                            }
+                        });
+                });
+
+                ui.separator();
+                // One line, four states, and never a number that belongs to other
+                // rules: an answer is shown only while the boxes still say what it
+                // was counted for.
+                if !problems.is_empty() {
+                    let count = problems.len();
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        format!(
+                            "{count} condition(s) above cannot match anything, so nothing was                              counted. Fix them or remove them."
+                        ),
+                    );
+                } else if editor.outstanding.is_some() {
+                    ui.weak("Counting…");
+                } else if !editor.count_is_current(&key) {
+                    ui.weak("Not counted for these rules yet.");
+                } else if let Some(error) = &editor.count_error {
+                    ui.colored_label(
+                        ui.visuals().error_fg_color,
+                        format!("Could not count: {error}"),
+                    );
+                } else if let Some(count) = editor.count {
+                    ui.label(format!("{count} file(s) match"));
+                }
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let typed = editor.name.trim();
+                    let replaces = !typed.is_empty()
+                        && saved_names
+                            .iter()
+                            .any(|name| name.as_str() == typed);
+                    let renamed = editor
+                        .editing
+                        .as_deref()
+                        .is_some_and(|old| old != typed);
+                    let can_save =
+                        !typed.is_empty() && problems.is_empty() && !store_unreadable;
+                    let reason = if store_unreadable {
+                        "The saved-search file cannot be read, so nothing will be written over                          it."
+                    } else if typed.is_empty() {
+                        "A collection needs a name."
+                    } else if !problems.is_empty() {
+                        "Every condition has to be able to match before this can be saved."
+                    } else if renamed {
+                        "This name is new: the collection you opened stays in the list as it is."
+                    } else if replaces {
+                        "This replaces the rules the collection already holds."
+                    } else {
+                        "Store these conditions and this scope under the name above."
+                    };
+                    if ui
+                        .add_enabled(can_save, egui::Button::new("Save").small())
+                        .on_hover_text(reason)
+                        .clicked()
+                    {
+                        save = true;
+                    }
+                    if ui
+                        .add(egui::Button::new("Cancel").small())
+                        .on_hover_text("Close without saving. Nothing has been written.")
+                        .clicked()
+                    {
+                        dismiss = true;
+                    }
+                    if renamed {
+                        ui.weak(format!("keeps “{}”", editor.editing.as_deref().unwrap_or("")));
+                    }
+                });
+            });
+
+        if save {
+            let name = editor.name.trim().to_string();
+            let search = editor.as_saved();
+            let editing = editor.editing.clone();
+            // Close only on a write that landed. A failure keeps the rules on
+            // screen, because they exist nowhere else until it succeeds.
+            dismiss = self.save_collection_draft(&name, &search, editing.as_deref());
+        }
+        if open && !dismiss {
+            self.editor = Some(editor);
         }
     }
 
@@ -1214,6 +2085,38 @@ impl BridgeApp {
     /// The line that explains a result grid. The count is not the whole story:
     /// a folder-scope search has to say how many of its files the index has
     /// never read, because those cannot appear however the box is worded.
+    /// How much of the folder on screen the index has actually seen, for a
+    /// scope that *is* that folder.
+    ///
+    /// Anything else answers zero. The numbers describe the listing, so
+    /// attaching them to a search of somewhere else is a claim about files
+    /// nobody is looking at — which is how a stale pair from the search box used
+    /// to follow a collection run into the status line and describe a folder the
+    /// collection had never mentioned.
+    ///
+    /// Taken from the folder listing *before* it is replaced: once the grid
+    /// holds results, the files that are not in the index are exactly the ones
+    /// that are not on screen.
+    fn scope_coverage(&self, scope: &bc_core::SearchScope) -> (usize, usize) {
+        let bc_core::SearchScope::Folder(root) = scope else {
+            return (0, 0);
+        };
+        if self.browser.root.as_deref() != Some(root.as_path()) {
+            return (0, 0);
+        }
+        let files: Vec<&Path> = self
+            .browser
+            .entries
+            .iter()
+            .filter(|e| !e.is_dir)
+            .map(|e| e.path.as_path())
+            .collect();
+        (
+            files.len(),
+            self.browser.tags.missing_among(files.into_iter()),
+        )
+    }
+
     fn search_status(&self, count: usize) -> String {
         let Some((text, _query, scope)) = self.browser.search() else {
             return format!("{} items", self.browser.len());
@@ -5166,6 +6069,11 @@ impl eframe::App for BridgeApp {
         }
         self.poll_jobs(ctx);
         self.poll_search(ctx);
+        // The rule editor shares the search worker, so it is serviced here too:
+        // answers taken, and a due recount asked for. Before the panels are
+        // drawn, so a count that landed while the user was deciding is on screen
+        // in the same frame it arrives.
+        self.tick_editor_count(ctx);
         self.handle_search_shortcuts(ctx);
         // A debounced search fires on the clock, not on an event: nothing
         // happens 450 ms after the last keystroke except this check.
@@ -5301,6 +6209,7 @@ impl eframe::App for BridgeApp {
         self.confirm_delete_window(ctx);
         self.rename_window(ctx);
         self.export_window(ctx);
+        self.editor_window(ctx);
         self.jobs_window(ctx);
         self.auto_process_window(ctx);
         self.plugin_manager_window(ctx);
@@ -5925,6 +6834,694 @@ mod tests {
             std::fs::read(&file).unwrap(),
             before,
             "a refused save still overwrote the user's saved searches"
+        );
+    }
+
+    /// Draw the rule editor alone and collect what it said, the way
+    /// `sidebar_text` does for the sidebar. A window has to be testable without
+    /// the rest of the interface, and the assertions are about the words a user
+    /// reads rather than about fields nobody sees.
+    fn editor_text(app: &mut BridgeApp, ctx: &egui::Context) -> Vec<(String, egui::Rect)> {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1400.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        // A window needs one pass to lay itself out before it paints anything:
+        // the first pass on a fresh context yields the frame's shapes with no
+        // text at all, which reads exactly like a dialog that drew nothing. The
+        // sidebar does not behave this way, so the warm-up belongs here rather
+        // than being assumed of every surface.
+        let _ = ctx.run(raw.clone(), |ctx| app.editor_window(ctx));
+        let out = ctx.run(raw, |ctx| app.editor_window(ctx));
+        let mut texts = Vec::new();
+        for clipped in &out.shapes {
+            if let egui::Shape::Text(text) = &clipped.shape {
+                texts.push((
+                    text.galley.text().to_string(),
+                    egui::Rect::from_min_size(text.pos, text.galley.size()),
+                ));
+            }
+        }
+        texts
+    }
+
+    fn editor_rect(app: &mut BridgeApp, ctx: &egui::Context, wanted: &str) -> egui::Rect {
+        let drawn = editor_text(app, ctx);
+        drawn
+            .iter()
+            .find(|(text, _)| text == wanted)
+            .map(|(_, rect)| *rect)
+            .unwrap_or_else(|| {
+                panic!(
+                    "“{wanted}” was not drawn in the rule editor; it drew {:?}",
+                    drawn
+                        .iter()
+                        .map(|(text, _)| text.as_str())
+                        .collect::<Vec<_>>()
+                )
+            })
+    }
+
+    /// Put an answer on the editor's reply channel as if the worker had written
+    /// it. Tests that care about *which* reply is accepted cannot wait for the
+    /// real thread to produce the wrong one on schedule.
+    fn editor_send(app: &mut BridgeApp, answer: CountAnswer) {
+        let editor = app.editor.as_ref().unwrap();
+        editor.count_tx.send(answer).unwrap();
+    }
+
+    /// An editor with one rating rule over `root`, library-wide.
+    fn rating_editor(app: &mut BridgeApp, stars: &str) {
+        app.open_collection_editor("picked".to_string(), None, None);
+        let editor = app.editor.as_mut().unwrap();
+        editor.scope = bc_core::SearchScope::Library;
+        editor.rows.push(RuleRow {
+            field: bc_core::Field::Rating,
+            operator: bc_core::Operator::GreaterThanOrEqual,
+            value: stars.to_string(),
+        });
+    }
+
+    /// Wait for the worker's number, collapsing the debounce by moving its
+    /// deadline up rather than sleeping through it. The reply still comes from
+    /// the worker thread, which is the thing under test.
+    fn finish_count(app: &mut BridgeApp, ctx: &egui::Context) -> Option<usize> {
+        for _ in 0..500 {
+            if let Some(editor) = app.editor.as_mut() {
+                editor.count_due = Some(Instant::now());
+            }
+            app.tick_editor_count(ctx);
+            if let Some(editor) = app.editor.as_ref() {
+                if editor.outstanding.is_none() && editor.count.is_some() {
+                    return editor.count;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        panic!("the count never came back from the worker");
+    }
+
+    #[test]
+    fn the_editor_asks_the_worker_for_a_count_instead_of_scanning_in_the_frame() {
+        // The claim worth testing is not that the number is right — `search`
+        // already counts rows — but that the frame that shows it never ran the
+        // scan itself. A dialog that computed its own count would freeze while
+        // someone typed, and every assertion below would still pass.
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let low = png(&root, "low.png");
+        let mid = png(&root, "mid.png");
+        let high = png(&root, "high.png");
+        seed_index(&data, &[(low, 1), (mid, 3), (high, 5)], &_stores);
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data, &_stores);
+        rating_editor(&mut app, "3");
+
+        // One tick sets a debounce and asks for nothing.
+        app.tick_editor_count(&ctx);
+        {
+            let editor = app.editor.as_ref().unwrap();
+            assert!(
+                editor.count_due.is_some(),
+                "the frame did not queue a debounce"
+            );
+            assert!(
+                editor.outstanding.is_none(),
+                "a count was asked for before the debounce had passed"
+            );
+            assert!(
+                editor.count.is_none() && editor.counted.is_none(),
+                "the frame counted the library on its own thread"
+            );
+        }
+
+        // Two more frames, still inside the window. This is the assertion the
+        // debounce is actually for: without it a fast typist queues one table
+        // scan per keystroke, and 70 ms per 100 000 rows is a window that stops
+        // answering. A build that sent the request here would pass every check
+        // above.
+        app.tick_editor_count(&ctx);
+        app.tick_editor_count(&ctx);
+        assert!(
+            app.editor.as_ref().unwrap().outstanding.is_none(),
+            "a count was asked for while the debounce was still open"
+        );
+
+        assert_eq!(
+            finish_count(&mut app, &ctx),
+            Some(2),
+            "two of three files hold three stars or more"
+        );
+        let shown = editor_text(&mut app, &ctx);
+        let words: Vec<&str> = shown.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(
+            words.contains(&"2 file(s) match"),
+            "the count was computed but never shown: {words:?}"
+        );
+    }
+
+    #[test]
+    fn a_count_for_other_rules_cannot_take_the_place_of_a_newer_one() {
+        // Requests share one channel and one worker, so an answer to rules the
+        // user has since edited can land after a newer request went out. Taking
+        // it would put a confident wrong number on screen — the one failure mode
+        // this dialog has more of than any other.
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let low = png(&root, "low.png");
+        let mid = png(&root, "mid.png");
+        let high = png(&root, "high.png");
+        // Two files at three stars or more, one at five: the old rules and the
+        // new ones have to answer differently, or a test cannot tell them apart.
+        seed_index(&data, &[(low, 1), (mid, 3), (high, 5)], &_stores);
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data, &_stores);
+        rating_editor(&mut app, "3");
+        assert_eq!(finish_count(&mut app, &ctx), Some(2));
+
+        // The state the guard exists for, built directly: a request for the rules
+        // now on screen is outstanding, and an answer for the rules that used to
+        // be there arrives. Racing the real worker for this would make the
+        // outcome a function of machine load rather than of the code.
+        app.editor.as_mut().unwrap().rows[0].value = "5".to_string();
+        let late = {
+            let editor = app.editor.as_mut().unwrap();
+            let older = editor.count_seq;
+            editor.outstanding = Some((older + 1, editor.count_key()));
+            older
+        };
+        editor_send(
+            &mut app,
+            CountAnswer {
+                seq: late,
+                count: Ok(9_999),
+            },
+        );
+
+        // Polled away: the outstanding request keeps its place, and nothing the
+        // stale answer carried reaches either the field or the screen.
+        app.tick_editor_count(&ctx);
+        {
+            let editor = app.editor.as_ref().unwrap();
+            assert!(
+                editor.outstanding.is_some(),
+                "a reply to a different request was accepted as this one's"
+            );
+            assert_eq!(
+                editor.count,
+                Some(2),
+                "the stale number overwrote the previous answer"
+            );
+        }
+        let words: Vec<String> = editor_text(&mut app, &ctx)
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        assert!(
+            words.iter().any(|t| t == "Counting…"),
+            "the dialog stopped saying a request is outstanding: {words:?}"
+        );
+        assert!(
+            !words
+                .iter()
+                .any(|t| t.contains("9,999") || t.contains("9999")),
+            "an answer for rules that no longer exist reached the screen: {words:?}"
+        );
+
+        // And the recount the user is owed does arrive, for the new rules.
+        assert_eq!(
+            finish_count(&mut app, &ctx),
+            Some(1),
+            "five stars or more is one file, not two"
+        );
+        let after: Vec<String> = editor_text(&mut app, &ctx)
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        assert!(
+            after.iter().any(|t| t == "1 file(s) match"),
+            "the recount never made it to the screen: {after:?}"
+        );
+    }
+
+    #[test]
+    fn a_collection_of_rules_only_runs_from_the_sidebar_and_says_so_about_itself() {
+        // The run path is what makes authoring worth doing, and a rules-only
+        // collection is a shape it has never seen: no words for the box to
+        // mirror, and a scope of its own rather than the folder the box last
+        // searched.
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let seen = png(&root, "seen.png");
+        png(&root, "unseen.png");
+        seed_index(&data, &[(seen.clone(), 4)], &_stores);
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data, &_stores);
+
+        // Leave a coverage figure on the screen, folder-scoped, as the box does.
+        app.search_scope = SearchScopeChoice::Folder;
+        app.search_text = "seen".to_string();
+        app.request_search();
+        finish_search(&mut app, &ctx);
+        assert!(
+            app.status.contains("not indexed yet"),
+            "the folder search should have reported its own gap: {}",
+            app.status
+        );
+
+        // Author a collection the search box cannot express, with no words.
+        app.open_collection_editor("picked".to_string(), None, None);
+        {
+            let editor = app.editor.as_mut().unwrap();
+            editor.scope = bc_core::SearchScope::Library;
+            editor.rows.push(RuleRow {
+                field: bc_core::Field::Rating,
+                operator: bc_core::Operator::GreaterThanOrEqual,
+                value: "3".to_string(),
+            });
+            assert!(
+                editor.problems().is_empty(),
+                "a plain rating rule should be countable: {:?}",
+                editor.problems()
+            );
+        }
+        let draft = app.editor.as_ref().unwrap().as_saved();
+        assert!(
+            app.save_collection_draft("picked", &draft, None),
+            "{}",
+            app.status
+        );
+        app.editor = None;
+        app.refresh_collections();
+
+        // Run it the way the sidebar does.
+        app.run_collection("picked");
+        finish_search(&mut app, &ctx);
+        assert!(
+            app.status.starts_with("Collection “picked”: 1 file(s)"),
+            "a rules-only collection does not report itself honestly: {}",
+            app.status
+        );
+        assert!(
+            !app.status.contains("not indexed yet"),
+            "the previous folder search's coverage figure followed the run: {}",
+            app.status
+        );
+        assert_eq!(
+            result_names(&app),
+            vec!["seen.png".to_string()],
+            "the rule did not produce the file it describes"
+        );
+        // And the box stays empty, because there was nothing in this collection
+        // for it to mirror — a search box showing "" while the grid answers a
+        // rule is the honest state and the one the label above has to explain.
+        assert!(
+            app.search_text.is_empty(),
+            "the box invented words for a rules-only collection: {:?}",
+            app.search_text
+        );
+
+        // The same collection, edited and re-run: the sidebar's definition and
+        // the dialog's are the same object, so a run reflects the edit.
+        app.open_collection_editor(
+            "picked".to_string(),
+            Some("picked".to_string()),
+            Some(&draft),
+        );
+        app.editor.as_mut().unwrap().rows[0].value = "5".to_string();
+        let edited = app.editor.as_ref().unwrap().as_saved();
+        assert!(
+            app.save_collection_draft("picked", &edited, Some("picked")),
+            "{}",
+            app.status
+        );
+        app.editor = None;
+        app.refresh_collections();
+        app.run_collection("picked");
+        finish_search(&mut app, &ctx);
+        assert!(
+            app.status.starts_with("Collection “picked”: 0 file(s)"),
+            "four stars is not five: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn an_editor_with_no_conditions_says_so_and_a_words_only_one_does_not() {
+        // The sentence "this matches every file in its scope" is true of an empty
+        // rule set and wrong of one holding words, and the two look identical in
+        // the dialog until the count arrives. Pinning both halves, because the
+        // first version of this dialog printed it while words were typed.
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let one = png(&root, "one.png");
+        seed_index(&data, &[(one, 2)], &_stores);
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data, &_stores);
+        app.open_collection_editor("blank".to_string(), None, None);
+        let words: Vec<String> = editor_text(&mut app, &ctx)
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        assert!(
+            words
+                .iter()
+                .any(|t| t.contains("matches every file in its scope")),
+            "an empty rule set did not say what it matches: {words:?}"
+        );
+
+        app.editor.as_mut().unwrap().words = "one".to_string();
+        let after: Vec<String> = editor_text(&mut app, &ctx)
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        assert!(
+            !after
+                .iter()
+                .any(|t| t.contains("matches every file in its scope")),
+            "the dialog still promised every file after words were typed: {after:?}"
+        );
+        // And the count agrees with the promise it replaced.
+        assert_eq!(finish_count(&mut app, &ctx), Some(1));
+    }
+
+    #[test]
+    fn an_impossible_rule_is_never_reported_as_no_matches() {
+        // The failure mode the guard exists for: `compare_i64` reads an
+        // unparsable value as zero, so "rating at least big" is a rule that
+        // matches two of three files, and "0 files match" is the same screen as
+        // "this rule cannot mean anything". Neither number is the truth, so the
+        // dialog refuses to show one.
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let low = png(&root, "low.png");
+        let high = png(&root, "high.png");
+        seed_index(&data, &[(low, 1), (high, 5)], &_stores);
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data, &_stores);
+        rating_editor(&mut app, "big");
+
+        // Two ticks: one to set the debounce, one to reach the deadline. If the
+        // dialog counted anyway, a request would be outstanding by now.
+        app.tick_editor_count(&ctx);
+        {
+            let editor = app.editor.as_mut().unwrap();
+            editor.count_due = Some(Instant::now());
+        }
+        app.tick_editor_count(&ctx);
+        {
+            let editor = app.editor.as_ref().unwrap();
+            assert!(
+                editor.outstanding.is_none(),
+                "an impossible rule was still sent to the worker"
+            );
+            assert!(
+                editor.count.is_none(),
+                "a count was shown for rules that cannot match: {:?}",
+                editor.count
+            );
+            assert!(
+                editor.counted.is_some(),
+                "the impossible ruleset will be re-asked every frame"
+            );
+        }
+
+        let words: Vec<String> = editor_text(&mut app, &ctx)
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        let flat = words.join(" / ");
+        assert!(
+            flat.contains("cannot match anything"),
+            "the dialog did not say why there is no number: {flat}"
+        );
+        assert!(
+            flat.contains("read as zero"),
+            "the row has to explain the specific mistake: {flat}"
+        );
+        assert!(
+            !words.iter().any(|t| t.ends_with("file(s) match")),
+            "a number was shown for rules that cannot match: {flat}"
+        );
+    }
+
+    #[test]
+    fn the_save_button_is_dead_while_a_rule_cannot_match_and_live_when_it_can() {
+        // A negative test with its own positive control: "disabled" that nobody
+        // can click is indistinguishable from a button that was never wired up.
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let one = png(&root, "one.png");
+        seed_index(&data, &[(one, 4)], &_stores);
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data, &_stores);
+        let file = bc_core::SavedSearches::open_default()
+            .unwrap()
+            .path()
+            .to_path_buf();
+        rating_editor(&mut app, "nonsense");
+        app.editor.as_mut().unwrap().name = "keeper".to_string();
+
+        // Refused: the rule cannot match, so the click must do nothing at all.
+        let save = editor_rect(&mut app, &ctx, "Save");
+        click_at(&mut app, &ctx, save.center(), |app, ctx| {
+            app.editor_window(ctx);
+        });
+        assert!(
+            app.editor.is_some(),
+            "the dialog closed on a save it should have refused"
+        );
+        assert!(
+            !file.exists(),
+            "a refused save still wrote the user's saved-search file"
+        );
+
+        // Accepted: the same button, the same click, one fixed rule.
+        app.editor.as_mut().unwrap().rows[0].value = "3".to_string();
+        let save = editor_rect(&mut app, &ctx, "Save");
+        click_at(&mut app, &ctx, save.center(), |app, ctx| {
+            app.editor_window(ctx);
+        });
+        assert!(
+            app.editor.is_none(),
+            "a valid save did not close the dialog"
+        );
+        assert!(file.exists(), "the save did not reach the disk");
+        let stored = bc_core::SavedSearches::open_default().unwrap();
+        assert!(
+            stored.get("keeper").is_some(),
+            "the collection is not in the file the sidebar reads"
+        );
+    }
+
+    #[test]
+    fn words_and_rules_come_back_from_the_store_as_the_same_things() {
+        // The dialog's load path has to agree with its save path byte for byte,
+        // or editing a collection twice drifts it: a rule that reappears
+        // rewritten is a collection the user did not save.
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        png(&root, "one.png");
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data, &_stores);
+        {
+            app.open_collection_editor("trips".to_string(), None, None);
+            let editor = app.editor.as_mut().unwrap();
+            editor.words = "Beach sunset".to_string();
+            editor.combinator = bc_core::Combinator::Or;
+            editor.scope = bc_core::SearchScope::FolderAndSubfolders(root.clone());
+            editor.rows.push(RuleRow {
+                field: bc_core::Field::Keyword,
+                operator: bc_core::Operator::HasKeyword,
+                value: "Holiday".to_string(),
+            });
+            editor.rows.push(RuleRow {
+                field: bc_core::Field::Rating,
+                operator: bc_core::Operator::LessThanOrEqual,
+                value: "4".to_string(),
+            });
+        }
+        let draft = app.editor.as_ref().unwrap().as_saved();
+        assert!(
+            app.save_collection_draft("trips", &draft, None),
+            "{}",
+            app.status
+        );
+
+        // Re-read from disk, not from the object that was just in memory.
+        let reopened = bc_core::SavedSearches::open_default().unwrap();
+        let stored = reopened.get("trips").expect("gone after reopen").clone();
+        assert_eq!(stored, draft, "the store changed the rules on the way out");
+
+        app.open_collection_editor(
+            "trips".to_string(),
+            Some("trips".to_string()),
+            Some(&stored),
+        );
+        let editor = app.editor.as_ref().unwrap();
+        // The letters the user typed, not a folded copy of them: the evaluator
+        // case-folds on its own, so anything else here is a silent rewrite.
+        assert_eq!(editor.words, "Beach sunset");
+        assert_eq!(editor.combinator, bc_core::Combinator::Or);
+        assert_eq!(
+            editor.scope,
+            bc_core::SearchScope::FolderAndSubfolders(root.clone()),
+            "a folder scope came back as something else"
+        );
+        assert_eq!(editor.rows.len(), 2, "rules were lost or invented");
+        assert_eq!(editor.rows[0].field, bc_core::Field::Keyword);
+        assert_eq!(editor.rows[0].operator, bc_core::Operator::HasKeyword);
+        assert_eq!(editor.rows[0].value, "Holiday");
+        assert_eq!(editor.rows[1].field, bc_core::Field::Rating);
+        assert_eq!(editor.rows[1].value, "4");
+        // And rebuilding the query from the loaded rows is the stored query, not
+        // a paraphrase of it.
+        assert_eq!(editor.query(), stored.query, "round trip was not stable");
+
+        // The count of conditions and words is what the dialog writes down, so a
+        // collection that mixes both keeps both.
+        assert_eq!(
+            stored.query.predicates.len(),
+            4,
+            "two words and two rules should be four conditions"
+        );
+        // And the words still find the file they were typed for, folded or not:
+        // the case is kept for the user, not for the match.
+        let beach = png(&root, "beach.png");
+        seed_index(&data, &[(beach, 2)], &_stores);
+        let matched = bc_core::MetadataIndex::open(&bc_core::paths::metadata_index_path().unwrap())
+            .unwrap()
+            .search(&stored.query, &bc_core::SearchScope::Library)
+            .unwrap();
+        assert!(
+            matched
+                .iter()
+                .any(|row| row.path.file_name().unwrap() == "beach.png"),
+            "“Beach” with a capital stopped matching a lowercase file"
+        );
+    }
+
+    #[test]
+    fn the_collections_panel_opens_the_editor_and_a_saved_one_edits_itself() {
+        // Reachability: the rule model and the dialog can both be correct and
+        // still be a feature nobody can start. This clicks the real button.
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        png(&root, "one.png");
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data, &_stores);
+        app.sidebar_tab = SidebarTab::Collections;
+
+        let button = {
+            let drawn = sidebar_text(&mut app, &ctx);
+            drawn
+                .iter()
+                .find(|(text, _)| text == "Edit rules…")
+                .map(|(_, rect)| *rect)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the Collections tab does not offer the rule editor: {:?}",
+                        drawn.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>()
+                    )
+                })
+        };
+        click_sidebar(&mut app, &ctx, button.center());
+        assert!(app.editor.is_some(), "the button did not open the editor");
+        let words: Vec<String> = editor_text(&mut app, &ctx)
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        assert!(
+            words.iter().any(|t| t == "New collection"),
+            "a new collection opened something else: {words:?}"
+        );
+
+        // Save it, then reopen it from its own row and see the rules again.
+        app.editor.as_mut().unwrap().name = "trips".to_string();
+        app.editor.as_mut().unwrap().words = "beach".to_string();
+        let draft = app.editor.as_ref().unwrap().as_saved();
+        assert!(
+            app.save_collection_draft("trips", &draft, None),
+            "{}",
+            app.status
+        );
+        app.editor = None;
+        app.refresh_collections();
+        let edit = {
+            let drawn = sidebar_text(&mut app, &ctx);
+            drawn
+                .iter()
+                .find(|(text, _)| text == "✎")
+                .map(|(_, rect)| *rect)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "a saved collection offers no way back into its rules: {:?}",
+                        drawn.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>()
+                    )
+                })
+        };
+        click_sidebar(&mut app, &ctx, edit.center());
+        let editor = app
+            .editor
+            .as_ref()
+            .expect("the edit button did not open the editor");
+        assert_eq!(editor.words, "beach");
+        assert_eq!(
+            editor.editing.as_deref(),
+            Some("trips"),
+            "it forgot which collection it opened from"
+        );
+        assert_eq!(editor.name, "trips");
+        let title: Vec<String> = editor_text(&mut app, &ctx)
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        assert!(
+            title.iter().any(|t| t == "Edit collection"),
+            "editing an existing collection is titled as a new one: {title:?}"
         );
     }
 

@@ -118,6 +118,150 @@ pub enum Field {
     Description,
 }
 
+/// How a field's value is written down. This decides which operators can match
+/// it at all, and what the interface should let the user type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueKind {
+    /// A string, matched as text.
+    Text,
+    /// A whole number: star count, byte size.
+    Number,
+}
+
+impl Field {
+    /// The fields the rule editor offers.
+    ///
+    /// A deliberate subset, not an accident of laziness. `Mtime`, `Width` and
+    /// `Height` are stored and queryable, but authoring them well needs a date
+    /// picker and a size unit rather than a box of nanoseconds and a box of
+    /// bytes; offering them as raw numbers would produce rules nobody can read
+    /// back, which is the failure this whole feature exists to avoid.
+    pub const EDITABLE: [Field; 11] = [
+        Field::Name,
+        Field::Path,
+        Field::Extension,
+        Field::Keyword,
+        Field::Title,
+        Field::Description,
+        Field::CameraMake,
+        Field::CameraModel,
+        Field::ColorLabel,
+        Field::Flag,
+        Field::Rating,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Field::AnyText => "any text",
+            Field::Path => "path",
+            Field::Name => "file name",
+            Field::Extension => "extension",
+            Field::Size => "size in bytes",
+            Field::Mtime => "modified on",
+            Field::Width => "width",
+            Field::Height => "height",
+            Field::Created => "taken on",
+            Field::Modified => "modified (metadata)",
+            Field::CameraMake => "camera make",
+            Field::CameraModel => "camera model",
+            Field::Rating => "star rating",
+            Field::ColorLabel => "colour label",
+            Field::Flag => "flag",
+            Field::Keyword => "keyword",
+            Field::Title => "title",
+            Field::Description => "description",
+        }
+    }
+
+    pub fn value_kind(self) -> ValueKind {
+        match self {
+            Field::Rating | Field::Size | Field::Width | Field::Height | Field::Mtime => {
+                ValueKind::Number
+            }
+            _ => ValueKind::Text,
+        }
+    }
+
+    /// The operators that can meaningfully test this field.
+    ///
+    /// Not a matter of taste: an operator the evaluator has no arm for is not
+    /// rejected, it is a rule that matches nothing, and one the field can never
+    /// lack is a rule that matches everything. Both look like a filter in the
+    /// grid. These lists are what the editor builds its menus from, and
+    /// `Predicate::problem` re-checks them for rules that came from anywhere
+    /// else — `every_operator_a_field_offers_can_actually_match_a_row` and
+    /// `is_set_is_offered_exactly_where_a_value_can_actually_be_absent` hold the
+    /// lists and `eval_predicate` against each other, because a menu that drifts
+    /// from the evaluator is invisible until someone wonders why a collection
+    /// that should be small is the whole library, or the other way round.
+    pub fn operators(self) -> &'static [Operator] {
+        use Operator::*;
+        const ORDERING: [Operator; 6] = [
+            Equals,
+            NotEquals,
+            GreaterThan,
+            GreaterThanOrEqual,
+            LessThan,
+            LessThanOrEqual,
+        ];
+        const TEXT: [Operator; 4] = [Contains, Equals, NotEquals, Exists];
+        match self {
+            // A rating is always present (0 means "no stars given"), so "is
+            // set" is not a question about it; ordering and equality are.
+            Field::Rating => &ORDERING,
+            Field::Size | Field::Mtime => &ORDERING,
+            // Dimensions come from a decoder and can be missing entirely.
+            Field::Width | Field::Height => &[
+                Equals,
+                NotEquals,
+                GreaterThan,
+                GreaterThanOrEqual,
+                LessThan,
+                LessThanOrEqual,
+                Exists,
+            ],
+            // A keyword list is not one string: `HasKeyword` tests the list, the
+            // other two test its entries. There is no `NotEquals` here because the
+            // evaluator has no arm for it, and the question itself is ambiguous on
+            // a multi-valued field — "not Holiday" for a file tagged Holiday *and*
+            // Family could reasonably be yes or no. A rule whose meaning depends on
+            // which reading the engine happened to pick is worse than no rule.
+            Field::Keyword => &[HasKeyword, Contains, Equals, Exists],
+            // These have a fixed vocabulary, so "contains" only invites partial
+            // words that never occur ("Approv").
+            Field::ColorLabel | Field::Flag => &[Equals, NotEquals, Exists],
+            // Every indexed row has a path, so every row has a name and an
+            // extension too: `Exists` would match the whole scope.
+            Field::Path | Field::Name | Field::Extension => &[Contains, Equals, NotEquals],
+            // Free text, present or absent.
+            Field::Title | Field::Description | Field::CameraMake | Field::CameraModel => &TEXT,
+            // Dates are stored as ISO text, which compares correctly as text but
+            // only until the editor can offer a date rather than a string; see
+            // `Field::EDITABLE`.
+            Field::Created | Field::Modified => &TEXT,
+            // The whole haystack: "is" cannot mean equality to one phrase, and
+            // absence is not a thing (see `haystack`).
+            Field::AnyText => &[Contains],
+        }
+    }
+
+    /// Whether some file can lack this field. `Exists` is only a question when
+    /// the answer can be no, and the rule editor should not offer a condition
+    /// that matches everything in the scope while looking like a filter.
+    pub fn can_be_unset(self) -> bool {
+        !matches!(
+            self,
+            Field::Path
+                | Field::Name
+                | Field::Extension
+                | Field::Size
+                | Field::Mtime
+                | Field::Rating
+                | Field::AnyText
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Operator {
     Contains,
@@ -129,6 +273,24 @@ pub enum Operator {
     LessThanOrEqual,
     Exists,
     HasKeyword,
+}
+
+impl Operator {
+    /// The words a rule row shows. Phrased as the claim the rule makes, so a
+    /// list of rules reads as sentences rather than as code.
+    pub fn label(self) -> &'static str {
+        match self {
+            Operator::Contains => "contains",
+            Operator::Equals => "is",
+            Operator::NotEquals => "is not",
+            Operator::GreaterThan => "is after or greater than",
+            Operator::GreaterThanOrEqual => "is at least",
+            Operator::LessThan => "is before or less than",
+            Operator::LessThanOrEqual => "is at most",
+            Operator::Exists => "is set",
+            Operator::HasKeyword => "has keyword",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -144,6 +306,95 @@ pub struct Predicate {
     pub field: Field,
     pub operator: Operator,
     pub value: Option<QueryValue>,
+}
+
+impl Predicate {
+    /// Why this rule cannot match any file, or `None` when it is well formed.
+    ///
+    /// This exists because `eval_predicate` returns false for a nonsense pair —
+    /// `Contains` against a number, a rating greater than the word `big`, a
+    /// star count of 9 — and a rule that can only ever be false is
+    /// indistinguishable, in a results grid, from a library that does not
+    /// contain what the user asked for. Saying which rule is broken and why is
+    /// the difference between an editor and a trap.
+    pub fn problem(&self) -> Option<String> {
+        // First, because it says *why*: a field no file can lack is not missing
+        // from the operator menus by accident, and "cannot be tested" would send
+        // the user looking for a different operator when the real answer is that
+        // this one asks nothing.
+        if self.operator == Operator::Exists && !self.field.can_be_unset() {
+            return Some(format!(
+                "every file has a {}, so “is set” would match the whole scope",
+                self.field.label()
+            ));
+        }
+        if !self.field.operators().contains(&self.operator) {
+            return Some(format!(
+                "“{}” cannot be tested for {} — it can only be {}",
+                self.operator.label(),
+                self.field.label(),
+                self.field
+                    .operators()
+                    .iter()
+                    .map(|o| o.label())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        // `Exists` asks whether a value is there at all, so a value box is not
+        // merely redundant but silently ignored. Refusing the rule beats
+        // letting the user believe their text was the reason for the result.
+        if self.operator == Operator::Exists {
+            return self.value.as_ref().map(|_| {
+                format!(
+                    "“is set” for {} needs no value; anything typed there is ignored",
+                    self.field.label()
+                )
+            });
+        }
+        let Some(value) = &self.value else {
+            return Some(format!(
+                "{} needs a value to compare against",
+                self.field.label()
+            ));
+        };
+
+        if self.field.value_kind() == ValueKind::Number {
+            // One normalisation instead of a match per shape: what a number
+            // field can accept is a number, however it was written down.
+            let number = match value {
+                QueryValue::Integer(n) => Some(*n),
+                QueryValue::Real(n) => Some(*n as i64),
+                QueryValue::Text(text) => text.trim().parse::<i64>().ok(),
+                QueryValue::Bool(_) => None,
+            };
+            let Some(number) = number else {
+                return Some(format!(
+                    "{} is a number; what was written there would be read as zero",
+                    self.field.label()
+                ));
+            };
+            if self.field == Field::Rating && !(0..=5).contains(&number) {
+                return Some(format!(
+                    "a star rating is 0 to 5, so “{number}” matches every file or none"
+                ));
+            }
+            return None;
+        }
+
+        match value {
+            QueryValue::Text(text) if text.trim().is_empty() => Some(format!(
+                "an empty value for {} is not a condition: depending on the test it matches \
+                 every file, or only the ones with nothing written there",
+                self.field.label()
+            )),
+            QueryValue::Text(_) => None,
+            other => Some(format!(
+                "{} holds text, and the stored value is {other:?}",
+                self.field.label()
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -219,6 +470,15 @@ impl Query {
         self.predicates.is_empty()
     }
 
+    /// Every reason this rule set cannot do what it looks like it does, in
+    /// order, so an editor can show all of them rather than the first.
+    pub fn problems(&self) -> Vec<String> {
+        self.predicates
+            .iter()
+            .filter_map(Predicate::problem)
+            .collect()
+    }
+
     pub fn matches(&self, row: &IndexedFile) -> bool {
         if self.predicates.is_empty() {
             return true;
@@ -269,6 +529,18 @@ impl SearchScope {
     /// Whether the scope wants the folder's direct children only.
     fn folder_only(&self) -> bool {
         matches!(self, SearchScope::Folder(_))
+    }
+
+    /// The scope as a phrase, for anywhere the interface has to say what will
+    /// actually be searched. `SavedSearch::summary` and the rule editor both
+    /// ask for it, because two hand-written versions of "in" and "under" is how
+    /// a label ends up promising one folder and searching another.
+    pub fn describe(&self) -> String {
+        match self {
+            SearchScope::Library => "in the library".to_string(),
+            SearchScope::Folder(root) => format!("in {}", root.display()),
+            SearchScope::FolderAndSubfolders(root) => format!("under {}", root.display()),
+        }
     }
 
     fn root(&self) -> Option<&Path> {
@@ -335,12 +607,7 @@ fn describe(query: &Query, scope: &SearchScope) -> String {
     } else {
         format!("“{}”", words.join(" "))
     };
-    let where_ = match scope {
-        SearchScope::Library => "in the library".to_string(),
-        SearchScope::Folder(root) => format!("in {}", root.display()),
-        SearchScope::FolderAndSubfolders(root) => format!("under {}", root.display()),
-    };
-    format!("{what} {where_}")
+    format!("{what} {}", scope.describe())
 }
 
 // ---------------------------------------------------------------------------
@@ -1479,6 +1746,430 @@ mod tests {
             "single is an AND of one"
         );
         assert_eq!(matches(&Query::new()), 2, "no predicates is not a filter");
+    }
+
+    fn rule(field: Field, operator: Operator, value: Option<QueryValue>) -> Predicate {
+        Predicate {
+            field,
+            operator,
+            value,
+        }
+    }
+
+    #[test]
+    fn a_rule_that_cannot_match_says_which_rule_and_why() {
+        // Each of these is silently false to the evaluator. The point of the
+        // editor refusing them is that "0 files match" and "this rule can
+        // never match" look identical in a grid.
+        let cases: Vec<(Predicate, &str)> = vec![
+            (
+                rule(
+                    Field::Size,
+                    Operator::Contains,
+                    Some(QueryValue::Text("a".into())),
+                ),
+                "cannot be tested for",
+            ),
+            (
+                rule(
+                    Field::Rating,
+                    Operator::GreaterThan,
+                    Some(QueryValue::Text("big".into())),
+                ),
+                "read as zero",
+            ),
+            (
+                rule(
+                    Field::Rating,
+                    Operator::Equals,
+                    Some(QueryValue::Integer(9)),
+                ),
+                "0 to 5",
+            ),
+            (
+                rule(
+                    Field::Title,
+                    Operator::Exists,
+                    Some(QueryValue::Text("ignored".into())),
+                ),
+                "needs no value",
+            ),
+            (rule(Field::Title, Operator::Equals, None), "needs a value"),
+            (
+                rule(
+                    Field::Keyword,
+                    Operator::Contains,
+                    Some(QueryValue::Text("   ".into())),
+                ),
+                "is not a condition",
+            ),
+            (
+                rule(
+                    Field::CameraMake,
+                    Operator::Equals,
+                    Some(QueryValue::Bool(true)),
+                ),
+                "holds text",
+            ),
+            // Not an impossible pair but the opposite: a field no file can lack,
+            // so "is set" is the whole scope wearing a filter's clothes.
+            (
+                rule(Field::Rating, Operator::Exists, None),
+                "every file has",
+            ),
+            (rule(Field::Name, Operator::Exists, None), "every file has"),
+        ];
+        for (predicate, expect) in cases {
+            let problem = predicate
+                .problem()
+                .unwrap_or_else(|| format!("no problem reported for {predicate:?}"));
+            assert!(
+                problem.contains(expect),
+                "{predicate:?} said {problem:?}, expected it to contain {expect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rules_that_are_meaningful_are_not_complained_about() {
+        let good = [
+            rule(
+                Field::Name,
+                Operator::Contains,
+                Some(QueryValue::Text("sunset".into())),
+            ),
+            rule(
+                Field::Keyword,
+                Operator::HasKeyword,
+                Some(QueryValue::Text("Holiday".into())),
+            ),
+            rule(
+                Field::Rating,
+                Operator::GreaterThanOrEqual,
+                Some(QueryValue::Integer(3)),
+            ),
+            // A number written as text is fine as long as it parses: the value
+            // box produces strings, and refusing that would refuse the editor.
+            rule(
+                Field::Rating,
+                Operator::Equals,
+                Some(QueryValue::Text("4".into())),
+            ),
+            rule(
+                Field::ColorLabel,
+                Operator::Equals,
+                Some(QueryValue::Text("Red".into())),
+            ),
+            rule(Field::Flag, Operator::Exists, None),
+            rule(
+                Field::CameraModel,
+                Operator::NotEquals,
+                Some(QueryValue::Text("GH5".into())),
+            ),
+        ];
+        for predicate in good {
+            assert_eq!(
+                predicate.problem(),
+                None,
+                "a well-formed rule was refused: {predicate:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_query_reports_every_broken_rule_not_just_the_first() {
+        let query = Query::with(
+            vec![
+                rule(
+                    Field::Name,
+                    Operator::Contains,
+                    Some(QueryValue::Text("ok".into())),
+                ),
+                rule(
+                    Field::Rating,
+                    Operator::Equals,
+                    Some(QueryValue::Integer(12)),
+                ),
+                rule(
+                    Field::Size,
+                    Operator::Contains,
+                    Some(QueryValue::Text("no".into())),
+                ),
+            ],
+            Combinator::And,
+        );
+        let problems = query.problems();
+        assert_eq!(problems.len(), 2, "{problems:?}");
+
+        // A well-formed set reports nothing, so an empty list is not itself a
+        // warning the interface has to explain.
+        assert!(Query::text("beach").problems().is_empty());
+        assert!(Query::new().problems().is_empty());
+    }
+
+    /// Every field the type knows about, not just the editable subset: the
+    /// operator lists and `can_be_unset` are consulted for any rule, including
+    /// ones that arrive from a hand-edited `saved-searches.json`.
+    const ALL_FIELDS: [Field; 18] = [
+        Field::AnyText,
+        Field::Path,
+        Field::Name,
+        Field::Extension,
+        Field::Size,
+        Field::Mtime,
+        Field::Width,
+        Field::Height,
+        Field::Created,
+        Field::Modified,
+        Field::CameraMake,
+        Field::CameraModel,
+        Field::Rating,
+        Field::ColorLabel,
+        Field::Flag,
+        Field::Keyword,
+        Field::Title,
+        Field::Description,
+    ];
+
+    /// A row with something in every column. The fixture matters as much as the
+    /// assertion: a row that leaves a field empty turns a working `Exists` into
+    /// a false failure, and a row with an empty keyword list proves nothing about
+    /// `HasKeyword`.
+    fn populated_row() -> IndexedFile {
+        IndexedFile {
+            path: PathBuf::from("/library/2024/beach.jpg"),
+            root: Some(PathBuf::from("/library")),
+            size: 2048,
+            mtime_ns: 1_700_000_000_000_000_000,
+            sidecar_mtime_ns: None,
+            width: Some(6000),
+            height: Some(4000),
+            created: Some("2024-06-01T10:00:00".to_string()),
+            modified: Some("2024-06-02T10:00:00".to_string()),
+            camera_make: Some("Canon".to_string()),
+            camera_model: Some("EOS R5".to_string()),
+            rating: 3,
+            color_label: Some("Red".to_string()),
+            flag: Some("Pick".to_string()),
+            keywords: vec!["Holiday".to_string(), "Family".to_string()],
+            title: Some("Sunset over the pier".to_string()),
+            description: Some("dusk at sea".to_string()),
+            schema_version: SCHEMA_VERSION,
+            extractor_version: EXTRACTOR_VERSION,
+        }
+    }
+
+    /// A row that carries nothing but what every file must have: a path, a size,
+    /// a modified time and a rating of zero.
+    fn bare_row() -> IndexedFile {
+        IndexedFile {
+            path: PathBuf::from("/library/b.jpg"),
+            root: None,
+            size: 0,
+            mtime_ns: 0,
+            sidecar_mtime_ns: None,
+            width: None,
+            height: None,
+            created: None,
+            modified: None,
+            camera_make: None,
+            camera_model: None,
+            rating: 0,
+            color_label: None,
+            flag: None,
+            keywords: Vec::new(),
+            title: None,
+            description: None,
+            schema_version: SCHEMA_VERSION,
+            extractor_version: EXTRACTOR_VERSION,
+        }
+    }
+
+    /// A value that should match `field` as populated by `populated_row` under
+    /// `operator`, or `None` where the operator takes no value at all.
+    fn matching_value(field: Field, operator: Operator) -> Option<QueryValue> {
+        use Operator::*;
+        if operator == Exists {
+            return None;
+        }
+        if field.value_kind() == ValueKind::Number {
+            let n = match field {
+                Field::Rating => 3,
+                Field::Size => 2048,
+                Field::Width => 6000,
+                Field::Height => 4000,
+                Field::Mtime => 1_700_000_000_000_000_000,
+                _ => unreachable!("only these fields are numbers"),
+            };
+            return Some(QueryValue::Integer(match operator {
+                GreaterThan => n - 1,
+                GreaterThanOrEqual | Equals => n,
+                LessThan => n + 1,
+                LessThanOrEqual => n,
+                NotEquals => n - 1,
+                _ => n,
+            }));
+        }
+        let text = match field {
+            Field::Path => "/library/2024/beach.jpg",
+            Field::Name => "beach.jpg",
+            Field::Extension => "jpg",
+            Field::Keyword => "Holiday",
+            Field::Title => "Sunset over the pier",
+            Field::Description => "dusk at sea",
+            Field::CameraMake => "Canon",
+            Field::CameraModel => "EOS R5",
+            Field::ColorLabel => "Red",
+            Field::Flag => "Pick",
+            Field::Created => "2024-06-01T10:00:00",
+            Field::Modified => "2024-06-02T10:00:00",
+            Field::AnyText => "beach.jpg",
+            _ => unreachable!("{field:?} is not a text field with a fixture"),
+        };
+        Some(QueryValue::Text(
+            match operator {
+                Contains => &text[1..],
+                Equals | HasKeyword => text,
+                NotEquals => "no such value in this fixture",
+                _ => text,
+            }
+            .to_string(),
+        ))
+    }
+
+    /// The menus and the evaluator are two hand-written lists, and the gap
+    /// between them is not an error message — it is a collection that matches
+    /// nothing while looking like a filter. So every pair an editor can build is
+    /// checked against a row that has the value, for matching *and* for the
+    /// guard: `problem()` must stay silent about exactly what the engine accepts.
+    #[test]
+    fn every_operator_a_field_offers_can_actually_match_a_row() {
+        let row = populated_row();
+        let mut checked = 0;
+        for field in ALL_FIELDS {
+            for operator in field.operators() {
+                let predicate = Predicate {
+                    field,
+                    operator: *operator,
+                    value: matching_value(field, *operator),
+                };
+                assert_eq!(
+                    predicate.problem(),
+                    None,
+                    "{field:?} / {operator:?}: the menus offer a rule the guard then refuses"
+                );
+                assert!(
+                    eval_predicate(&predicate, &row),
+                    "{field:?} / {operator:?} is offered but cannot match a row that holds \
+                     the value ({:?})",
+                    predicate.value
+                );
+                checked += 1;
+            }
+        }
+        // Not a tautology about behaviour, but about coverage: a field or an
+        // operator quietly dropped from `ALL_FIELDS` would shrink this.
+        assert!(
+            checked >= 70,
+            "only {checked} pairs were checked; the field or operator lists are not being \
+             walked"
+        );
+    }
+
+    /// `Exists` is the mirror-image hazard: a field that can never be absent
+    /// turns "is set" into a rule that matches the entire scope, which is the
+    /// same silent no-op wearing the other hat.
+    #[test]
+    fn is_set_is_offered_exactly_where_a_value_can_actually_be_absent() {
+        let bare = bare_row();
+        let populated = populated_row();
+        for field in ALL_FIELDS {
+            // Defined by the evaluator itself: a field can be unset when there is
+            // a real row shape where `field_exists` says no.
+            let can_be_absent = !field_exists(field, &bare);
+            assert!(
+                field_exists(field, &populated),
+                "{field:?} is missing from the populated fixture, so the test below proves \
+                 nothing"
+            );
+            assert_eq!(
+                field.can_be_unset(),
+                can_be_absent,
+                "{field:?}: `can_be_unset` disagrees with `field_exists` about whether a \
+                 file can lack it"
+            );
+            assert_eq!(
+                field.operators().contains(&Operator::Exists),
+                can_be_absent,
+                "{field:?}: the menus offer \"is set\" {offered}, but a file {absence}",
+                offered = if can_be_absent {
+                    "for a field that is always present"
+                } else {
+                    "for a field that can be absent"
+                },
+                absence = if can_be_absent {
+                    "can lack it"
+                } else {
+                    "always has it"
+                },
+            );
+            // And the guard's answer follows the same rule, for rules that did
+            // not come from the menus.
+            let predicate = Predicate {
+                field,
+                operator: Operator::Exists,
+                value: None,
+            };
+            assert_eq!(
+                predicate.problem().is_some(),
+                !can_be_absent,
+                "{field:?} / Exists: the guard and the menus disagree about whether this \
+                 can match"
+            );
+        }
+    }
+
+    #[test]
+    fn every_editable_field_offers_at_least_one_operator_and_labels_itself() {
+        // Guards the editor's menus: a field with no operators would render an
+        // empty popup, and duplicate labels would make two rows indistinguishable.
+        let mut labels = std::collections::HashSet::new();
+        for field in Field::EDITABLE {
+            assert!(
+                !field.operators().is_empty(),
+                "{field:?} offers nothing to build a rule with"
+            );
+            assert!(!field.label().is_empty(), "{field:?} has no label");
+            assert!(
+                labels.insert(field.label()),
+                "two fields share the label {:?}",
+                field.label()
+            );
+            // Every operator the field offers must be one that can match it.
+            for operator in field.operators() {
+                let predicate = rule(
+                    field,
+                    *operator,
+                    if *operator == Operator::Exists {
+                        None
+                    } else if field.value_kind() == ValueKind::Number {
+                        Some(QueryValue::Integer(if field == Field::Rating {
+                            3
+                        } else {
+                            1
+                        }))
+                    } else {
+                        Some(QueryValue::Text("x".into()))
+                    },
+                );
+                assert_eq!(
+                    predicate.problem(),
+                    None,
+                    "{field:?} offered {operator:?}, which it then refuses: {:?}",
+                    predicate.problem()
+                );
+            }
+        }
     }
 
     #[test]
