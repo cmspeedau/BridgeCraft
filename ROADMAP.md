@@ -143,9 +143,15 @@ What is left on the critical path, in the order that unblocks the most:
 2. ~~A rule editor for saved collections~~ — shipped: `Edit rules…` authors words, conditions, combinator and scope, with a live match count from the worker. What that item also settled was that the remaining authorship gap is *typed ergonomics*, not the query model: the fields the index stores but the editor does not offer (size, dates, dimensions) need unit and date controls, not a new query language.
 3. **Contact sheets, publish presets and version stacks** wired into the UI: all implemented, tested and unreachable. Metadata templates came off this list in slice 15; what that taught worth keeping is in the slice log — the safety question was never the merge rules but *which properties a template is allowed to name*, and the answer ("only the ones it holds, and only the bulk-stampable fields") is what made the engine safe to reach.
 4. ~~The data-path cleanup~~ — done: the thumbnail cache moved into the data directory and the CWD is no longer written to. Atomic persistence for `favorites.json` and `recents.json` is the remaining sibling of that work, listed under Tech debt rather than here.
-5. **Tags for PNG and WebP exports, and IPTC-IIM written back into TIFF.** Each needs a container writer that does not exist yet; until then the export dialog says plainly that these formats carry no tags.
+5. **Upgrade `egui`/`eframe` off 0.27.** Scheduled because of the macOS leg recorded in
+   Risks, and it is the same work Phase 1 already owes for outbound OS drag: `winit 0.29`
+   is what pins the `objc2` that no longer compiles, so a newer eframe clears both. Treat
+   it as its own slice — egui breaks APIs between minor versions and the UI is roughly six
+   thousand lines — and let the macOS CI leg, which today cannot reach our own code at all,
+   be the thing that says it worked.
+6. **Tags for PNG and WebP exports, and IPTC-IIM written back into TIFF.** Each needs a container writer that does not exist yet; until then the export dialog says plainly that these formats carry no tags.
 
-M1's remaining items are the two surfacing defects (failed-versus-pending thumbnails, folder-open errors only in the status bar) plus outbound OS drag, which needs an eframe upgrade.
+M1's remaining items are the two surfacing defects (failed-versus-pending thumbnails, folder-open errors only in the status bar) plus outbound OS drag, which needs an eframe upgrade — the same upgrade the macOS CI leg now needs, so one slice pays off two debts.
 
 ## Tech debt
 
@@ -1006,14 +1012,17 @@ down twice.
 - PDF thumbnails require a user-provided Pdfium library, which is not bundled (mitigate: same availability probe and graceful skip; Pdfium's licence applies only to the user's copy)
 - Camera RAW thumbnails require a user-provided LibRaw library, which is not bundled (mitigate: same availability probe and graceful skip; LIBRAW_PATH override; embedded-preview fast-path keeps it fast; licence applies only to the user's copy)
 - **The macOS build is broken by a transitive dependency, and has been since before this
-  phase of work.** `objc2 0.4.1` — pulled in by the winit/eframe stack, not chosen by us —
+  phase of work. DECIDED 2026-11-19: leave the leg red and fix the cause.** `objc2 0.4.1` — pulled in by the winit/eframe stack, not chosen by us —
   does not type-check against the current Rust toolchain (`E0277` in its own
   `ivar_forwarding_impls`), so `cargo test --workspace` fails on `macos-latest` CI while
   passing on Linux. Ubuntu and Windows legs are the ones anyone has watched. Mitigate: update
   the GUI stack (eframe/winit → a release resolving a newer objc2), or pin the CI toolchain to
   a version `objc2 0.4.1` still compiles under; a universal-2 Phase 6 build is not reachable
-  until one of the two is done. Windows had its own red — an atomic-writer temp name built
-  from a test thread name, which contains `:` and so is illegal there — fixed on 2026-11-19.
+  until one of the two is done. Pinning was considered and refused: it would hide a real
+  incompatibility behind a green badge and leave the macOS leg the only one that does not
+  describe what an actual user compiles. Windows had its own red — an atomic-writer temp
+  name built from a test thread name, which contains `:` and so is illegal there — and is
+  green as of CI run 44410910645.
 - Unsigned distribution artifacts will trigger OS trust warnings (macOS Gatekeeper, Windows SmartScreen) that users must dismiss manually (accepted trade-off: no signing certificates are purchased or managed)
 
 ---
