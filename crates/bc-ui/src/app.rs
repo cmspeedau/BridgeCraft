@@ -456,6 +456,101 @@ struct SuggestAnswer {
     results: Result<Vec<bc_core::KeywordSuggestion>, String>,
 }
 
+/// A contact sheet to render, asked of the worker thread.
+struct ContactJob {
+    sources: Vec<PathBuf>,
+    cols: u32,
+    rows: u32,
+    page_size: bc_core::contact_sheet::PageSize,
+    jpeg_quality: u8,
+    output: PathBuf,
+    pdf: bool,
+}
+
+struct ContactResult {
+    path: PathBuf,
+    error: Option<String>,
+}
+
+struct ContactSheetDialog {
+    sources: Vec<PathBuf>,
+    cols: u32,
+    rows: u32,
+    page_size: usize,
+    output: String,
+    pdf: bool,
+    working: bool,
+}
+
+impl ContactSheetDialog {
+    fn new(sources: Vec<PathBuf>) -> Self {
+        let output = sources
+            .first()
+            .and_then(|path| path.parent())
+            .map(|dir| dir.join("contact-sheet.pdf").display().to_string())
+            .unwrap_or_else(|| "contact-sheet.pdf".to_string());
+        Self {
+            sources,
+            cols: 3,
+            rows: 3,
+            page_size: 0,
+            output,
+            pdf: true,
+            working: false,
+        }
+    }
+
+    fn page(&self) -> bc_core::contact_sheet::PageSize {
+        match self.page_size {
+            0 => bc_core::contact_sheet::PageSize::A4,
+            1 => bc_core::contact_sheet::PageSize::Letter,
+            _ => bc_core::contact_sheet::PageSize::A4,
+        }
+    }
+}
+
+/// Render a contact sheet off the UI thread. A sheet over a large selection decodes
+/// and resizes every thumbnail, which is the same work the grid does but all at once,
+/// and the grid does it per visible cell.
+fn spawn_contact_worker(rx: Receiver<ContactJob>, tx: Sender<ContactResult>) {
+    std::thread::Builder::new()
+        .name("contact-sheet".into())
+        .spawn(move || {
+            for job in rx {
+                let result = (|| -> Result<(), String> {
+                    let options = bc_core::contact_sheet::ContactSheetOptions {
+                        cols: job.cols.max(1),
+                        rows: job.rows.max(1),
+                        page_size: job.page_size,
+                        jpeg_quality: job.jpeg_quality.clamp(1, 100),
+                        ..bc_core::contact_sheet::ContactSheetOptions::default()
+                    };
+                    if job.pdf {
+                        let bytes = bc_core::contact_sheet::render_pdf(&job.sources, &options)
+                            .map_err(|error| error.to_string())?;
+                        std::fs::write(&job.output, &bytes).map_err(|error| error.to_string())?;
+                    } else {
+                        let canvas =
+                            bc_core::contact_sheet::render_image_sheet(&job.sources, &options)
+                                .map_err(|error| error.to_string())?;
+                        canvas
+                            .save(&job.output)
+                            .map_err(|error| error.to_string())?;
+                    }
+                    Ok(())
+                })();
+                let answer = ContactResult {
+                    path: job.output,
+                    error: result.err(),
+                };
+                if tx.send(answer).is_err() {
+                    tracing::debug!("contact sheet answer dropped: worker shutting down");
+                }
+            }
+        })
+        .expect("the contact-sheet worker thread must start");
+}
+
 struct ThumbJob {
     path: PathBuf,
     mtime_ns: i64,
@@ -824,6 +919,12 @@ pub struct BridgeApp {
     /// `search_tx` like every other query, so a stale answer cannot race a
     /// newer one across two threads reading one SQLite connection.
     editor: Option<CollectionEditor>,
+    /// The contact sheet dialog, open when `Some`.
+    contact_sheet: Option<ContactSheetDialog>,
+    /// Request channel for the worker that renders sheets.
+    contact_job_tx: Sender<ContactJob>,
+    /// The worker's reply channel for a sheet that has been rendered.
+    contact_reply_rx: Receiver<ContactResult>,
     /// Library-wide keyword type-ahead for the box in the tags panel.
     /// `suggestions` describes `suggestions_prefix`, and the panel shows nothing
     /// unless the two still agree: a candidate list for a word the user has
@@ -938,6 +1039,9 @@ impl BridgeApp {
         let (query_tx, query_rx) = channel::<SearchJob>();
         let (answer_tx, answer_rx) = channel::<SearchAnswer>();
         let (suggest_reply_tx, suggest_rx) = channel::<SuggestAnswer>();
+        let (contact_job_tx, contact_job_rx) = channel::<ContactJob>();
+        let (contact_reply_tx, contact_reply_rx) = channel::<ContactResult>();
+        spawn_contact_worker(contact_job_rx, contact_reply_tx);
         spawn_search_worker(query_rx);
 
         let (favorites, favorites_error) = match Favorites::open_default() {
@@ -1008,7 +1112,10 @@ impl BridgeApp {
             search_tx: query_tx.clone(),
             search_rx: answer_rx,
             search_reply_tx: answer_tx,
+            contact_job_tx,
             editor: None,
+            contact_sheet: None,
+            contact_reply_rx,
             templates: Vec::new(),
             template_store: None,
             template_store_error: None,
@@ -2022,6 +2129,161 @@ impl BridgeApp {
         {
             self.search_waiting = None;
             self.status = "Search unavailable: the background search thread is gone".to_string();
+        }
+    }
+
+    /// Take a finished contact sheet and say so. A render that failed on one
+    /// source still produced a sheet with a gap in it, so the failure is named
+    /// rather than swallowed — the user asked for a file and needs to know
+    /// whether they got one.
+    fn poll_contact_sheet(&mut self, ctx: &egui::Context) {
+        for result in self.contact_reply_rx.try_iter() {
+            if let Some(dialog) = self.contact_sheet.as_mut() {
+                dialog.working = false;
+            }
+            match result.error {
+                None => {
+                    self.status = format!("Contact sheet written to {}", result.path.display());
+                }
+                Some(error) => {
+                    self.status = format!("Contact sheet failed: {error}");
+                    // Keep the dialog open on a failure so the error is readable where
+                    // the request was made, rather than only in the status bar.
+                    if let Some(dialog) = self.contact_sheet.as_mut() {
+                        dialog.working = true;
+                    }
+                }
+            }
+        }
+        if self.contact_sheet.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(60));
+        }
+    }
+
+    /// Open the contact sheet dialog for the current selection.
+    fn open_contact_sheet(&mut self, files: Vec<PathBuf>) {
+        if files.is_empty() {
+            self.status = "Select files to make a contact sheet from.".to_string();
+            return;
+        }
+        self.contact_sheet = Some(ContactSheetDialog::new(files));
+    }
+
+    /// The contact sheet dialog. A render runs on the worker thread, so the
+    /// panel stays responsive while a large sheet is being built — the same
+    /// reason the search box does not parse files on the paint thread.
+    fn contact_sheet_window(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.contact_sheet.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut start = false;
+        let mut dismiss = false;
+        egui::Window::new("Contact sheet")
+            .id(egui::Id::new("contact_sheet"))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "{} file(s) selected. A sheet lays them out as a labelled grid.",
+                    dialog.sources.len()
+                ));
+                ui.horizontal(|ui| {
+                    ui.label("Layout:");
+                    let mut cols = dialog.cols.to_string();
+                    let cols_field = ui.add_sized(
+                        [40.0, 20.0],
+                        egui::TextEdit::singleline(&mut cols).font(egui::TextStyle::Small),
+                    );
+                    if cols_field.lost_focus() {
+                        if let Ok(n) = cols.trim().parse::<u32>() {
+                            dialog.cols = n.clamp(1, 8);
+                        }
+                    }
+                    ui.label("×");
+                    let mut rows = dialog.rows.to_string();
+                    let rows_field = ui.add_sized(
+                        [40.0, 20.0],
+                        egui::TextEdit::singleline(&mut rows).font(egui::TextStyle::Small),
+                    );
+                    if rows_field.lost_focus() {
+                        if let Ok(n) = rows.trim().parse::<u32>() {
+                            dialog.rows = n.clamp(1, 8);
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Page:");
+                    egui::ComboBox::from_id_source("contact_page")
+                        .selected_text(match dialog.page_size {
+                            0 => "A4 (portrait)",
+                            1 => "Letter (portrait)",
+                            _ => "A4 (portrait)",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut dialog.page_size, 0, "A4 (portrait)");
+                            ui.selectable_value(&mut dialog.page_size, 1, "Letter (portrait)");
+                        });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Format:");
+                    egui::ComboBox::from_id_source("contact_format")
+                        .selected_text(if dialog.pdf { "PDF" } else { "PNG" })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut dialog.pdf, true, "PDF");
+                            ui.selectable_value(&mut dialog.pdf, false, "PNG");
+                        });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Output:");
+                    ui.add_sized(
+                        [300.0, 20.0],
+                        egui::TextEdit::singleline(&mut dialog.output)
+                            .font(egui::TextStyle::Small)
+                            .hint_text("file path"),
+                    );
+                });
+                if dialog.working {
+                    ui.weak("Creating the sheet…");
+                }
+                ui.separator();
+                if ui
+                    .add_enabled(!dialog.working, egui::Button::new("Create").small())
+                    .on_hover_text("Renders the selected files as a labelled grid")
+                    .clicked()
+                {
+                    let output = PathBuf::from(dialog.output.trim());
+                    let page_size = dialog.page();
+                    let job = ContactJob {
+                        sources: dialog.sources.clone(),
+                        cols: dialog.cols,
+                        rows: dialog.rows,
+                        page_size,
+                        jpeg_quality: 85,
+                        output: output.clone(),
+                        pdf: dialog.pdf,
+                    };
+                    dialog.working = true;
+                    if self.contact_job_tx.send(job).is_err() {
+                        dialog.working = false;
+                        self.status =
+                            "Contact sheet unavailable: the background thread is gone".to_string();
+                        dismiss = true;
+                    } else {
+                        start = true;
+                    }
+                }
+                if ui
+                    .button("Cancel")
+                    .on_hover_text("Close without creating anything.")
+                    .clicked()
+                {
+                    dismiss = true;
+                }
+            });
+        if start || (open && !dismiss) {
+            self.contact_sheet = Some(dialog);
         }
     }
 
@@ -5113,6 +5375,15 @@ impl BridgeApp {
             }
             ui.close_menu();
         }
+        if ui.button("Contact sheet\u{2026}").clicked() {
+            let files: Vec<PathBuf> = paths
+                .iter()
+                .filter(|path| !path.is_dir())
+                .cloned()
+                .collect();
+            self.open_contact_sheet(files);
+            ui.close_menu();
+        }
         if ui.button("Move to BridgeCraft Trash").clicked() {
             match TrashBin::open_default() {
                 Ok(mut bin) => {
@@ -6758,6 +7029,7 @@ fn sort_direction_label(key: SortKey, dir: SortDir) -> (String, String) {
 
 impl eframe::App for BridgeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_contact_sheet(ctx);
         self.poll_thumbnails(ctx);
         if let Some(processor) = &mut self.auto_processor {
             processor.poll(self.auto_started.elapsed());
@@ -6909,6 +7181,7 @@ impl eframe::App for BridgeApp {
         self.rename_window(ctx);
         self.export_window(ctx);
         self.editor_window(ctx);
+        self.contact_sheet_window(ctx);
         self.jobs_window(ctx);
         self.auto_process_window(ctx);
         self.plugin_manager_window(ctx);
@@ -8270,6 +8543,177 @@ mod tests {
             untouched,
             "the already-matching file was rewritten anyway"
         );
+    }
+
+    /// Draw the contact sheet dialog alone and collect what it wrote, the way
+    /// `editor_text` does for the rule editor. A window has to be testable without
+    /// the rest of the interface, and the assertions are about the words a user
+    /// reads rather than about fields nobody sees.
+    fn contact_texts(app: &mut BridgeApp, ctx: &egui::Context) -> Vec<(String, egui::Rect)> {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(420.0, 1_400.0),
+            )),
+            time: Some(next_frame_time()),
+            ..Default::default()
+        };
+        // A window needs one pass to lay itself out before it paints text.
+        let _ = ctx.run(raw.clone(), |ctx| app.contact_sheet_window(ctx));
+        let out = ctx.run(raw, |ctx| app.contact_sheet_window(ctx));
+        out.shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some((
+                    text.galley.text().to_string(),
+                    egui::Rect::from_min_size(text.pos, text.galley.size()),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Wait for the worker's sheet to land, the way `finish_search` does for the
+    /// box. The render decodes every source, so on a slow machine this can take
+    /// a second: the deadline is the worker's, not a keystroke's.
+    fn finish_contact_sheet(app: &mut BridgeApp, ctx: &egui::Context) {
+        for _ in 0..500 {
+            app.poll_contact_sheet(ctx);
+            if app
+                .contact_sheet
+                .as_ref()
+                .map(|dialog| !dialog.working)
+                .unwrap_or(true)
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the contact sheet never came back from the worker");
+    }
+
+    #[test]
+    fn a_contact_sheet_in_pdf_format_writes_a_file_for_the_selection() {
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let a = png_file(&root, "a.png");
+        let b = png_file(&root, "b.png");
+        std::fs::write(&a, [0xFFu8, 0xD8, 0xFF, 0xD9]).unwrap();
+        std::fs::write(&b, [0xFFu8, 0xD8, 0xFF, 0xD9]).unwrap();
+        let output = data.join("sheet.pdf");
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data, &_stores);
+        let files: Vec<PathBuf> = app
+            .browser
+            .entries
+            .iter()
+            .filter(|e| !e.is_dir)
+            .map(|e| e.path.clone())
+            .take(2)
+            .collect();
+        assert_eq!(files.len(), 2, "the fixture lost its files");
+        app.open_contact_sheet(files);
+        {
+            let dialog = app.contact_sheet.as_mut().unwrap();
+            dialog.cols = 2;
+            dialog.rows = 2;
+            dialog.pdf = true;
+            dialog.output = output.display().to_string();
+        }
+
+        // The dialog must not render on the frame that asks: a sheet over a
+        // large selection decodes every source, and doing that in the paint path
+        // is the frozen window the search box was moved off it to avoid.
+        contact_texts(&mut app, &ctx);
+        assert!(
+            !app.contact_sheet.as_ref().unwrap().working,
+            "Create was not pressed, yet the sheet is working"
+        );
+
+        let create = contact_texts(&mut app, &ctx)
+            .iter()
+            .find(|(t, _)| t.as_str() == "Create")
+            .map(|(_, r)| r.center())
+            .expect("no Create button");
+        click_at(&mut app, &ctx, create, |app, ctx| {
+            app.contact_sheet_window(ctx)
+        });
+        assert!(
+            app.contact_sheet.as_ref().unwrap().working,
+            "the click did not reach the worker"
+        );
+        finish_contact_sheet(&mut app, &ctx);
+
+        assert!(output.exists(), "no file was written: {}", output.display());
+        let bytes = std::fs::read(&output).unwrap();
+        assert!(
+            bytes.starts_with(b"%PDF-1.4"),
+            "the output is not a PDF: {:?}",
+            &bytes[..bytes.len().min(12)]
+        );
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("/Count 1"),
+            "the sheet has the wrong page count"
+        );
+        assert!(
+            app.status.contains("Contact sheet written"),
+            "the status line did not report success: {}",
+            app.status
+        );
+        assert!(
+            app.contact_sheet.is_some(),
+            "the dialog closed before the user could see the result"
+        );
+    }
+
+    #[test]
+    fn a_contact_sheet_in_png_format_writes_a_png() {
+        let _stores = STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("library");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let a = png_file(&root, "a.png");
+        std::fs::write(&a, [0xFFu8, 0xD8, 0xFF, 0xD9]).unwrap();
+        let output = data.join("sheet.png");
+
+        let ctx = egui::Context::default();
+        let mut app = isolated_app(&ctx, &root, &data, &_stores);
+        let files: Vec<PathBuf> = app
+            .browser
+            .entries
+            .iter()
+            .filter(|e| !e.is_dir)
+            .map(|e| e.path.clone())
+            .take(1)
+            .collect();
+        assert_eq!(files.len(), 1, "the fixture lost its files");
+        app.open_contact_sheet(files);
+        {
+            let dialog = app.contact_sheet.as_mut().unwrap();
+            dialog.pdf = false;
+            dialog.output = output.display().to_string();
+        }
+
+        let create = contact_texts(&mut app, &ctx)
+            .iter()
+            .find(|(t, _)| t == "Create")
+            .map(|(_, r)| r.center())
+            .expect("no Create button");
+        click_at(&mut app, &ctx, create, |app, ctx| {
+            app.contact_sheet_window(ctx)
+        });
+        finish_contact_sheet(&mut app, &ctx);
+
+        assert!(output.exists(), "no PNG was written: {}", output.display());
+        let bytes = std::fs::read(&output).unwrap();
+        assert_eq!(&bytes[..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
     }
 
     #[test]

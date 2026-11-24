@@ -72,10 +72,10 @@ A 1:1 clean-room reimplementation of Adobe Bridge in Rust.
 - [x] A rule editor for collections: "Edit rules…" in the Collections tab opens a dialog that authors the whole stored shape — words, any number of conditions on the eleven indexed fields the editor offers (file name, path, extension, keyword, title, description, camera make and model, colour label, flag, star rating), AND or OR across them, and the scope — and ✎ on a saved collection opens that collection's own rules. It shows a live "N file(s) match" count, debounced like the search box and answered by the same worker thread, so no rule set is ever saved on faith. Each operator menu lists only the tests that field can actually answer: a text field is never offered `>` and a number is never offered "contains", because `eval_predicate` answers those with false rather than with an error — and the same guard, `Predicate::problem`, refuses a star count outside 0–5, a non-number in a number field (the engine reads it as zero), an empty value, a value typed into "is set", and "is set" on a field no file can lack. While any row is refused the dialog counts nothing and says so, because an impossible rule and an empty library look identical in a grid, and it will not save a rule set it has just explained cannot match. Two tests hold the menus against the evaluator rather than against each other: `every_operator_a_field_offers_can_actually_match_a_row` constructs a value per pair and asserts a populated row matches it, and `is_set_is_offered_exactly_where_a_value_can_actually_be_absent` derives `Field::can_be_unset` from `field_exists` on an empty row. The pair that is *not* offered is deliberate: `Size`, `Mtime`, `Width`, `Height` and the two date fields are indexed and queryable but absent from the menus, because a size in bytes and a 
   nanosecond timestamp are not things a user should be asked to type
 
-## Phase 4 — Batch Operations & Automation (Weeks 24–34) — ◐ rename, export and watched folders shipped with UI; contact sheets and the scripting surface are core-only
+## Phase 4 — Batch Operations & Automation (Weeks 24–34) — ◐ rename, export and watched folders shipped with UI; contact sheets now have a dialog and a worker, and the scripting surface is core-only
 - [x] Batch rename (token-based patterns) — `bc-core::batch_rename` parser/planner/journaled apply/undo plus `bc-ui` preview/apply dialog, pattern validation, and undo action
 - [x] Batch resize/convert/export (issue #15: queued `bc-core` export pipeline + jobs UI; JPEG/PNG/WebP, orientation applied). JPEG exports also carry the asset's rating, colour label, flag and keywords as an embedded XMP packet; camera/exposure tags are deliberately not copied, and PNG/WebP carry no tags until those containers get a writer. The dialog states which, per format, before the job starts
-- [~] Contact sheet / PDF contact sheet output: `bc-core::contact_sheet` renders RGBA and paginated PDF sheets and is tested, but no UI or export path calls it. Remaining: a "Contact Sheet…" action plus layout picker
+- [x] Contact sheet / PDF contact sheet output: a "Contact Sheet…" entry beside Export in the toolbar opens a dialog over the selection — columns, rows, page size (A4/Letter), PDF or PNG — and "Create" renders on the shared worker thread so the panel stays responsive while it runs. Output is written to disk and the status line reports the path; a failure keeps the dialog open and says why. The engine already handled pagination, thumbnails and JPEG embedding; what was missing was the button. Remaining: per-source progress and cancellation (the render is one shot on its own thread), captions under the cells (the engine reserves the space and leaves it blank), and a contact-sheet entry in the export pipeline's preset list rather than a standalone dialog
 - [~] Watched-folder auto-processing: persisted rules, settle gate, bounded worker queue, preferences/history UI and docs landed. The `IndexIntoMetadataIndex` action exists in core but is not selectable in the rules UI (Thumbnail / Rename / Export PNG / Dated folder only)
 - [~] Scripting/automation API (WASM): local manifest-based scripts use the shared `wasmi` sandbox, fuel/memory limits, default-deny persisted capability and filesystem grants, and permissioned selection/current-folder/metadata/thumbnail/file-operation host imports; per-script failures are isolated. **Runtime is done, the surface is not**: `bc-core::scripting::ScriptHost` has no UI (no scripts window), so scripts can only be discovered from the scripts directory; the plugin path below is what users can actually drive today
 
@@ -141,7 +141,7 @@ What is left on the critical path, in the order that unblocks the most:
 
 1. **Index-backed tags.** Done for sorting and filtering, which is where the index was the only way to do the job at all: ordering a folder by stars needs every file's rating, and reading every file costs 14.9 µs each against 1.3 µs each for one indexed range query. What this slice measured and then *rejected* was the plan I wrote in the previous commit — "the grid and details overlays stat and parse a sidecar plus a packet for every visible row each frame; that belongs in `metadata_index`". The overlays cache on the file's own mtime, so a frame costs 2.3 µs per visible row and can never show a stale tag, while a per-file index lookup costs 98 µs — 6.6× slower than parsing the file, and permitted to lag it. Per-row display stays as it is. Cross-library keyword suggestions — the other half of that older note — shipped in slice 14; what still needs more than the four tag columns the index holds is the panel's full layer read, which keeps parsing the file so a saved star shows up immediately.
 2. ~~A rule editor for saved collections~~ — shipped: `Edit rules…` authors words, conditions, combinator and scope, with a live match count from the worker. What that item also settled was that the remaining authorship gap is *typed ergonomics*, not the query model: the fields the index stores but the editor does not offer (size, dates, dimensions) need unit and date controls, not a new query language.
-3. **Contact sheets, publish presets and version stacks** wired into the UI: all implemented, tested and unreachable. Metadata templates came off this list in slice 15; what that taught worth keeping is in the slice log — the safety question was never the merge rules but *which properties a template is allowed to name*, and the answer ("only the ones it holds, and only the bulk-stampable fields") is what made the engine safe to reach.
+3. **Publish presets and version stacks** wired into the UI: both implemented, tested and unreachable. Contact sheets came off this list in slice 16. Version stacks also still carries the eight mutate-before-persist sites from slice 12, and publish runs synchronously while exports of the same shape go through the job queue — that is the decision the item needs before it can be a dialog rather than a freeze
 4. ~~The data-path cleanup~~ — done: the thumbnail cache moved into the data directory and the CWD is no longer written to. Atomic persistence for `favorites.json` and `recents.json` is the remaining sibling of that work, listed under Tech debt rather than here.
 5. **Upgrade `egui`/`eframe` off 0.27.** Scheduled because of the macOS leg recorded in
    Risks, and it is the same work Phase 1 already owes for outbound OS drag: `winit 0.29`
@@ -765,6 +765,64 @@ interesting part is not the query but what the query said back.
   without drawing (a test bug, not an app bug — but it looked identical from the failure),
   and the click helper (a harness bug). Three of the four were only visible once I asked the
   running code what it did instead of reading what I meant.
+
+### A contact sheet you can actually make (slice 16, shipped 2026-11-25)
+
+The engine in `bc-core::contact_sheet` was complete and tested before this slice
+started: pagination, thumbnail embedding, JPEG as DCTDecode, a hand-rolled PDF
+writer, A4/Letter page sizes. Nothing called it, and the roadmap carried it under
+Phase 4 as "core-only" — the same shape as the three slices before this one, and
+the same reason: an engine without a caller is not a feature. This slice adds
+the button, and the interesting part is the one that is not about contact
+sheets.
+
+- **A dialog plus a thread, not a call.** Rendering a sheet decodes every
+  thumbnail and re-encodes them as JPEG, which on a large selection is a second
+  or two of work. Doing it on the paint thread would freeze the window for the
+  duration, which is exactly the failure the search box was moved off it in
+  slice 9 and the rule editor's live count in slice 13. So "Create" spawns a job
+  on a worker thread and the panel shows "Creating…" until the result lands,
+  with a cancel-ish outcome: a failed render keeps the dialog open and says why,
+  because the user asked for a file and needs to know whether they got one.
+- **What it does not do, stated rather than implied.** No per-source progress,
+  no cancellation mid-render, no captions under the cells (the engine reserves
+  the space and leaves it blank — the comment in `render_image_sheet` says so),
+  and no entry in the export pipeline's preset list, so a contact sheet is a
+  standalone dialog rather than a reusable job. All four are real gaps and the
+  first two are the reason this is a "contact sheet" feature rather than a
+  "batch output" one; the engine's `render_pdf`/`render_image_sheet` are ready
+  for them, which is what makes the gaps honest rather than accidental.
+- **The sixth harness fact in four slices.** `click_at` — the shared helper every
+  dialog test in this codebase uses — draws once without events, then hovers,
+  then presses, and that first bare draw is what I once assumed double-toggled the
+  rule editor's header. It does not; the rule editor's probe refuted that. But
+  this slice taught the opposite lesson, which is that a helper's *extra* pass
+  can also be load-bearing in a way that is worse: `click_at`'s bare draw happens
+  *before* the measuring pass, so the layout it measures is one pass further along
+  than the layout a real user sees, and a widget that is scrolled out of view in
+  that extra pass is still "found" by the helper and clicked at a coordinate that
+  no longer holds it. The fix is the same discipline as the panel-width drift:
+  measure and click in passes that use the same input, and let the helper's
+  additional pass be the one that does not change state. The bulk-panel test
+  failed twice before this was understood; the fix is in `click_right_panel`,
+  which now does its own three passes and has a comment about why.
+- **What the slice added and what it did not.** No new storage, no new writer, no
+  new job kind: the output goes through `std::fs::write`/`RgbaImage::save` on the
+  worker. Adding a job kind would have given progress and cancellation for free,
+  but it would also have coupled a read-only rendering feature to the export
+  queue's request and report types, and the engine's `Result` is already the
+  honest shape for "this file could not be rendered". That coupling is the thing
+  the publish slice will have to decide, and it is recorded as a decision rather
+  than made here by default.
+- **Two tests, both of which bite.** Creating a PDF writes a file whose bytes
+  start `%PDF-1.4` with `/Count 1`; creating a PNG writes the PNG magic bytes.
+  Suppressing the write in the worker fails the PDF test, which is how I know the
+  assertion is about the write and not about the dialog having opened.
+
+fmt clean; clippy --workspace --all-targets --locked -D warnings clean; 434 tests
+pass (two new), verified on a full-workspace run. Release binary re-run on a clean
+profile: 200 files indexed, no errors logged, nothing written beside the working
+directory.
 
 ### A rule editor that counts, and six bugs it counted out of the woodwork (slice 13, shipped 2026-11-18)
 
